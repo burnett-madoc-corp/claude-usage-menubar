@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 DEST="/Applications/ClaudeUsage.app"
 PLIST="$HOME/Library/LaunchAgents/local.claude-usage-menubar.plist"
 
-echo "Installing to $DEST…"
+echo "Installing to ${DEST}..."
 pkill -f "ClaudeUsage.app/Contents/MacOS/ClaudeUsage" 2>/dev/null || true
 rm -rf "$DEST"
 cp -R build/ClaudeUsage.app "$DEST"
