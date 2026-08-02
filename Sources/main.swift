@@ -352,6 +352,27 @@ enum Providers {
 
 // MARK: - Entry point
 
+private func runSelfTests() {
+    let normalLimits: [String: Any] = [
+        "primary": ["window_minutes": 300, "used_percent": 12.0],
+        "secondary": ["window_minutes": 10080, "used_percent": 63.0],
+    ]
+    precondition(CodexProvider.extractWeeklyHeadline(from: normalLimits)?.percent == 63)
+    precondition(CodexProvider.extractWeeklyHeadline(from: normalLimits)?.severity == "normal")
+
+    let criticalLimits: [String: Any] = [
+        "primary": ["window_minutes": 300, "used_percent": 12.0],
+        "secondary": ["window_minutes": 10080, "used_percent": 96.0],
+    ]
+    precondition(CodexProvider.extractWeeklyHeadline(from: criticalLimits)?.severity == "critical")
+    print("Self-tests passed")
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    runSelfTests()
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--once") {
     let semaphore = DispatchSemaphore(value: 0)
     Task {
