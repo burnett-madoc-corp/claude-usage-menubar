@@ -210,30 +210,61 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Title — Claude stays the headline; the rest live in the dropdown.
+    // MARK: Title — Claude and Codex stay visible; other providers live in the dropdown.
+
+    nonisolated static func headlineText(claude: (session: Int, weekly: Int)?, codex: Int?) -> String {
+        let session = claude.map { "\($0.session)%" } ?? "—"
+        let weekly = claude.map { "\($0.weekly)%" } ?? "—"
+        let codexWeekly = codex.map { "\($0)%" } ?? "—"
+        return "Claude 5h \(session) wk \(weekly)   Codex \(codexWeekly)"
+    }
 
     private func renderTitle() {
         guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         let title = NSMutableAttributedString()
+        let claude = ClaudeProvider.headline.value
+        let codex = CodexProvider.headline.value
 
         func append(_ text: String, _ color: NSColor) {
             title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
         }
 
-        guard let headline = ClaudeProvider.headline.value else {
-            button.attributedTitle = NSAttributedString(
-                string: cards.isEmpty ? "◌ …" : "◌ !",
-                attributes: [.font: font, .foregroundColor: cards.isEmpty ? NSColor.secondaryLabelColor : NSColor.systemRed]
-            )
-            return
+        func appendLogo(_ resource: String, fallback: String) {
+            guard let url = Bundle.main.url(forResource: resource, withExtension: "svg"),
+                  let image = NSImage(contentsOf: url)
+            else {
+                append(fallback, .secondaryLabelColor)
+                return
+            }
+            image.isTemplate = true
+            image.size = NSSize(width: 13, height: 13)
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
+            title.append(NSAttributedString(attachment: attachment))
         }
 
-        append("5h ", .secondaryLabelColor)
-        append("\(headline.session)%", Format.color(for: headline.severity, percent: headline.session))
+        appendLogo("claude-template", fallback: "Claude")
+        append(" 5h ", .secondaryLabelColor)
+        append(claude.map { "\($0.session)%" } ?? "—",
+               claude.map { Format.color(for: $0.severity, percent: $0.session) } ?? .secondaryLabelColor)
         append("  wk ", .secondaryLabelColor)
-        append("\(headline.weekly)%", Format.color(for: headline.severity, percent: headline.weekly))
+        append(claude.map { "\($0.weekly)%" } ?? "—",
+               claude.map { Format.color(for: $0.severity, percent: $0.weekly) } ?? .secondaryLabelColor)
+        append("   ", .secondaryLabelColor)
+        appendLogo("codex-template", fallback: "Codex")
+        append(" ", .secondaryLabelColor)
+        append(codex.map { "\($0.percent)%" } ?? "—",
+               codex.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
+
         button.attributedTitle = title
+        let plainText = Self.headlineText(
+            claude: claude.map { ($0.session, $0.weekly) },
+            codex: codex?.percent
+        )
+        button.toolTip = plainText
+        button.setAccessibilityLabel(plainText)
     }
 
     private static let clock: DateFormatter = {
@@ -365,6 +396,13 @@ private func runSelfTests() {
         "secondary": ["window_minutes": 10080, "used_percent": 96.0],
     ]
     precondition(CodexProvider.extractWeeklyHeadline(from: criticalLimits)?.severity == "critical")
+
+    precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: 42)
+                 == "Claude 5h 17% wk 85%   Codex 42%")
+    precondition(UsageMenuBar.headlineText(claude: nil, codex: 42)
+                 == "Claude 5h — wk —   Codex 42%")
+    precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: nil)
+                 == "Claude 5h 17% wk 85%   Codex —")
     print("Self-tests passed")
 }
 
