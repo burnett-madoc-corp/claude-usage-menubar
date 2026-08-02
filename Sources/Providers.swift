@@ -19,6 +19,11 @@ struct Card {
     var error: String?
 }
 
+struct HeadlineValue {
+    let percent: Int
+    let severity: String
+}
+
 protocol Provider: Sendable {
     var name: String { get }
     func load() async -> Card
@@ -95,12 +100,24 @@ enum Net {
 struct CodexProvider: Provider {
     let name = "Codex"
 
+    static let headline = Headline()
+
+    final class Headline: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: HeadlineValue?
+        var value: HeadlineValue? {
+            get { lock.lock(); defer { lock.unlock() }; return storage }
+            set { lock.lock(); storage = newValue; lock.unlock() }
+        }
+    }
+
     private var sessionsDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
     }
 
     func load() async -> Card {
         guard let newest = newestSessions(limit: 6), !newest.isEmpty else {
+            Self.headline.value = nil
             return Card(provider: name, rows: [], error: "no Codex sessions found")
         }
 
@@ -119,11 +136,27 @@ struct CodexProvider: Provider {
                 }
             }
         }
+        Self.headline.value = nil
         return Card(provider: name, rows: [], error: "no rate-limit data in recent sessions")
+    }
+
+    static func extractWeeklyHeadline(from limits: [String: Any]) -> HeadlineValue? {
+        for key in ["primary", "secondary"] {
+            guard let window = limits[key] as? [String: Any],
+                  (window["window_minutes"] as? NSNumber)?.intValue == 10080,
+                  let used = (window["used_percent"] as? NSNumber)?.doubleValue
+            else { continue }
+            let percent = Int(used.rounded())
+            let severity = percent >= 95 ? "critical" : (percent >= 80 ? "warning" : "normal")
+            return HeadlineValue(percent: percent, severity: severity)
+        }
+        return nil
     }
 
     private func card(from limits: [String: Any], timestamp: String?) -> Card? {
         var rows: [Row] = []
+
+        Self.headline.value = Self.extractWeeklyHeadline(from: limits)
 
         for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
             guard let window = limits[key] as? [String: Any],

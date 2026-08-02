@@ -4,11 +4,11 @@ A tiny native menu bar app showing rate-limit and credit usage across the AI
 coding tools you actually use: **Claude**, **Codex**, **Antigravity**,
 **OpenRouter** and **Grok**.
 
-Claude's 5-hour and weekly windows stay in the menu bar title; everything else
-lives one click away.
+Claude's 5-hour and weekly windows plus Codex's weekly percentage stay in the
+menu bar title. Reset times and every other provider live one click away.
 
 ```
-5h 17%  wk 85%          ← menu bar title (tinted by severity)
+[Claude] 5h 17%  wk 85%   [Codex] wk 42%  ← menu bar title (RAG coloured)
 
 Claude
   5-hour   ██░░░░░░░░   17%   resets in 3h 23m

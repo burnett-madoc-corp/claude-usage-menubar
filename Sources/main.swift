@@ -16,12 +16,10 @@ enum Format {
         return f
     }()
 
-    static func color(for severity: String, percent: Int) -> NSColor {
-        switch severity {
-        case "critical": return .systemRed
-        case "warning": return .systemOrange
-        default: return percent >= 90 ? .systemRed : .labelColor
-        }
+    static func color(for _: String, percent: Int) -> NSColor {
+        if percent >= 95 { return .systemRed }
+        if percent >= 80 { return .systemOrange }
+        return .systemGreen
     }
 
     /// "2h 14m", "3d 4h" — compact enough for a menu row.
@@ -210,30 +208,73 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Title — Claude stays the headline; the rest live in the dropdown.
+    // MARK: Title — Claude and Codex stay visible; other providers live in the dropdown.
+
+    nonisolated static func headlineText(claude: (session: Int, weekly: Int)?, codex: Int?) -> String {
+        let session = claude.map { "\($0.session)%" } ?? "—"
+        let weekly = claude.map { "\($0.weekly)%" } ?? "—"
+        let codexWeekly = codex.map { "\($0)%" } ?? "—"
+        return "Claude 5h \(session) wk \(weekly)   Codex wk \(codexWeekly)"
+    }
+
+    nonisolated static func logoImage(resource: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "svg"),
+              let source = NSImage(contentsOf: url)
+        else { return nil }
+
+        let size = NSSize(width: 13, height: 13)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        source.draw(in: NSRect(origin: .zero, size: size))
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill(using: .sourceAtop)
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }
 
     private func renderTitle() {
         guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         let title = NSMutableAttributedString()
+        let claude = ClaudeProvider.headline.value
+        let codex = CodexProvider.headline.value
 
         func append(_ text: String, _ color: NSColor) {
             title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
         }
 
-        guard let headline = ClaudeProvider.headline.value else {
-            button.attributedTitle = NSAttributedString(
-                string: cards.isEmpty ? "◌ …" : "◌ !",
-                attributes: [.font: font, .foregroundColor: cards.isEmpty ? NSColor.secondaryLabelColor : NSColor.systemRed]
-            )
-            return
+        func appendLogo(_ resource: String, fallback: String) {
+            guard let image = Self.logoImage(resource: resource) else {
+                append(fallback, .secondaryLabelColor)
+                return
+            }
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
+            title.append(NSAttributedString(attachment: attachment))
         }
 
-        append("5h ", .secondaryLabelColor)
-        append("\(headline.session)%", Format.color(for: headline.severity, percent: headline.session))
+        appendLogo("claude-template", fallback: "Claude")
+        append(" 5h ", .secondaryLabelColor)
+        append(claude.map { "\($0.session)%" } ?? "—",
+               claude.map { Format.color(for: $0.severity, percent: $0.session) } ?? .secondaryLabelColor)
         append("  wk ", .secondaryLabelColor)
-        append("\(headline.weekly)%", Format.color(for: headline.severity, percent: headline.weekly))
+        append(claude.map { "\($0.weekly)%" } ?? "—",
+               claude.map { Format.color(for: $0.severity, percent: $0.weekly) } ?? .secondaryLabelColor)
+        append("   ", .secondaryLabelColor)
+        appendLogo("codex-template", fallback: "Codex")
+        append(" wk ", .secondaryLabelColor)
+        append(codex.map { "\($0.percent)%" } ?? "—",
+               codex.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
+
         button.attributedTitle = title
+        let plainText = Self.headlineText(
+            claude: claude.map { ($0.session, $0.weekly) },
+            codex: codex?.percent
+        )
+        button.toolTip = plainText
+        button.setAccessibilityLabel(plainText)
     }
 
     private static let clock: DateFormatter = {
@@ -351,6 +392,52 @@ enum Providers {
 }
 
 // MARK: - Entry point
+
+private func runSelfTests() {
+    let normalLimits: [String: Any] = [
+        "primary": ["window_minutes": 300, "used_percent": 12.0],
+        "secondary": ["window_minutes": 10080, "used_percent": 63.0],
+    ]
+    precondition(CodexProvider.extractWeeklyHeadline(from: normalLimits)?.percent == 63)
+    precondition(CodexProvider.extractWeeklyHeadline(from: normalLimits)?.severity == "normal")
+
+    let criticalLimits: [String: Any] = [
+        "primary": ["window_minutes": 300, "used_percent": 12.0],
+        "secondary": ["window_minutes": 10080, "used_percent": 96.0],
+    ]
+    precondition(CodexProvider.extractWeeklyHeadline(from: criticalLimits)?.severity == "critical")
+
+    precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: 42)
+                 == "Claude 5h 17% wk 85%   Codex wk 42%")
+    precondition(UsageMenuBar.headlineText(claude: nil, codex: 42)
+                 == "Claude 5h — wk —   Codex wk 42%")
+    precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: nil)
+                 == "Claude 5h 17% wk 85%   Codex wk —")
+
+    precondition(Format.color(for: "normal", percent: 79).isEqual(NSColor.systemGreen))
+    precondition(Format.color(for: "normal", percent: 80).isEqual(NSColor.systemOrange))
+    precondition(Format.color(for: "normal", percent: 95).isEqual(NSColor.systemRed))
+
+    let logo = UsageMenuBar.logoImage(resource: "codex-template")
+    precondition(logo != nil)
+    precondition(logo!.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)).map { bitmap in
+        (0..<bitmap.pixelsHigh).contains { y in
+            (0..<bitmap.pixelsWide).contains { x in
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
+                return color.alphaComponent > 0.5
+                    && color.redComponent > 0.9
+                    && color.greenComponent > 0.9
+                    && color.blueComponent > 0.9
+            }
+        }
+    } == true)
+    print("Self-tests passed")
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    runSelfTests()
+    exit(0)
+}
 
 if CommandLine.arguments.contains("--once") {
     let semaphore = DispatchSemaphore(value: 0)

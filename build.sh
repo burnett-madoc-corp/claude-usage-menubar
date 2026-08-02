@@ -10,6 +10,7 @@ BIN="$APP/Contents/MacOS/ClaudeUsage"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Resources/*-template.svg "$APP/Contents/Resources/"
 
 echo "Compiling…"
 swiftc -O \
