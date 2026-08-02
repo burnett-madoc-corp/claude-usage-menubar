@@ -16,12 +16,10 @@ enum Format {
         return f
     }()
 
-    static func color(for severity: String, percent: Int) -> NSColor {
-        switch severity {
-        case "critical": return .systemRed
-        case "warning": return .systemOrange
-        default: return percent >= 90 ? .systemRed : .labelColor
-        }
+    static func color(for _: String, percent: Int) -> NSColor {
+        if percent >= 95 { return .systemRed }
+        if percent >= 80 { return .systemOrange }
+        return .systemGreen
     }
 
     /// "2h 14m", "3d 4h" — compact enough for a menu row.
@@ -216,7 +214,23 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         let session = claude.map { "\($0.session)%" } ?? "—"
         let weekly = claude.map { "\($0.weekly)%" } ?? "—"
         let codexWeekly = codex.map { "\($0)%" } ?? "—"
-        return "Claude 5h \(session) wk \(weekly)   Codex \(codexWeekly)"
+        return "Claude 5h \(session) wk \(weekly)   Codex wk \(codexWeekly)"
+    }
+
+    nonisolated static func logoImage(resource: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "svg"),
+              let source = NSImage(contentsOf: url)
+        else { return nil }
+
+        let size = NSSize(width: 13, height: 13)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        source.draw(in: NSRect(origin: .zero, size: size))
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill(using: .sourceAtop)
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
     }
 
     private func renderTitle() {
@@ -231,14 +245,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
 
         func appendLogo(_ resource: String, fallback: String) {
-            guard let url = Bundle.main.url(forResource: resource, withExtension: "svg"),
-                  let image = NSImage(contentsOf: url)
-            else {
+            guard let image = Self.logoImage(resource: resource) else {
                 append(fallback, .secondaryLabelColor)
                 return
             }
-            image.isTemplate = true
-            image.size = NSSize(width: 13, height: 13)
             let attachment = NSTextAttachment()
             attachment.image = image
             attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
@@ -254,7 +264,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
                claude.map { Format.color(for: $0.severity, percent: $0.weekly) } ?? .secondaryLabelColor)
         append("   ", .secondaryLabelColor)
         appendLogo("codex-template", fallback: "Codex")
-        append(" ", .secondaryLabelColor)
+        append(" wk ", .secondaryLabelColor)
         append(codex.map { "\($0.percent)%" } ?? "—",
                codex.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
 
@@ -398,11 +408,29 @@ private func runSelfTests() {
     precondition(CodexProvider.extractWeeklyHeadline(from: criticalLimits)?.severity == "critical")
 
     precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: 42)
-                 == "Claude 5h 17% wk 85%   Codex 42%")
+                 == "Claude 5h 17% wk 85%   Codex wk 42%")
     precondition(UsageMenuBar.headlineText(claude: nil, codex: 42)
-                 == "Claude 5h — wk —   Codex 42%")
+                 == "Claude 5h — wk —   Codex wk 42%")
     precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: nil)
-                 == "Claude 5h 17% wk 85%   Codex —")
+                 == "Claude 5h 17% wk 85%   Codex wk —")
+
+    precondition(Format.color(for: "normal", percent: 79).isEqual(NSColor.systemGreen))
+    precondition(Format.color(for: "normal", percent: 80).isEqual(NSColor.systemOrange))
+    precondition(Format.color(for: "normal", percent: 95).isEqual(NSColor.systemRed))
+
+    let logo = UsageMenuBar.logoImage(resource: "codex-template")
+    precondition(logo != nil)
+    precondition(logo!.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)).map { bitmap in
+        (0..<bitmap.pixelsHigh).contains { y in
+            (0..<bitmap.pixelsWide).contains { x in
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
+                return color.alphaComponent > 0.5
+                    && color.redComponent > 0.9
+                    && color.greenComponent > 0.9
+                    && color.blueComponent > 0.9
+            }
+        }
+    } == true)
     print("Self-tests passed")
 }
 

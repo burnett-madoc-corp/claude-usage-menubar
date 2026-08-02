@@ -8,7 +8,7 @@ Claude's 5-hour and weekly windows plus Codex's weekly percentage stay in the
 menu bar title. Reset times and every other provider live one click away.
 
 ```
-[Claude] 5h 17%  wk 85%   [Codex] 42%  ← menu bar title (tinted by severity)
+[Claude] 5h 17%  wk 85%   [Codex] wk 42%  ← menu bar title (RAG coloured)
 
 Claude
   5-hour   ██░░░░░░░░   17%   resets in 3h 23m

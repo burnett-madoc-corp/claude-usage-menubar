@@ -8,18 +8,18 @@ Show Codex weekly usage directly in the macOS menu bar so it is visible without 
 
 The menu-bar headline contains two compact provider groups in this order:
 
-1. A monochrome Claude logo followed by its existing `5h` and `wk` percentages.
-2. A monochrome Codex logo followed by the Codex weekly percentage only.
+1. A white Claude logo followed by its existing `5h` and `wk` percentages.
+2. A white Codex logo followed by `wk` and the Codex weekly percentage.
 
 Conceptually:
 
 ```text
-[Claude] 5h 17% wk 85%   [Codex] 42%
+[Claude] 5h 17% wk 85%   [Codex] wk 42%
 ```
 
 Reset countdowns, freshness notes, plan details, and all other providers remain in the click-open dropdown. Antigravity, OpenRouter, and Grok are not added to the menu-bar headline.
 
-The provider logos use macOS template-image rendering so they remain legible in light and dark menu bars. Percentages retain the app's existing warning and critical colours. Missing provider data displays an em dash in that provider's position instead of removing the group and causing the headline layout to jump.
+The provider logos render white for strong contrast on the dark menu bar. Percentages use RAG colours: green below 80%, amber from 80% through 94%, and red from 95% upward. Missing provider data displays an em dash in that provider's position instead of removing the group and causing the headline layout to jump.
 
 ## Data Flow
 

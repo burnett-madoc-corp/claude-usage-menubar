@@ -13,7 +13,7 @@
 - The menu-bar headline contains Claude first and Codex second.
 - Codex shows only its weekly percentage; reset countdowns and freshness remain in the dropdown.
 - Antigravity, OpenRouter, and Grok remain click-only providers.
-- Provider marks must remain legible in light and dark menu bars.
+- Provider marks render white, and percentages use green below 80%, amber from 80% through 94%, and red from 95% upward.
 - Missing data uses an em dash and does not remove or reorder a provider group.
 - No new third-party dependencies.
 
@@ -121,7 +121,7 @@ Create compact official-shape monochrome SVG marks for Claude and Codex/OpenAI, 
 The attributed title must conceptually render:
 
 ```text
-[Claude logo] 5h 17% wk 85%   [Codex logo] 42%
+[Claude logo] 5h 17% wk 85%   [Codex logo] wk 42%
 ```
 
 - [ ] **Step 4: Update documentation**
