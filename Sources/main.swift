@@ -1,143 +1,6 @@
 import AppKit
 import Foundation
 
-// MARK: - Model
-
-/// One rate-limit window as reported by /api/oauth/usage.
-struct Window {
-    let label: String
-    let percent: Int
-    let severity: String
-    let resetsAt: Date?
-    let isActive: Bool
-}
-
-struct Usage {
-    let session: Window?
-    let weekly: Window?
-    /// Per-model weekly windows (Fable, Opus, …), keyed off `limits[].scope.model.display_name`.
-    let scoped: [Window]
-    let extraCreditsEnabled: Bool
-    let spendPercent: Int?
-}
-
-enum UsageError: LocalizedError {
-    case noCredentials
-    case tokenExpired
-    case http(Int)
-
-    var errorDescription: String? {
-        switch self {
-        case .noCredentials: return "No Claude credentials in Keychain"
-        case .tokenExpired: return "Token expired — run `claude` to refresh"
-        case .http(let code): return "Usage API returned HTTP \(code)"
-        }
-    }
-}
-
-// MARK: - Credentials
-
-/// Reads the OAuth access token out of the login Keychain.
-///
-/// We deliberately only ever *read*. Anthropic rotates refresh tokens, so
-/// redeeming one here would silently invalidate the token Claude Code itself
-/// holds and break its login. When the token goes stale we surface that
-/// instead — running `claude` refreshes it and we pick the new one up on the
-/// next poll, since the Keychain is re-read every time.
-enum Credentials {
-    static func accessToken() throws -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        try task.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-
-        guard task.terminationStatus == 0,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
-        else { throw UsageError.noCredentials }
-        return token
-    }
-}
-
-// MARK: - API client
-
-enum UsageAPI {
-    static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-
-    static func fetch() async throws -> Usage {
-        var request = URLRequest(url: endpoint)
-        request.setValue("Bearer \(try Credentials.accessToken())", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("claude-usage-menubar/1.0", forHTTPHeaderField: "User-Agent")
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.timeoutInterval = 20
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw http.statusCode == 401 ? UsageError.tokenExpired : UsageError.http(http.statusCode)
-        }
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw UsageError.http(-1)
-        }
-        return parse(json)
-    }
-
-    private static let iso: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-
-    private static func date(_ raw: Any?) -> Date? {
-        guard let s = raw as? String else { return nil }
-        return iso.date(from: s) ?? ISO8601DateFormatter().date(from: s)
-    }
-
-    /// The `limits` array is the authoritative view: it carries severity and,
-    /// for per-model caps, a `scope.model.display_name` such as "Fable".
-    private static func parse(_ json: [String: Any]) -> Usage {
-        var session: Window?
-        var weekly: Window?
-        var scoped: [Window] = []
-
-        for case let limit as [String: Any] in json["limits"] as? [Any] ?? [] {
-            let percent = (limit["percent"] as? NSNumber)?.intValue ?? 0
-            let severity = limit["severity"] as? String ?? "normal"
-            let resets = date(limit["resets_at"])
-            let active = limit["is_active"] as? Bool ?? false
-            let model = ((limit["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
-
-            switch limit["kind"] as? String {
-            case "session":
-                session = Window(label: "5-hour", percent: percent, severity: severity, resetsAt: resets, isActive: active)
-            case "weekly_all":
-                weekly = Window(label: "Weekly", percent: percent, severity: severity, resetsAt: resets, isActive: active)
-            case "weekly_scoped":
-                scoped.append(Window(label: model ?? "Weekly (scoped)", percent: percent,
-                                     severity: severity, resetsAt: resets, isActive: active))
-            default:
-                break
-            }
-        }
-
-        let extra = json["extra_usage"] as? [String: Any]
-        let spend = json["spend"] as? [String: Any]
-        return Usage(
-            session: session,
-            weekly: weekly,
-            scoped: scoped,
-            extraCreditsEnabled: extra?["is_enabled"] as? Bool ?? false,
-            spendPercent: (spend?["percent"] as? NSNumber)?.intValue
-        )
-    }
-}
-
 // MARK: - Formatting
 
 extension String {
@@ -147,6 +10,12 @@ extension String {
 }
 
 enum Format {
+    static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
     static func color(for severity: String, percent: Int) -> NSColor {
         switch severity {
         case "critical": return .systemRed
@@ -166,84 +35,205 @@ enum Format {
         return "\(m)m"
     }
 
+    static func ago(_ date: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        let (d, h, m) = (seconds / 86400, (seconds % 86400) / 3600, (seconds % 3600) / 60)
+        if d > 0 { return "\(d)d ago" }
+        if h > 0 { return "\(h)h ago" }
+        return m > 0 ? "\(m)m ago" : "just now"
+    }
+
+    static func usd(_ amount: Double) -> String {
+        String(format: amount.magnitude < 10 ? "$%.3f" : "$%.2f", amount)
+    }
+
     static func bar(_ percent: Int, width: Int = 10) -> String {
         let filled = max(0, min(width, Int((Double(percent) / 100.0 * Double(width)).rounded())))
         return String(repeating: "█", count: filled) + String(repeating: "░", count: width - filled)
     }
 }
 
-// MARK: - Menu bar controller
+// MARK: - Claude
+
+enum ClaudeError: LocalizedError {
+    case noCredentials, tokenExpired, http(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .noCredentials: return "No Claude credentials in Keychain"
+        case .tokenExpired: return "Token expired — run `claude` to refresh"
+        case .http(let code): return "Usage API returned HTTP \(code)"
+        }
+    }
+}
+
+/// Reads the OAuth access token out of the login Keychain.
+///
+/// We deliberately only ever *read*. Anthropic rotates refresh tokens, so
+/// redeeming one here would silently invalidate the token Claude Code itself
+/// holds and break its login. When the token goes stale we surface that
+/// instead — running `claude` refreshes it and we pick the new one up on the
+/// next poll, since the Keychain is re-read every time.
+enum Keychain {
+    static func claudeToken() throws -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        try task.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+
+        guard task.terminationStatus == 0,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String
+        else { throw ClaudeError.noCredentials }
+        return token
+    }
+}
+
+/// The `limits` array is authoritative: it carries severity and, for per-model
+/// caps, a `scope.model.display_name` such as "Fable". Scoped windows are
+/// iterated rather than hardcoded, so new per-model caps appear on their own.
+struct ClaudeProvider: Provider {
+    let name = "Claude"
+
+    /// Headline numbers for the menu bar title, set as a side effect of load().
+    static let headline = Headline()
+
+    final class Headline: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: (session: Int, weekly: Int, severity: String)?
+        var value: (session: Int, weekly: Int, severity: String)? {
+            get { lock.lock(); defer { lock.unlock() }; return storage }
+            set { lock.lock(); storage = newValue; lock.unlock() }
+        }
+    }
+
+    func load() async -> Card {
+        do {
+            let token = try Keychain.claudeToken()
+            let json = try await Net.getJSON(
+                URL(string: "https://api.anthropic.com/api/oauth/usage")!,
+                bearer: token,
+                extraHeaders: ["anthropic-beta": "oauth-2025-04-20"]
+            )
+
+            var rows: [Row] = []
+            var session = 0, weekly = 0, worst = "normal"
+
+            for case let limit as [String: Any] in json["limits"] as? [Any] ?? [] {
+                let percent = (limit["percent"] as? NSNumber)?.intValue ?? 0
+                let severity = limit["severity"] as? String ?? "normal"
+                let resets = (limit["resets_at"] as? String).flatMap {
+                    Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
+                }
+                let model = ((limit["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+
+                let label: String
+                switch limit["kind"] as? String {
+                case "session": label = "5-hour"; session = percent
+                case "weekly_all": label = "Weekly"; weekly = percent
+                case "weekly_scoped": label = model ?? "Weekly (scoped)"
+                default: continue
+                }
+                if severity == "critical" || (severity == "warning" && worst == "normal") { worst = severity }
+                rows.append(Row(label: label, percent: percent,
+                                detail: "resets in \(Format.countdown(to: resets))", severity: severity))
+            }
+
+            Self.headline.value = (session, weekly, worst)
+            return Card(provider: name, rows: rows)
+        } catch let error as NSError where error.domain == "http" && error.code == 401 {
+            // Only a genuine auth failure invalidates the headline; transient
+            // errors below keep the last good numbers on screen.
+            Self.headline.value = nil
+            return Card(provider: name, rows: [], error: ClaudeError.tokenExpired.localizedDescription)
+        } catch let error as NSError where error.domain == "http" && error.code == 429 {
+            return Card(provider: name, rows: [], error: "rate limited by usage API")
+        } catch {
+            return Card(provider: name, rows: [], error: error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - Menu bar
 
 @MainActor
 final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var timer: Timer?
-    private var lastUsage: Usage?
-    private var lastError: Error?
+    private var cards: [Card] = []
     private var lastUpdated: Date?
-
-    private let refreshInterval: TimeInterval = 60
+    // The Anthropic usage endpoint rate-limits aggressively; 2 minutes keeps
+    // well clear while still feeling live.
+    private let refreshInterval: TimeInterval = 120
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         statusItem.menu = menu
         menu.delegate = self
-        render()
+        renderTitle()
         refresh()
 
         timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        // Keep polling while a menu is open, and survive App Nap throttling.
         RunLoop.main.add(timer!, forMode: .common)
     }
 
     @objc func refresh() {
         Task { @MainActor in
-            do {
-                lastUsage = try await UsageAPI.fetch()
-                lastError = nil
-            } catch {
-                lastError = error
-            }
+            cards = Self.merge(new: await Providers.loadAll(), previous: cards)
             lastUpdated = Date()
-            render()
+            renderTitle()
+            rebuildMenu()
         }
     }
 
-    // MARK: Title
-
-    private func render() {
-        guard let button = statusItem.button else { return }
-
-        guard let usage = lastUsage else {
-            button.attributedTitle = NSAttributedString(
-                string: lastError == nil ? "◌ …" : "◌ !",
-                attributes: [.foregroundColor: lastError == nil ? NSColor.secondaryLabelColor : NSColor.systemRed]
-            )
-            return
+    /// A failed poll (a 429, a dropped network) should not blank a provider
+    /// that was working a minute ago — keep the last good rows and mark them
+    /// stale instead.
+    private static func merge(new: [Card], previous: [Card]) -> [Card] {
+        let byName = Dictionary(previous.map { ($0.provider, $0) }, uniquingKeysWith: { first, _ in first })
+        return new.map { card in
+            guard let error = card.error, card.rows.isEmpty,
+                  let old = byName[card.provider], !old.rows.isEmpty
+            else { return card }
+            var stale = old
+            stale.note = "stale — \(error)"
+            return stale
         }
+    }
 
-        // Compact title: 5h and weekly, each tinted by its own severity.
-        let title = NSMutableAttributedString()
+    // MARK: Title — Claude stays the headline; the rest live in the dropdown.
+
+    private func renderTitle() {
+        guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        let title = NSMutableAttributedString()
 
         func append(_ text: String, _ color: NSColor) {
             title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
         }
 
-        if let session = usage.session {
-            append("5h ", .secondaryLabelColor)
-            append("\(session.percent)%", Format.color(for: session.severity, percent: session.percent))
+        guard let headline = ClaudeProvider.headline.value else {
+            button.attributedTitle = NSAttributedString(
+                string: cards.isEmpty ? "◌ …" : "◌ !",
+                attributes: [.font: font, .foregroundColor: cards.isEmpty ? NSColor.secondaryLabelColor : NSColor.systemRed]
+            )
+            return
         }
-        if let weekly = usage.weekly {
-            if usage.session != nil { append("  ", .secondaryLabelColor) }
-            append("wk ", .secondaryLabelColor)
-            append("\(weekly.percent)%", Format.color(for: weekly.severity, percent: weekly.percent))
-        }
+
+        append("5h ", .secondaryLabelColor)
+        append("\(headline.session)%", Format.color(for: headline.severity, percent: headline.session))
+        append("  wk ", .secondaryLabelColor)
+        append("\(headline.weekly)%", Format.color(for: headline.severity, percent: headline.weekly))
         button.attributedTitle = title
-        button.toolTip = "Claude usage — updated \(lastUpdated.map(Self.clock.string(from:)) ?? "never")"
     }
 
     private static let clock: DateFormatter = {
@@ -257,64 +247,67 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         menu.removeAllItems()
 
-        if let error = lastError {
-            addHeader(error.localizedDescription, color: .systemRed)
-            if case UsageError.tokenExpired = error {
-                addHeader("Run `claude` once; this picks it up automatically.", color: .secondaryLabelColor)
+        for card in cards {
+            addSectionHeader(card.provider)
+            if let error = card.error {
+                addLine("  \(error)", color: .systemRed, size: 11)
+            }
+            let labelWidth = card.rows.map(\.label.count).max() ?? 8
+            for row in card.rows { addRow(row, labelWidth: labelWidth) }
+            if let note = card.note {
+                addLine("  \(note)", color: .tertiaryLabelColor, size: 10)
             }
             menu.addItem(.separator())
         }
 
-        if let usage = lastUsage {
-            addWindow(usage.session)
-            addWindow(usage.weekly)
-            for window in usage.scoped { addWindow(window) }
-
-            if usage.extraCreditsEnabled, let spend = usage.spendPercent {
-                menu.addItem(.separator())
-                addHeader("Extra credits: \(spend)% used", color: .secondaryLabelColor)
-            }
-        } else if lastError == nil {
-            addHeader("Loading…", color: .secondaryLabelColor)
-        }
-
-        menu.addItem(.separator())
         if let updated = lastUpdated {
-            addHeader("Updated \(Self.clock.string(from: updated))", color: .tertiaryLabelColor)
+            addLine("Updated \(Self.clock.string(from: updated))", color: .tertiaryLabelColor, size: 10)
         }
 
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
-
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quitItem)
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
-    private func addWindow(_ window: Window?) {
-        guard let window else { return }
-        let color = Format.color(for: window.severity, percent: window.percent)
-        let line = NSMutableAttributedString()
+    private func addRow(_ row: Row, labelWidth: Int) {
         let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-
-        let name = window.label.padding(toLength: max(8, window.label.count + 1), withPad: " ", startingAt: 0)
+        let line = NSMutableAttributedString()
+        let name = "  " + row.label.padding(toLength: max(labelWidth, row.label.count) + 1,
+                                            withPad: " ", startingAt: 0)
         line.append(NSAttributedString(string: name, attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
-        line.append(NSAttributedString(string: Format.bar(window.percent) + "  ",
-                                       attributes: [.font: mono, .foregroundColor: color]))
-        line.append(NSAttributedString(string: String(format: "%3d%%", window.percent),
-                                       attributes: [.font: mono, .foregroundColor: color]))
-        line.append(NSAttributedString(string: "   resets in \(Format.countdown(to: window.resetsAt))",
-                                       attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
+
+        if let percent = row.percent {
+            let color = Format.color(for: row.severity, percent: percent)
+            line.append(NSAttributedString(string: Format.bar(percent) + " ",
+                                          attributes: [.font: mono, .foregroundColor: color]))
+            line.append(NSAttributedString(string: String(percent).leftPadded(to: 3) + "%",
+                                          attributes: [.font: mono, .foregroundColor: color]))
+        }
+        if !row.detail.isEmpty {
+            let color: NSColor = row.severity == "critical" ? .systemRed : .secondaryLabelColor
+            line.append(NSAttributedString(string: (row.percent == nil ? "" : "   ") + row.detail,
+                                          attributes: [.font: mono, .foregroundColor: color]))
+        }
 
         let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.attributedTitle = line
         menu.addItem(item)
     }
 
-    private func addHeader(_ text: String, color: NSColor) {
+    private func addSectionHeader(_ text: String) {
         let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.attributedTitle = NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: 11),
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        menu.addItem(item)
+    }
+
+    private func addLine(_ text: String, color: NSColor, size: CGFloat) {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: size),
             .foregroundColor: color,
         ])
         menu.addItem(item)
@@ -322,38 +315,63 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 }
 
 extension UsageMenuBar: NSMenuDelegate {
-    // Rebuild on open so countdowns are current, and kick a fetch if data is stale.
     func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu()
-        if let updated = lastUpdated, Date().timeIntervalSince(updated) > refreshInterval / 2 {
-            refresh()
+        if let updated = lastUpdated, Date().timeIntervalSince(updated) > refreshInterval / 2 { refresh() }
+    }
+}
+
+// MARK: - Provider registry
+
+enum Providers {
+    static func all() -> [Provider] {
+        let config = Config.load()
+        return [
+            ClaudeProvider(),
+            CodexProvider(),
+            AntigravityProvider(),
+            OpenRouterProvider(key: config.openRouterKey),
+            XAIProvider(key: config.xaiKey),
+        ]
+    }
+
+    /// Fetch every provider concurrently but keep registry order in the menu,
+    /// so rows don't jump around between refreshes.
+    static func loadAll() async -> [Card] {
+        let providers = all()
+        return await withTaskGroup(of: (Int, Card).self) { group in
+            for (index, provider) in providers.enumerated() {
+                group.addTask { (index, await provider.load()) }
+            }
+            var results: [(Int, Card)] = []
+            for await result in group { results.append(result) }
+            return results.sorted { $0.0 < $1.0 }.map(\.1)
         }
     }
 }
 
 // MARK: - Entry point
 
-// `--once` prints the same numbers to stdout and exits — handy for scripting
-// and for checking the fetch/parse path without the GUI.
 if CommandLine.arguments.contains("--once") {
     let semaphore = DispatchSemaphore(value: 0)
-    var exitCode: Int32 = 0
     Task {
-        do {
-            let usage = try await UsageAPI.fetch()
-            for window in [usage.session, usage.weekly].compactMap({ $0 }) + usage.scoped {
-                let name = window.label.padding(toLength: 10, withPad: " ", startingAt: 0)
-                let percent = String(window.percent).leftPadded(to: 3)
-                print("\(name) \(Format.bar(window.percent)) \(percent)%  resets in \(Format.countdown(to: window.resetsAt))")
+        for card in await Providers.loadAll() {
+            print(card.provider)
+            if let error = card.error { print("  \(error)") }
+            let width = card.rows.map(\.label.count).max() ?? 0
+            for row in card.rows {
+                // padding(toLength:) truncates when the label is longer, which
+                // collapses distinct model names — pad to the widest instead.
+                let name = row.label.padding(toLength: max(width, 8), withPad: " ", startingAt: 0)
+                let gauge = row.percent.map { "\(Format.bar($0)) \(String($0).leftPadded(to: 3))%  " } ?? ""
+                print("  \(name) \(gauge)\(row.detail)")
             }
-        } catch {
-            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
-            exitCode = 1
+            if let note = card.note { print("  (\(note))") }
         }
         semaphore.signal()
     }
     semaphore.wait()
-    exit(exitCode)
+    exit(0)
 }
 
 // Top-level code always runs on the main thread, so asserting main-actor

@@ -16,7 +16,7 @@ swiftc -O \
   -target arm64-apple-macosx13.0 \
   -framework AppKit \
   -o "$BIN" \
-  Sources/main.swift
+  Sources/Providers.swift Sources/main.swift
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
