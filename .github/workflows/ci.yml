@@ -6,7 +6,12 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A superseded push should give up its slot, so pushes still cancel.
+  # A review must NOT: cancelling an in-flight build leaves a FAILURE check run
+  # that the replacement run's SUCCESS does not supersede. The rollup for that
+  # SHA stays FAILURE and the PR is blocked with auto-merge armed but never
+  # firing, until someone re-runs the cancelled run by hand.
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
 permissions:
   contents: read

@@ -1,0 +1,16 @@
+name: PR title lint
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title-lint:
+    uses: burnett-madoc-corp/Claude-skills/.github/workflows/pr-title-lint-reusable.yml@main
