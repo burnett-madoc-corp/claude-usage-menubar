@@ -9,7 +9,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # Deliberately false. This workflow runs on `edited`, so retitling a PR to fix
+  # a title-lint failure would otherwise cancel the run already in flight -- and
+  # a cancelled check run is never superseded by a later success, leaving the
+  # rollup FAILURE and the PR blocked with auto-merge armed but never firing.
+  # The job validates a string in seconds; there is no slot worth reclaiming.
+  cancel-in-progress: false
 
 jobs:
   pr-title-lint:
