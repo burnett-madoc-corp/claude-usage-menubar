@@ -5,7 +5,9 @@ coding tools you actually use: **Claude**, **Codex**, **Antigravity**,
 **OpenRouter** and **Grok**.
 
 Claude's 5-hour and weekly windows plus Codex's weekly percentage stay in the
-menu bar title. Reset times and every other provider live one click away.
+menu bar title. Reset times, every other provider, and live agent sessions all
+live one click away — alongside a Settings window (⌘,) for provider
+visibility, refresh interval, and API keys.
 
 ```
 [Claude] 5h 17%  wk 85%   [Codex] wk 42%  ← menu bar title (RAG coloured)
@@ -49,10 +51,41 @@ The plain Gemini CLI is deliberately not included: Google exposes no quota
 endpoint for it — the CLI itself only learns its quota from the metadata on a
 429. Antigravity is covered instead, because it has a real quota RPC.
 
+All five providers are visible by default, in both the dropdown and (where
+they publish a headline) the title — see [Settings](#settings) to change that
+per provider.
+
+## Settings
+
+Everything below is one **Settings…** (⌘,) click away from the dropdown — a
+plain AppKit window, no SwiftUI, matching the rest of the app. Nothing in it
+needs a restart: prefs are read fresh on every poll and every menu rebuild.
+
+**Providers** — two independent checkboxes per provider: *Dropdown* (show its
+card in the menu) and *Menu bar* (put it in the title). Menu bar only exists
+for Claude and Codex — they're the only two with a headline value to put in
+12pt of title text, so the other three simply don't get that checkbox rather
+than showing it disabled. Hiding a provider from both stops polling it
+entirely — a real saving, since the Anthropic usage endpoint rate-limits
+aggressively and every unnecessary poll eats into that budget. `--once`
+ignores all of this and always reports every provider, since headless output
+is a diagnostic, not a display.
+
+**Refresh interval** — 1/2/5/10/15 minutes, default 2. Floored at 60s for the
+same reason: the Claude usage API rate-limits aggressively enough that a
+faster poll risks trading a working title for a string of 429s.
+
+**Sessions** — a show/hide checkbox for the whole section below, and a
+Compact/Detailed row-style choice. See [Sessions](#sessions).
+
 ## API keys
 
-OpenRouter and Grok need keys. Put them in
-`~/.config/claude-usage/config.json` (never in the repo):
+OpenRouter and Grok need keys. Highest-precedence source wins:
+
+1. `OPENROUTER_API_KEY` / `XAI_API_KEY` environment variables.
+2. The macOS Keychain — set from **Settings… → API Keys**, service
+   `local.claude-usage-menubar`.
+3. Legacy `~/.config/claude-usage/config.json` (never in the repo):
 
 ```json
 {
@@ -61,8 +94,104 @@ OpenRouter and Grok need keys. Put them in
 }
 ```
 
-`OPENROUTER_API_KEY` / `XAI_API_KEY` environment variables override the file.
+The legacy file is a permanent fallback, not a deprecation notice with a
+deadline: if you never open Settings, it keeps working forever, un-nagged. If
+it holds a key with no matching Keychain item yet, Settings offers a one-click
+"Import from config.json" — the file itself is left on disk either way, since
+deleting a user's config out from under them isn't this app's call to make.
+
+Each key gets **Test** (validates whatever's currently typed, not what's
+saved, so you can try a key before committing to it) and **Save** (saving an
+empty field deletes the Keychain item rather than storing an empty string,
+which would just be a key that silently outranks nothing). If an env var is
+set, its field shows disabled instead of quietly being outranked — a saved
+Keychain key you can't tell is being ignored is exactly the kind of thing that
+costs someone an afternoon.
+
+One existing wart, not new: the app is ad-hoc signed (`build.sh`), so every
+rebuild is a different identity as far as macOS's Keychain ACLs are concerned
+— a rebuild can retrigger the "ClaudeUsage wants to access…" prompt even for a
+key this app itself created. Developer ID signing is the real fix; out of
+scope here.
+
 Providers without a key simply show "no API key" — nothing else breaks.
+
+## Sessions
+
+A read-only view of your **live** Claude Code and Codex processes, answering
+one question: *should I clear this session?* Is a conversation still cheap to
+continue, or is every turn now dragging a huge amount of context behind it?
+It only reads process state and on-disk logs — no per-session cost estimate,
+no history sparkline, no way to kill or attach to a session from here.
+
+Two complementary signals drive each row:
+
+- **contextPercent** — how full the context window is, against the model's
+  window size. Absolute, but only as good as the window it's dividing by —
+  see the limitation below.
+- **xFloor** — a *relative* cost multiple: what a turn costs right now versus
+  the first few turns of the session (or since the last compaction). It needs
+  no context-window constant at all, so it stays correct even in the cases
+  where contextPercent is working from a wrong denominator.
+
+Row colour is the **worse of the two** severities — a session that opened
+with one huge turn pins xFloor near 1.0x forever while contextPercent quietly
+climbs toward full, and neither signal alone would catch that.
+
+Two row styles, chosen in Settings (default Detailed):
+
+- **Compact** — one line per session, through the same `NSMenuItem`
+  attributed-title mechanism the provider rows use. `cwd`, model, raw token
+  totals, and compaction/reclaim detail ride the native tooltip instead of
+  taking up row width.
+- **Detailed** — a richer two-line row (glyph, name and multiple on top;
+  model, bar, turns and totals below) that you click to expand in place for
+  `cwd` and compaction detail, without the menu closing.
+
+Compaction is surfaced per session: how many, how long since the last one,
+and what it reclaimed (context before → after, as a percentage). A session
+with zero compactions shows nothing for it — no "⌁0" — and a compaction with
+no usage recorded since it fired shows reclaim as pending (`—`), never a
+fabricated 0% or 100%.
+
+Detailed, the default:
+
+```
+Sessions
+  ● worktree-a   5.2x
+    claude-opus-5   ████░░░░░░  37%   217 turns   49.8M in / 138k out
+  ○ sqlmesh   2.5x
+    claude-opus-5   █░░░░░░░░░  12%   57 turns   5.5M in / 32k out
+  ○ scratch-1   3.4x
+    claude-opus-5   ██░░░░░░░░  16%   84 turns   9.5M in / 87k out
+  ○ scratch-2   9.7x
+    claude-opus-5   ████░░░░░░  38%   363 turns   76.2M in / 238k out
+  ○ worktree-b   2.8x
+    claude-opus-5   ██░░░░░░░░  18%   35 turns   3.7M in / 43k out
+
+  (worktree-a clicked — expands in place:)
+  ● worktree-a   5.2x
+    claude-opus-5   ████░░░░░░  37%   217 turns   49.8M in / 138k out
+    /Users/you/worktrees/agent-a
+```
+
+Compact renders the same data as single lines, cwd and detail in the tooltip:
+
+```
+Sessions
+  ● worktree-a      ████░░░░░░  37%  5.2x  217t
+  ○ sqlmesh         █░░░░░░░░░  12%  2.5x  57t
+  ○ scratch-1       ██░░░░░░░░  16%  3.4x  84t
+  ○ scratch-2       ████░░░░░░  38%  9.7x  363t
+  ○ worktree-b      ██░░░░░░░░  18%  2.8x  35t
+```
+
+The `●`/`○` glyph tracks whether the process is currently busy (Detailed
+pulses it; Compact stays static). A session with no usage recorded yet
+(brand new, before its first message) shows "starting — no usage yet"
+instead of a bar, and one whose model's context window couldn't be resolved
+shows the raw token count with "window unknown" rather than a bar with a
+fabricated denominator.
 
 ## Install
 
@@ -93,12 +222,16 @@ rm -rf /Applications/ClaudeUsage.app ~/Library/LaunchAgents/local.claude-usage-m
 /Applications/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --once
 ```
 
-Prints the same numbers and exits — useful for scripting or a shell prompt.
+Prints the same numbers — every provider card plus any live Sessions — and
+exits; useful for scripting or a shell prompt. Unlike the live dropdown,
+`--once` always reports all five providers regardless of what's hidden in
+Settings.
 
 ## How it works
 
-Every provider is polled concurrently every 2 minutes, but rendered in a fixed
-order so rows never jump around. A failed poll keeps the last good numbers and
+Every provider is polled concurrently on the configured refresh interval
+(default 2 minutes, see [Settings](#settings)), but rendered in a fixed order
+so rows never jump around. A failed poll keeps the last good numbers and
 marks them `stale` rather than blanking the section — the Anthropic usage
 endpoint rate-limits aggressively, and a transient 429 should not look like an
 outage.
@@ -115,7 +248,16 @@ account `antigravity`, stored by go-keyring as base64 JSON. The plain file at
 refresh into the Keychain, not the file. `remainingFraction` is what is *left*
 (1.0 = untouched), so the displayed percentage is `1 - remainingFraction`.
 
-## A deliberate limitation
+**Sessions** — no network call at all. Live processes come from `ps`; Claude
+session data from an incremental, byte-offset read of
+`~/.claude/projects/**/*.jsonl` (only newly-appended bytes are ever re-read);
+Codex from a strictly read-only query against `~/.codex/state_*.sqlite` plus
+the same incremental read of its rollout log. The section re-scans every 2
+seconds *while the dropdown is open* — session files change on the order of
+seconds, far faster than the provider poll interval — and that tick stops the
+moment you close the menu.
+
+## Deliberate limitations
 
 The app **only ever reads** credentials; it never writes and never redeems a
 refresh token. Anthropic rotates refresh tokens on use, so redeeming one here
@@ -125,6 +267,29 @@ The trade-off: if a token expires while you are not using the tool in question,
 the app says so — *"Token expired — run `claude` to refresh"*, or *"run `agy`"*.
 Running that tool once refreshes it, and since credentials are re-read on every
 poll the app recovers on its own. No restart needed.
+
+Sessions carries its own, smaller set:
+
+- **Claude's context window is the configured/inferred one, not necessarily
+  the live one.** It's resolved in tiers — the session's `.claude/settings.json`
+  at start time, then a spawned subagent's `resolvedModel` as corroboration,
+  then an observed-usage upgrade to 1M once real usage exceeds 200k — but no
+  transcript event records a mid-session `/model` switch, so contextPercent
+  can be stale until the observed-usage tier catches up. **xFloor is
+  unaffected** — it never touches a window size at all.
+- **Codex session matching is start-time proximity, not identity.** A live
+  `codex` process is matched to its `state_*.sqlite` thread row by cwd plus
+  being within 5 seconds of that thread's `created_at_ms`. A resumed session
+  (`codex resume`) falls outside that window and renders labelled
+  "(unmatched)" rather than being silently guessed at.
+- **Both data sources are undocumented and may change.**
+  `~/.claude/sessions/<pid>.json` and the Codex `state_*.sqlite` schema are
+  internal details of tools this app doesn't control, not a stable API. Reads
+  degrade rather than crash: a missing registry file, a missing table or
+  column, or a locked database all resolve to "no sessions from this source,"
+  never a fatal error. (The Codex DB filename is itself versioned —
+  `state_5.sqlite` today — so the app globs for the newest rather than
+  hardcoding a number.)
 
 ## Requirements
 
