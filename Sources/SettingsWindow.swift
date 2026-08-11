@@ -309,13 +309,14 @@ final class SettingsWindowController: NSObject {
         refreshMigrationBanner()
     }
 
-    // MARK: Sessions section (Feature C, Phase 4b)
+    // MARK: Sessions section (Feature C, Phase 4c)
     //
-    // Both row-style options ship visible now — Detailed disabled/greyed
-    // out — so the pref plumbing is exercised once here and Phase 4c only
-    // flips the enablement. The stored default is Detailed (Prefs.swift),
-    // so the popup opens with "Detailed" selected even though only
-    // "Compact" can actually be chosen from this menu today.
+    // Both row styles are real, independently-maintained renderers now:
+    // Compact through the existing addRow/attributedTitle path, Detailed
+    // through the custom NSMenuItem.view in Sources/SessionRowView.swift.
+    // The stored default is Detailed (Prefs.swift), so an install that
+    // never opens Settings gets the rich rows out of the box; switching
+    // either way here takes effect on the next menu rebuild — no restart.
 
     private func sessionsSection() -> NSView {
         let header = NSTextField(labelWithString: "Sessions")
@@ -328,7 +329,6 @@ final class SettingsWindowController: NSObject {
         let stylePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         stylePopup.addItem(withTitle: "Compact")
         stylePopup.addItem(withTitle: "Detailed")
-        stylePopup.item(at: 1)?.isEnabled = false
         stylePopup.target = self
         stylePopup.action = #selector(sessionRowStyleChanged(_:))
         stylePopup.selectItem(at: Prefs.sessionRowStyle() == .detailed ? 1 : 0)
@@ -338,8 +338,8 @@ final class SettingsWindowController: NSObject {
         styleRow.spacing = 8
 
         let caption = NSTextField(wrappingLabelWithString:
-            "Detailed rows are richer two-line entries arriving in a later version — Compact is the only " +
-            "style available for now.")
+            "Compact is one line per session; Detailed is a richer two-line row you can click to expand " +
+            "for cwd and compaction detail.")
         caption.font = .systemFont(ofSize: 11)
         caption.textColor = .secondaryLabelColor
         caption.preferredMaxLayoutWidth = 320
@@ -356,10 +356,6 @@ final class SettingsWindowController: NSObject {
     }
 
     @objc private func sessionRowStyleChanged(_ sender: NSPopUpButton) {
-        // Detailed's item is disabled, so a click can only ever land on
-        // Compact (index 0) — this still reads the selection explicitly
-        // rather than hardcoding .compact, so the moment Phase 4c enables
-        // the Detailed item this keeps working with no change here.
         let style: SessionRowStyle = sender.indexOfSelectedItem == 1 ? .detailed : .compact
         Prefs.setSessionRowStyle(style)
     }
