@@ -165,6 +165,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var timer: Timer?
+    private var prefsRefreshDebounce: Timer?
     private var cards: [Card] = []
     private var lastUpdated: Date?
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
@@ -197,14 +198,28 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         timer = t
     }
 
-    /// Fires for any settings change (visibility or interval). Rescheduling
-    /// the timer is cheap even when only visibility changed; refreshing
-    /// immediately matters because a newly-shown provider has no `previous`
-    /// card for merge() to fall back on, and a title-visibility change needs
-    /// renderTitle() re-run even though no new data is required.
+    /// Fires for any settings change (visibility or interval).
+    ///
+    /// The title is re-rendered synchronously because a title-visibility
+    /// toggle needs no new data — only a redraw from the headline values
+    /// already in hand.
+    ///
+    /// The poll itself is coalesced. A newly-shown provider does need a
+    /// refresh (it has no `previous` card for merge() to fall back on), but
+    /// firing one per checkbox would mean five polls of the Anthropic usage
+    /// endpoint while someone ticks their way down the list — and that
+    /// endpoint rate-limits aggressively enough that the app already surfaces
+    /// 429s. One poll, shortly after the user stops clicking, is what's
+    /// actually wanted.
     private func handlePrefsChanged() {
         scheduleTimer()
-        refresh()
+        renderTitle()
+        prefsRefreshDebounce?.invalidate()
+        let debounce = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        RunLoop.main.add(debounce, forMode: .common)
+        prefsRefreshDebounce = debounce
     }
 
     @objc func refresh() {

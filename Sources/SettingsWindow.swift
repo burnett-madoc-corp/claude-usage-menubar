@@ -55,17 +55,19 @@ final class SettingsWindowController: NSObject {
         // above. Nothing above this comment should need to change.
         // -----------------------------------------------------------------
 
+        // Plain container, not a scroll view: the window is fixed-size and
+        // the content is short enough to fit. A later phase adding sections
+        // at the seam above may need to revisit that.
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
-        let scroll = container // plain container; window is fixed-size, no scrolling needed yet
-        scroll.addSubview(root)
+        container.addSubview(root)
         NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: scroll.topAnchor),
-            root.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
-            root.trailingAnchor.constraint(lessThanOrEqualTo: scroll.trailingAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: scroll.bottomAnchor),
+            root.topAnchor.constraint(equalTo: container.topAnchor),
+            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            root.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
+            root.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
         ])
-        return scroll
+        return container
     }
 
     // MARK: Providers section
