@@ -34,10 +34,9 @@ enum ProviderID: String, CaseIterable {
 // MARK: - Sessions row style
 
 /// Two shipped values, per the plan's "both options ship visible now, the
-/// pref plumbing is exercised once" decision. Phase 4b only has a Compact
-/// renderer; Detailed is real data but no view yet, so the stored default is
-/// deliberately Detailed — see `Prefs.rendersCompact(_:)` for the renderer's
-/// fallback until Phase 4c lands.
+/// pref plumbing is exercised once" decision. The stored default is
+/// deliberately Detailed — see `Prefs.rendersCompact(_:)` for how the two
+/// styles now map onto real, independent renderers (Phase 4c).
 enum SessionRowStyle: String {
     case compact, detailed
 }
@@ -85,15 +84,15 @@ enum Prefs {
         onChange?()
     }
 
-    /// Phase 4b ships only a Compact renderer. Until Phase 4c adds a Detailed
-    /// one, every stored value — including the deliberate Detailed default —
-    /// must render as Compact rather than draw nothing. This is the one
-    /// place that fallback lives, so 4c flips it by making this an identity
-    /// function instead of re-deriving the rule at each call site.
+    /// Phase 4c ships a real Detailed renderer (Sources/SessionRowView.swift),
+    /// so Detailed no longer falls back to Compact — this is the one place
+    /// that fallback used to live, flipped here rather than adding a second
+    /// fallback path anywhere else (per the Phase 4b comment that predicted
+    /// exactly this change).
     nonisolated static func rendersCompact(_ style: SessionRowStyle) -> Bool {
         switch style {
         case .compact: return true
-        case .detailed: return true // no Detailed renderer yet — falls back to Compact
+        case .detailed: return false
         }
     }
 

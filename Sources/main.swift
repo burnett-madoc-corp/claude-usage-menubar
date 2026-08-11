@@ -205,6 +205,19 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private var sessionRowItems: [NSMenuItem] = []
     private var sessionRowKeys: [String] = []
     private var sessionOverflow = 0
+    // Detailed-mode (Phase 4c) bookkeeping. `detailedRowViews` parallels
+    // sessionRowItems/sessionRowKeys so an in-place update can patch the
+    // same SessionRowView instances rather than recreating them (needed to
+    // keep the pulsing dot and expanded state alive across a tick).
+    // `expandedSessionKeys` persists expanded state independently of any
+    // one view instance, so it survives even a full rebuild (e.g. a
+    // session reorders because new usage landed while the menu was open).
+    // `isMenuOpen` gates whether a row's dot timer is allowed to run at
+    // all — see the pulsing-dot run-loop trap note on SessionRowView.
+    private var detailedRowViews: [SessionRowView] = []
+    private var expandedSessionKeys: Set<String> = []
+    private var isMenuOpen = false
+    private var detailedRowWidth: CGFloat = 330
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
     private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
@@ -412,6 +425,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         menu.removeAllItems()
         sessionRowItems.removeAll()
         sessionRowKeys.removeAll()
+        detailedRowViews.removeAll()
         sessionOverflow = 0
 
         for card in cards {
@@ -447,11 +461,15 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         SettingsWindowController.shared.show()
     }
 
-    // MARK: Sessions section (Compact — Phase 4b)
+    // MARK: Sessions section
     //
-    // Renders through the same NSMenuItem.attributedTitle mechanism addRow
-    // uses (no custom NSMenuItem.view — that's Phase 4c), so it inherits
-    // highlight, sizing, dark-mode, and accessibility rendering for free.
+    // Two first-class row styles (Prefs.sessionRowStyle()), neither a
+    // fallback for the other:
+    //  - Compact (Phase 4b): the same NSMenuItem.attributedTitle mechanism
+    //    addRow uses, inheriting highlight, sizing, dark-mode, and
+    //    accessibility rendering for free.
+    //  - Detailed (Phase 4c): a custom NSMenuItem.view (SessionRowView)
+    //    that hand-rolls all of the above — see SessionRowView.swift.
     // Hidden entirely (header included) when there are no live sessions or
     // Prefs.showSessions() is off.
 
@@ -459,12 +477,31 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         guard Prefs.showSessions(), !sessions.isEmpty else { return }
         addSectionHeader("Sessions")
         let visible = Self.visibleSessions(sessions)
-        for session in visible.rows { addSessionRow(session) }
+        let detailed = !Prefs.rendersCompact(Prefs.sessionRowStyle())
+        // Obligation 2 (explicit sizing): measured once here, from the
+        // provider rows already built above in this same rebuild — not
+        // recomputed per frame, and not recomputed again by
+        // applySessionUpdates()'s in-place patch path.
+        if detailed { detailedRowWidth = Self.computeDetailedRowWidth(from: menu) }
+        for session in visible.rows {
+            if detailed { addDetailedSessionRow(session) } else { addSessionRow(session) }
+        }
         sessionOverflow = visible.overflow
         if visible.overflow > 0 {
             addLine("  +\(visible.overflow) more", color: .tertiaryLabelColor, size: 10)
         }
         menu.addItem(.separator())
+    }
+
+    /// NSMenu auto-measures attributed-title rows (the provider cards and
+    /// Compact session rows above this section) but has no notion of what
+    /// width a custom view "should" be — so Detailed rows are given an
+    /// explicit width derived from what's already on screen, clamped into
+    /// the plan's 300–360pt range, so the menu doesn't visibly jump wider
+    /// or narrower than the rows above it.
+    private static func computeDetailedRowWidth(from menu: NSMenu) -> CGFloat {
+        let maxProviderWidth = menu.items.compactMap { $0.attributedTitle?.size().width }.max() ?? 0
+        return min(360, max(300, maxProviderWidth + 20))
     }
 
     /// Refreshing session rows while the menu is OPEN must not rebuild the
@@ -484,9 +521,18 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
               visible.overflow == sessionOverflow
         else { rebuildMenu(); return }
 
-        for (item, session) in zip(sessionRowItems, visible.rows) {
-            item.attributedTitle = Self.sessionRowText(for: session)
-            item.toolTip = Self.sessionTooltip(for: session)
+        if Prefs.rendersCompact(Prefs.sessionRowStyle()) {
+            for (item, session) in zip(sessionRowItems, visible.rows) {
+                item.attributedTitle = Self.sessionRowText(for: session)
+                item.toolTip = Self.sessionTooltip(for: session)
+            }
+        } else {
+            // Patches the SAME SessionRowView instances in place — this is
+            // what lets the pulsing dot and any expanded row survive a 2s
+            // tick instead of being torn down and recreated.
+            for (view, session) in zip(detailedRowViews, visible.rows) {
+                view.update(session: session, animate: isMenuOpen)
+            }
         }
     }
 
@@ -600,6 +646,33 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         sessionRowKeys.append(Self.sessionKey(for: session))
     }
 
+    /// Detailed-mode row (Phase 4c): a custom NSMenuItem.view. `action` is
+    /// deliberately left nil — see SessionRowView's obligation-5 comment —
+    /// so NSMenu never treats a click on the row as a selection that should
+    /// dismiss the menu; the view handles mouseUp itself.
+    ///
+    /// Expanded state is seeded from expandedSessionKeys (not always
+    /// false), so a session that structurally reorders — forcing
+    /// rebuildMenu() instead of the in-place patch path — still reopens
+    /// expanded if the user had it expanded before.
+    private func addDetailedSessionRow(_ session: AgentSession) {
+        let key = Self.sessionKey(for: session)
+        let view = SessionRowView(
+            session: session, width: detailedRowWidth,
+            expanded: expandedSessionKeys.contains(key), animate: isMenuOpen
+        )
+        view.onToggleExpanded = { [weak self] expanded in
+            guard let self else { return }
+            if expanded { self.expandedSessionKeys.insert(key) } else { self.expandedSessionKeys.remove(key) }
+        }
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.view = view
+        menu.addItem(item)
+        sessionRowItems.append(item)
+        sessionRowKeys.append(key)
+        detailedRowViews.append(view)
+    }
+
     /// Identity of a row, so an in-place update can tell "same sessions, new
     /// numbers" from "the set of sessions changed and the menu must be rebuilt".
     nonisolated static func sessionKey(for session: AgentSession) -> String {
@@ -684,6 +757,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
 extension UsageMenuBar: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
+        // Set before rebuildMenu() so any Detailed row constructed during
+        // this rebuild starts its pulsing-dot timer immediately if busy,
+        // rather than waiting for the next tick.
+        isMenuOpen = true
         rebuildMenu()
         if let updated = lastUpdated, Date().timeIntervalSince(updated) > refreshInterval / 2 { refresh() }
         refreshSessions()
@@ -692,7 +769,8 @@ extension UsageMenuBar: NSMenuDelegate {
         // session is active — much faster than the provider poll interval —
         // so re-scan every 2s for as long as the menu stays open. .common
         // mode is required so this keeps firing during the menu's modal
-        // event-tracking loop, same reasoning as the main refresh timer.
+        // event-tracking loop, same reasoning as the main refresh timer
+        // and each Detailed row's own dot-animation timer.
         sessionsTick?.invalidate()
         let tick = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshSessions() }
@@ -702,8 +780,13 @@ extension UsageMenuBar: NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
         sessionsTick?.invalidate()
         sessionsTick = nil
+        // A Detailed row's animation timer is otherwise idempotent and
+        // would happily keep firing forever — invalidate every one here so
+        // nothing burns cycles animating a dot nobody can see.
+        for view in detailedRowViews { view.stopAnimating() }
     }
 }
 
@@ -769,7 +852,10 @@ private final class FakeKeyStore: KeyStore, @unchecked Sendable {
 // every field explicitly via keyword args so a future field addition can't
 // silently leave a test using a stale default.
 
-private func makeSession(
+// Not private: DetailedSessionRowSelfTests (SessionRowView.swift) reuses
+// this exact fixture builder so Compact and Detailed self-tests can never
+// silently diverge on what a given AgentSession fixture actually contains.
+func makeSession(
     label: String = "session",
     busy: Bool = false,
     turns: Int = 12,
@@ -988,14 +1074,11 @@ private func runSelfTests() {
     precondition(Prefs.sessionRowStyle() == .detailed)
     Prefs.setSessionRowStyle(.detailed) // restore a clean value for anything reading after this point
 
-    // Phase 4b has no Detailed renderer yet, so every stored value —
-    // including the deliberate Detailed default — must still render as
-    // Compact rather than draw nothing. Phase 4c flips this by changing
-    // Prefs.rendersCompact's body, not by adding a second fallback path
-    // somewhere else.
+    // Phase 4c ships a real Detailed renderer (SessionRowView), so Detailed
+    // no longer falls back to Compact rendering.
     precondition(Prefs.rendersCompact(.compact))
-    precondition(Prefs.rendersCompact(.detailed),
-                 "non-Compact must fall back to Compact rendering until Phase 4c ships a Detailed renderer")
+    precondition(!Prefs.rendersCompact(.detailed),
+                 "Phase 4c ships a Detailed renderer — Detailed must render as Detailed, not fall back")
 
     precondition(Format.color(for: "normal", percent: 79).isEqual(NSColor.systemGreen))
     precondition(Format.color(for: "normal", percent: 80).isEqual(NSColor.systemOrange))
@@ -1116,6 +1199,7 @@ private func runSelfTests() {
 
     SessionSelfTests.run()
     testCompactSessionRendering()
+    DetailedSessionRowSelfTests.run()
 
     print("Self-tests passed")
 }
