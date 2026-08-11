@@ -1,0 +1,37 @@
+name: Cancel PR Runs
+
+# Closing a pull request leaves its workflow runs alive -- `concurrency` only
+# cancels when a newer run joins the group, and a merge creates no such run.
+# This is the thin caller; all of the logic and every safety guard lives in
+# burnett-madoc-corp/local-scripts so the estate has one copy to change.
+
+on:
+  pull_request:
+    types: [closed]
+
+# Granted here as well as in the called workflow: a reusable workflow cannot
+# widen the caller's token, so these have to be present on both sides.
+#
+# An explicit permissions block sets every scope it does not name to none, so
+# all three are load-bearing: `actions: write` to cancel, and
+# `pull-requests: read` for the guard that leaves runs alone when another open
+# PR still shares the head ref. Dropping the latter 403s that guard and kills
+# the step before anything is cancelled.
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: cancel-pr-runs-${{ github.event.pull_request.number }}
+  # One close event, one run. Nothing to supersede, and a half-finished cancel
+  # sweep is worse than a slow one.
+  cancel-in-progress: false
+
+jobs:
+  cancel:
+    # Same-repo PRs only. A fork `pull_request` event gets a read-only
+    # GITHUB_TOKEN that cannot be granted `actions: write`, so the job would
+    # 403 after burning a runner minute.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    uses: burnett-madoc-corp/local-scripts/.github/workflows/reusable-cancel-pr-runs.yml@main
