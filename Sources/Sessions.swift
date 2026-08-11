@@ -55,19 +55,26 @@ enum ProcessTime {
 
 struct ProcInfo: Sendable, Equatable {
     var pid: pid_t
+    var state: String
     var startedLocal: Date
     var comm: String
+
+    /// macOS `ps` state codes: the leading letter is the scheduler state and
+    /// `T` means stopped (SIGSTOP/SIGTSTP). Trailing flags (`+`, `s`, `<`, …)
+    /// carry no bearing on suspension.
+    var isStopped: Bool { state.hasPrefix("T") }
 }
 
 enum ProcessScanner {
-    // pid, then a fixed 24-char `lstart` (ctime-style, day space-padded),
-    // then whatever's left as comm — which can itself contain spaces
-    // ("Claude Helper (Renderer)"), so it must be the final greedy group.
+    // pid, then the state code, then a fixed 24-char `lstart` (ctime-style,
+    // day space-padded), then whatever's left as comm — which can itself
+    // contain spaces ("Claude Helper (Renderer)"), so it must be the final
+    // greedy group.
     private static let lineRegex = try! NSRegularExpression(
-        pattern: #"^\s*(\d+)\s+(\w{3}\s+\w{3}\s+[\d ]\d\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$"#
+        pattern: #"^\s*(\d+)\s+([A-Za-z][\w+<>]*)\s+(\w{3}\s+\w{3}\s+[\d ]\d\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$"#
     )
 
-    /// Pure parser for `ps -axo pid=,lstart=,comm=` output — self-testable
+    /// Pure parser for `ps -axo pid=,state=,lstart=,comm=` output — self-testable
     /// without a subprocess.
     static func parse(psOutput: String) -> [ProcInfo] {
         var result: [ProcInfo] = []
@@ -76,12 +83,14 @@ enum ProcessScanner {
             let full = NSRange(line.startIndex..., in: line)
             guard let match = lineRegex.firstMatch(in: line, range: full),
                   let pidRange = Range(match.range(at: 1), in: line),
-                  let lstartRange = Range(match.range(at: 2), in: line),
-                  let commRange = Range(match.range(at: 3), in: line),
+                  let stateRange = Range(match.range(at: 2), in: line),
+                  let lstartRange = Range(match.range(at: 3), in: line),
+                  let commRange = Range(match.range(at: 4), in: line),
                   let pid = pid_t(line[pidRange]),
                   let started = ProcessTime.parseLocal(String(line[lstartRange]))
             else { continue }
-            result.append(ProcInfo(pid: pid, startedLocal: started, comm: String(line[commRange])))
+            result.append(ProcInfo(pid: pid, state: String(line[stateRange]),
+                                   startedLocal: started, comm: String(line[commRange])))
         }
         return result
     }
@@ -89,7 +98,7 @@ enum ProcessScanner {
     static func run() -> [ProcInfo] {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-axo", "pid=,lstart=,comm="]
+        task.arguments = ["-axo", "pid=,state=,lstart=,comm="]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
@@ -134,20 +143,25 @@ enum Liveness {
     }
 }
 
-/// A SIGSTOPed `claude` stops updating its registry file, so staleness of
-/// `status`/`statusUpdatedAt` is the cheap primary filter for the busy
-/// indicator (the JSON is already being read). If this proves too coarse in
-/// practice, the documented escalation is a direct sysctl `kinfo_proc`
-/// `T`-state check — not implemented here, this is the first line of
-/// defense per the plan.
+/// A SIGSTOPed `claude` stops updating its registry file. The plan's first
+/// line of defence was to treat a stale `statusUpdatedAt` as suspended, with
+/// a direct process-state check as the documented escalation "if that proves
+/// too coarse in practice".
+///
+/// It proved too coarse on the first real run: Claude Code rewrites the
+/// registry on status *transitions*, not on a heartbeat, so a session sitting
+/// in one long turn is byte-for-byte indistinguishable from a suspended one.
+/// A genuinely-busy session was demoted to idle after 25 minutes of a single
+/// turn — wrong exactly when the row is most worth looking at.
+///
+/// So the escalation is what ships: the `ps` scan already runs once per
+/// refresh, and adding its `state=` column costs nothing. Suspension is now
+/// read from the process itself (`T` = stopped) and the registry's `status`
+/// is trusted at face value regardless of age.
 enum Suspension {
-    static let staleAfter: TimeInterval = 15 * 60
-
-    static func isBusy(status: String?, statusUpdatedAtMs: Int64?, now: Date = Date()) -> Bool {
+    static func isBusy(status: String?, processStopped: Bool) -> Bool {
         guard status == "busy" else { return false }
-        guard let statusUpdatedAtMs else { return true }
-        let updated = Date(timeIntervalSince1970: Double(statusUpdatedAtMs) / 1000)
-        return now.timeIntervalSince(updated) < staleAfter
+        return !processStopped
     }
 }
 
@@ -542,7 +556,8 @@ enum SessionScanner {
                 label: registry.name ?? PathEncoding.label(cwd: registry.cwd),
                 cwd: registry.cwd,
                 model: acc.lastModel,
-                busy: Suspension.isBusy(status: registry.status, statusUpdatedAtMs: registry.statusUpdatedAt),
+                busy: Suspension.isBusy(status: registry.status,
+                                        processStopped: processByPid[registry.pid]?.isStopped ?? false),
                 turns: acc.turnCosts.count,
                 inputTokens: acc.rawInputTokens,
                 outputTokens: acc.rawOutputTokens,
@@ -708,12 +723,19 @@ enum SessionSelfTests {
     // MARK: `ps` line parsing
 
     private static func testProcessScannerParsing() {
-        let sample = " 9123 Sat Aug  8 10:32:27 2026     /Users/alex/.local/bin/claude\n"
-                   + "45210 Tue Aug 11 07:57:58 2026     claude"
+        // Real `ps -axo pid=,state=,lstart=,comm=` shapes: a stopped process,
+        // a running one, and a comm containing spaces and parentheses.
+        let sample = " 9123 T    Sat Aug  8 10:32:27 2026     /Users/alex/.local/bin/claude\n"
+                   + "45210 S+   Tue Aug 11 07:57:58 2026     claude\n"
+                   + "  777 R    Tue Aug 11 07:57:58 2026     Claude Helper (Renderer)"
         let parsed = ProcessScanner.parse(psOutput: sample)
-        precondition(parsed.count == 2)
+        precondition(parsed.count == 3)
         precondition(parsed[0].pid == 9123)
+        precondition(parsed[0].isStopped, "state T must read as stopped")
         precondition(parsed[1].pid == 45210)
+        precondition(!parsed[1].isStopped)
+        precondition(parsed[2].comm == "Claude Helper (Renderer)",
+                     "comm is the greedy final group — spaces and parens must survive")
         precondition(parsed[1].comm == "claude")
     }
 
@@ -722,7 +744,7 @@ enum SessionSelfTests {
     private static func testLiveness() {
         let now = Date()
         let ownPid = getpid()
-        let selfProc = ProcInfo(pid: ownPid, startedLocal: now, comm: "claude")
+        let selfProc = ProcInfo(pid: ownPid, state: "S+", startedLocal: now, comm: "claude")
 
         precondition(Liveness.isAlive(pid: ownPid, startedAtMs: Int64(now.timeIntervalSince1970 * 1000),
                                        procStart: nil, process: selfProc),
@@ -738,7 +760,7 @@ enum SessionSelfTests {
         deadTask.waitUntilExit()
         let deadPid = deadTask.processIdentifier
         precondition(!Liveness.isAlive(pid: deadPid, startedAtMs: Int64(now.timeIntervalSince1970 * 1000),
-                                        procStart: nil, process: ProcInfo(pid: deadPid, startedLocal: now, comm: "claude")),
+                                        procStart: nil, process: ProcInfo(pid: deadPid, state: "S+", startedLocal: now, comm: "claude")),
                      "a dead PID must be filtered even if the claimed start time lines up")
 
         // Correction 1: procStart is UTC, ps lstart is local. Build both
@@ -747,20 +769,28 @@ enum SessionSelfTests {
         let instant = Date()
         let utcString = ProcessTime.format(instant, timeZone: TimeZone(identifier: "UTC")!)
         let localString = ProcessTime.format(instant, timeZone: .current)
-        let proc = ProcInfo(pid: ownPid, startedLocal: ProcessTime.parseLocal(localString)!, comm: "claude")
+        let proc = ProcInfo(pid: ownPid, state: "S+", startedLocal: ProcessTime.parseLocal(localString)!, comm: "claude")
         precondition(Liveness.isAlive(pid: ownPid, startedAtMs: nil, procStart: utcString, process: proc),
                      "correction 1: a naive string compare of UTC procStart vs local lstart would reject every " +
                      "live session — the parsed-instant compare must still match")
     }
 
     private static func testSuspension() {
-        let now = Date()
-        precondition(Suspension.isBusy(status: "busy", statusUpdatedAtMs: Int64(now.timeIntervalSince1970 * 1000), now: now))
-        precondition(!Suspension.isBusy(status: "busy",
-                                         statusUpdatedAtMs: Int64(now.addingTimeInterval(-3600).timeIntervalSince1970 * 1000),
-                                         now: now),
-                     "a status untouched for an hour reads as suspended, not busy")
-        precondition(!Suspension.isBusy(status: "idle", statusUpdatedAtMs: Int64(now.timeIntervalSince1970 * 1000), now: now))
+        precondition(Suspension.isBusy(status: "busy", processStopped: false))
+        precondition(!Suspension.isBusy(status: "busy", processStopped: true),
+                     "a SIGSTOPed process is not busy however recent its registry status")
+        precondition(!Suspension.isBusy(status: "idle", processStopped: false))
+
+        // The regression this replaced: a session on one long turn stops
+        // rewriting its registry file, so age alone cannot distinguish it
+        // from a suspended process. Registry age must not enter into it.
+        precondition(Suspension.isBusy(status: "busy", processStopped: false),
+                     "a busy session mid-long-turn stays busy no matter how stale its registry file is")
+
+        // ps state codes: the leading letter decides, trailing flags don't.
+        precondition(ProcInfo(pid: 1, state: "T", startedLocal: Date(), comm: "claude").isStopped)
+        precondition(!ProcInfo(pid: 1, state: "S+", startedLocal: Date(), comm: "claude").isStopped)
+        precondition(!ProcInfo(pid: 1, state: "R", startedLocal: Date(), comm: "claude").isStopped)
     }
 
     // MARK: worse-of-two severity, no-usage state
@@ -901,7 +931,7 @@ enum SessionSelfTests {
                 try? deadData.write(to: mappingDir.appendingPathComponent("\(deadPid).json"))
             }
 
-            let processList = [ProcInfo(pid: ownPid, startedLocal: now, comm: "claude")]
+            let processList = [ProcInfo(pid: ownPid, state: "S+", startedLocal: now, comm: "claude")]
             let sessions = await SessionScanner.liveSessions(
                 processList: processList, mappingDir: mappingDir, projectsDir: projectsDir,
                 userSettingsPath: root.appendingPathComponent("nonexistent-settings.json"),
