@@ -19,7 +19,22 @@ private extension Dictionary where Key == String, Value == Any {
 // deliberate time zones and compare instants.
 
 enum ProcessTime {
-    private static func formatter(timeZone: TimeZone) -> DateFormatter {
+    // M6: a fresh DateFormatter per `ps` line measured at ~58ms/refresh on
+    // real output (559 lines) — DateFormatter construction, not parsing, was
+    // the cost. Cached once: DateFormatter is thread-safe for use (though not
+    // mutation) on Apple platforms, and this actor-free enum only ever reads
+    // these two after init.
+    private static let localFormatter = makeFormatter(timeZone: .current)
+    private static let utcFormatter = makeFormatter(timeZone: TimeZone(identifier: "UTC")!)
+
+    /// Counts formatter construction — self-tests assert this stays at the
+    /// fixed cost of the two cached instances (plus whatever one-off zones
+    /// `format(_:timeZone:)` is exercised with) even after hundreds of parse
+    /// calls, guarding against a regression back to per-call allocation.
+    private(set) static var formatterAllocationCount = 0
+
+    private static func makeFormatter(timeZone: TimeZone) -> DateFormatter {
+        formatterAllocationCount += 1
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "EEE MMM d HH:mm:ss yyyy"
@@ -36,18 +51,23 @@ enum ProcessTime {
     }
 
     static func parseLocal(_ raw: String) -> Date? {
-        formatter(timeZone: .current).date(from: normalize(raw))
+        localFormatter.date(from: normalize(raw))
     }
 
     static func parseUTC(_ raw: String) -> Date? {
-        formatter(timeZone: TimeZone(identifier: "UTC")!).date(from: normalize(raw))
+        utcFormatter.date(from: normalize(raw))
     }
 
     /// Inverse of the two parsers above — self-tests use this to build exact
     /// fixture strings from a known instant instead of hand-writing
-    /// timestamps that could drift from the real `ps`/registry formats.
+    /// timestamps that could drift from the real `ps`/registry formats. Only
+    /// UTC/local are ever requested in practice, so those reuse the cached
+    /// instances; any other zone (self-test-only) builds a one-off rather
+    /// than growing the cache unboundedly.
     static func format(_ date: Date, timeZone: TimeZone) -> String {
-        formatter(timeZone: timeZone).string(from: date)
+        if timeZone.identifier == utcFormatter.timeZone!.identifier { return utcFormatter.string(from: date) }
+        if timeZone.identifier == localFormatter.timeZone!.identifier { return localFormatter.string(from: date) }
+        return makeFormatter(timeZone: timeZone).string(from: date)
     }
 }
 
@@ -63,6 +83,11 @@ struct ProcInfo: Sendable, Equatable {
     /// `T` means stopped (SIGSTOP/SIGTSTP). Trailing flags (`+`, `s`, `<`, …)
     /// carry no bearing on suspension.
     var isStopped: Bool { state.hasPrefix("T") }
+
+    /// `Z` = zombie: the process table entry for an unreaped exited process.
+    /// `kill(pid, 0)` still succeeds against it and it keeps its original
+    /// `lstart`, so without this check it reads as a perfectly live session.
+    var isZombie: Bool { state.hasPrefix("Z") }
 }
 
 enum ProcessScanner {
@@ -126,18 +151,27 @@ enum Liveness {
 
     static func isAlive(pid: pid_t, startedAtMs: Int64?, procStart: String?, process: ProcInfo?) -> Bool {
         guard let process, process.pid == pid else { return false }
+        // A zombie still answers kill(pid, 0) and keeps its original lstart
+        // — it must never be read as a live session.
+        guard !process.isZombie else { return false }
         // ESRCH = no such process (dead / reused). EPERM = alive, owned by
         // someone else — still alive for our purposes.
         guard kill(pid, 0) == 0 || errno == EPERM else { return false }
 
-        // startedAt (epoch ms) is unambiguous — prefer it (correction 2).
+        // M7: procStart and `ps lstart` both describe the same OS-reported
+        // start instant at 1s resolution — exact, once time zones are
+        // normalized (correction 1). startedAt lags the real process start
+        // by an observed 2-11s, so it's a strictly worse signal; it's only a
+        // fallback for the (currently theoretical) case where a registry
+        // entry lacks procStart. Every real registry file on this machine
+        // carries procStart, so this is the branch that actually executes.
+        if let procStart, let utc = ProcessTime.parseUTC(procStart) {
+            return abs(utc.timeIntervalSince(process.startedLocal)) <= procStartTolerance
+        }
+        // Fallback: startedAt (epoch ms), unambiguous but imprecise (correction 2).
         if let startedAtMs {
             let started = Date(timeIntervalSince1970: Double(startedAtMs) / 1000)
             return abs(started.timeIntervalSince(process.startedLocal)) <= startedAtTolerance
-        }
-        // Fallback: procStart (UTC) vs ps lstart (local) — correction 1.
-        if let procStart, let utc = ProcessTime.parseUTC(procStart) {
-            return abs(utc.timeIntervalSince(process.startedLocal)) <= procStartTolerance
         }
         return false
     }
@@ -168,14 +202,38 @@ enum Suspension {
 // MARK: - cwd <-> project-directory encoding
 
 enum PathEncoding {
-    /// Both `/` and `.` map to `-` (verified) — note the resulting `--`
-    /// wherever a path segment starts with a dot, e.g. a `.ade` worktree.
+    /// `/`, `.` AND `_` all map to `-` (verified against real
+    /// `~/.claude/projects` dirs — 6 of 19 on this machine are `_`-bearing
+    /// paths, e.g. `pytest_120/test_real_cli_denies_shell_com0`). Missing
+    /// `_` used to mean any underscored cwd never found its transcript and
+    /// rendered as "starting — no usage yet" for its entire life. Note the
+    /// resulting `--` wherever a path segment starts with a dot, e.g. a
+    /// `.ade` worktree.
     static func encode(cwd: String) -> String {
-        String(cwd.map { $0 == "/" || $0 == "." ? "-" : $0 })
+        String(cwd.map { $0 == "/" || $0 == "." || $0 == "_" ? "-" : $0 })
     }
 
     static func label(cwd: String) -> String {
         (cwd as NSString).lastPathComponent
+    }
+
+    /// The primary encoded path, verified to exist. If a future Claude Code
+    /// release changes the encoding again (or this mapping is still
+    /// incomplete for some character we haven't seen), degrade instead of
+    /// silently blanking the row: glob every project dir for this exact
+    /// sessionId and use it if — and only if — exactly one match turns up.
+    /// More than one match is genuinely ambiguous and not worth guessing at.
+    static func resolveTranscriptPath(projectsDir: URL, encoded: String, sessionId: String) -> URL {
+        let primary = projectsDir.appendingPathComponent(encoded).appendingPathComponent("\(sessionId).jsonl")
+        guard !FileManager.default.fileExists(atPath: primary.path) else { return primary }
+
+        guard let dirs = try? FileManager.default.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)
+        else { return primary }
+        let matches = dirs.compactMap { dir -> URL? in
+            let candidate = dir.appendingPathComponent("\(sessionId).jsonl")
+            return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        }
+        return matches.count == 1 ? matches[0] : primary
     }
 }
 
@@ -238,8 +296,9 @@ struct AgentSession: Sendable {
 
 // MARK: - Incremental transcript reader
 
-/// Byte-offset incremental reader keyed by path. On re-scan: size/mtime
-/// unchanged → reuse; grown → fold only the newly-appended, complete lines;
+/// Byte-offset incremental reader keyed by path. On re-scan: size unchanged
+/// (mtime is never read — the byte offset already encodes what's been
+/// consumed) → reuse; grown → fold only the newly-appended, complete lines;
 /// shrunk → discard and re-read from zero. All file I/O here is synchronous
 /// (no `await` inside `scan`), so calls to the same actor instance serialize
 /// with no interleaving — two overlapping requests for the same path can
@@ -248,11 +307,18 @@ struct AgentSession: Sendable {
 actor TranscriptReader {
     static let shared = TranscriptReader()
 
+    /// M5: this app runs for weeks. `seenMessageIds` is capped (FIFO —
+    /// message ids only repeat within the same streaming burst, never
+    /// across the file) and eviction removes accumulators for transcripts no
+    /// longer part of the live session set (Acc otherwise lived forever,
+    /// once per session that ever existed, for the process lifetime).
+    static let seenMessageIdCap = 4000
+
     struct Acc: Sendable {
         var byteOffset: UInt64 = 0
-        var fileSize: UInt64 = 0
 
         var seenMessageIds: Set<String> = []
+        var seenMessageIdOrder: [String] = []   // FIFO eviction order, parallel to the set above
         var rawInputTokens: Int64 = 0      // input+cacheRead+cacheCreation, incl. sidechains (they bill)
         var rawOutputTokens: Int64 = 0
         var subagentTokens: Int64 = 0
@@ -262,7 +328,9 @@ actor TranscriptReader {
         var contextTokens: Int64?          // newest non-sidechain per-turn quantity
         var lastActivityAt: Date?          // newest usage-record timestamp, main or sidechain
         var lastModel: String?
-        var resolvedModels: [String] = []  // resolvedModel corroboration votes, in order seen
+        // Only .last was ever read — an unbounded array of every corroboration
+        // vote ever seen was pure growth for no benefit. One slot instead.
+        var lastResolvedModel: String?
 
         var compactionCount: Int = 0
         var lastCompactionAt: Date?
@@ -275,9 +343,33 @@ actor TranscriptReader {
         // (never dropped) so a line straddling two scans is folded exactly
         // once, whole, on whichever scan completes it.
         var partialTail: Data = Data()
+
+        /// FIFO-capped insert — call from claudeFold instead of touching
+        /// seenMessageIds/seenMessageIdOrder directly, so the two can never
+        /// drift out of sync.
+        mutating func rememberMessageId(_ id: String) {
+            seenMessageIds.insert(id)
+            seenMessageIdOrder.append(id)
+            guard seenMessageIdOrder.count > TranscriptReader.seenMessageIdCap else { return }
+            let oldest = seenMessageIdOrder.removeFirst()
+            seenMessageIds.remove(oldest)
+        }
     }
 
     private var accumulators: [String: Acc] = [:]
+
+    /// Drops accumulators for any path not in this cycle's live session set
+    /// — a session that exited (or was mis-encoded and got fixed) must not
+    /// keep its transcript's state pinned in memory forever.
+    func evictAccumulators(keeping livePaths: Set<String>) {
+        accumulators = accumulators.filter { livePaths.contains($0.key) }
+    }
+
+    /// Test-only visibility into how many transcripts are currently tracked
+    /// — mirrors `ProcessTime.formatterAllocationCount`: a small counter
+    /// exposed purely so self-tests can prove eviction actually happened,
+    /// not just that outward behavior looks unchanged.
+    var accumulatorCount: Int { accumulators.count }
 
     @discardableResult
     func scan(_ url: URL) -> Acc {
@@ -320,14 +412,17 @@ actor TranscriptReader {
             SessionScanner.claudeFold(line: String(decoding: lineData, as: UTF8.self), into: &acc)
             searchStart = combined.index(after: nlIndex)
         }
-        // byteOffset tracks raw bytes already read off disk — including any
+        // byteOffset tracks raw bytes actually read off disk — including any
         // trailing partial line, which is kept (not re-read) in
-        // `partialTail`. Setting it to anything less than `size` would make
-        // the next scan re-read the partial bytes from disk *and* still
-        // carry them in `partialTail`, duplicating them.
+        // `partialTail`. M3: `size` is a stat taken *before* the read; if the
+        // writer appends between the stat and `readToEnd()`, the handle reads
+        // past `size` to the real EOF and `newBytes.count` exceeds
+        // `size - acc.byteOffset`. Advancing by the actual byte count read
+        // (not the stale `size`) keeps this correct in that race and is a
+        // no-op in the (overwhelmingly common) non-racing case, where the two
+        // are equal.
         acc.partialTail = Data(combined[searchStart...])
-        acc.byteOffset = size
-        acc.fileSize = size
+        acc.byteOffset += UInt64(newBytes.count)
 
         accumulators[key] = acc
         return acc
@@ -370,7 +465,7 @@ enum SessionScanner {
                 acc.hasSubagentTokens = true
             }
             if let resolved = toolResult.string("resolvedModel") {
-                acc.resolvedModels.append(resolved)
+                acc.lastResolvedModel = resolved
             }
             return
         }
@@ -380,11 +475,20 @@ enum SessionScanner {
               let usage = message.dict("usage")
         else { return }
 
+        // L17: `<synthetic>` is Claude Code's placeholder record for a failed
+        // API call ("Connection closed mid-response", etc.) — no real model,
+        // all-zero usage. Verified live: one of these sitting mid-transcript
+        // must not poison lastModel/contextTokens (if it happened to be the
+        // newest record, the row would render a 0% context bar over a real
+        // ~75k-token session) and its zero cost must not enter turnCosts and
+        // drag the xFloor median down. Skip entirely, before dedup even runs.
+        guard message.string("model") != "<synthetic>" else { return }
+
         // Dedup key is `message.id` specifically — `requestId` is off by one
         // from it in real data, not an equivalent key.
         let dedupKey = message.string("id") ?? obj.string("uuid") ?? UUID().uuidString
         guard !acc.seenMessageIds.contains(dedupKey) else { return }
-        acc.seenMessageIds.insert(dedupKey)
+        acc.rememberMessageId(dedupKey)
 
         // `input_tokens` alone is flat noise (observed 0/1/2, no signal) —
         // the real per-turn cost lives in cache_read + cache_creation.
@@ -549,6 +653,9 @@ enum SessionScanner {
         let processByPid = Dictionary(processList.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
 
         var sessions: [AgentSession] = []
+        // M5: every path scanned this cycle — fed to the reader's eviction
+        // pass below so a dead session's Acc doesn't outlive the process.
+        var transcriptPaths: Set<String> = []
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
                   let registry = try? JSONDecoder().decode(RegistryEntry.self, from: data)
@@ -559,12 +666,14 @@ enum SessionScanner {
             else { continue }
 
             let encoded = PathEncoding.encode(cwd: registry.cwd)
-            let transcript = projectsDir.appendingPathComponent(encoded)
-                .appendingPathComponent("\(registry.sessionId).jsonl")
+            let transcript = PathEncoding.resolveTranscriptPath(
+                projectsDir: projectsDir, encoded: encoded, sessionId: registry.sessionId
+            )
+            transcriptPaths.insert(transcript.path)
             let acc = await reader.scan(transcript)
 
             let settingsModel = resolveSettingsModel(cwd: registry.cwd, userSettingsPath: userSettingsPath)
-            let window = contextWindow(settingsModel: settingsModel, resolvedModel: acc.resolvedModels.last,
+            let window = contextWindow(settingsModel: settingsModel, resolvedModel: acc.lastResolvedModel,
                                         base: acc.lastModel, observedCtx: acc.contextTokens)
 
             sessions.append(AgentSession(
@@ -590,6 +699,7 @@ enum SessionScanner {
                 lastActivityAt: acc.lastActivityAt
             ))
         }
+        await reader.evictAccumulators(keeping: transcriptPaths)
         return sessions.sorted { $0.label < $1.label }
     }
 }
@@ -628,11 +738,16 @@ enum SessionSelfTests {
         testSidechainExclusion()
         testWindowResolution()
         testPathEncoding()
+        testPathEncodingFallback()
         testProcessScannerParsing()
         testLiveness()
+        testFormatterCaching()
         testSuspension()
         testSeverityAndNoUsage()
         testLastActivityAt()
+        testSyntheticRecordsSkipped()
+        testAccumulatorBounds()
+        testAccumulatorEviction()
         testIncrementalRead()
         testLiveSessionsEndToEnd()
         CodexSessionSelfTests.run()
@@ -656,6 +771,84 @@ enum SessionSelfTests {
         // the file just now, even though it's excluded from turns/xFloor/ctx.
         SessionScanner.claudeFold(line: usageLine(id: "t3", sidechain: true, timestamp: "2026-08-11T14:00:00.000Z"), into: &acc)
         precondition(acc.lastActivityAt! > first!, "sidechain records must still move the recency signal")
+    }
+
+    // MARK: L17 — `<synthetic>` records (failed API call placeholder, all-zero
+    // usage) must be invisible to model/context/turnCosts. Live evidence: the
+    // sqlmesh-be session has exactly one of these mid-transcript.
+
+    private static func testSyntheticRecordsSkipped() {
+        var acc = TranscriptReader.Acc()
+        SessionScanner.claudeFold(line: usageLine(id: "real1", cacheRead: 75_000, model: "claude-opus-5"), into: &acc)
+        precondition(acc.lastModel == "claude-opus-5")
+        precondition(acc.contextTokens == 75_000 + 2)
+        precondition(acc.turnCosts.count == 1)
+
+        // A synthetic record arrives next (e.g. "Connection closed
+        // mid-response") — it must change nothing.
+        SessionScanner.claudeFold(line: usageLine(id: "synth1", cacheRead: 0, output: 0, model: "<synthetic>"), into: &acc)
+        precondition(acc.lastModel == "claude-opus-5", "a synthetic record must not overwrite lastModel")
+        precondition(acc.contextTokens == 75_000 + 2, "a synthetic record must not become contextTokens")
+        precondition(acc.turnCosts.count == 1, "a synthetic record must not enter turnCosts")
+
+        // If synthetic is the LAST record in the transcript (session ends
+        // right after the API error) the real prior context must still show
+        // — never a fabricated 0%, which is what this bug looked like live.
+        precondition(acc.turnCosts == [75_000 + 2])
+    }
+
+    // MARK: M5 — bounded accumulator: FIFO-capped seenMessageIds, eviction
+    // of dead transcripts. This app runs for weeks; nothing here may grow
+    // without bound.
+
+    private static func testAccumulatorBounds() {
+        var acc = TranscriptReader.Acc()
+        for i in 0..<(TranscriptReader.seenMessageIdCap + 500) {
+            SessionScanner.claudeFold(line: usageLine(id: "id\(i)", cacheRead: Int64(i)), into: &acc)
+        }
+        precondition(acc.seenMessageIds.count == TranscriptReader.seenMessageIdCap,
+                     "seenMessageIds must stay capped even after far more unique ids than the cap")
+        precondition(acc.seenMessageIdOrder.count == TranscriptReader.seenMessageIdCap)
+        // The earliest ids must have been evicted — replaying one must be
+        // treated as new (not deduped away), while a recent one is still
+        // recognized and deduped.
+        let beforeReplayOldest = acc.turnCosts.count
+        SessionScanner.claudeFold(line: usageLine(id: "id0", cacheRead: 999_999), into: &acc)
+        precondition(acc.turnCosts.count == beforeReplayOldest + 1,
+                     "an id evicted from the FIFO window must no longer be recognized as a duplicate")
+        let beforeReplayRecent = acc.turnCosts.count
+        SessionScanner.claudeFold(line: usageLine(id: "id\(TranscriptReader.seenMessageIdCap + 499)", cacheRead: 1), into: &acc)
+        precondition(acc.turnCosts.count == beforeReplayRecent, "a recently-seen id must still dedup")
+    }
+
+    private static func testAccumulatorEviction() {
+        let sem = DispatchSemaphore(value: 0)
+        Task {
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("accumulator-eviction-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let fileA = dir.appendingPathComponent("a.jsonl")
+            let fileB = dir.appendingPathComponent("b.jsonl")
+            try? (usageLine(id: "a1") + "\n").write(to: fileA, atomically: true, encoding: .utf8)
+            try? (usageLine(id: "b1") + "\n").write(to: fileB, atomically: true, encoding: .utf8)
+
+            let reader = TranscriptReader()
+            _ = await reader.scan(fileA)
+            _ = await reader.scan(fileB)
+            let countAfterBoth = await reader.accumulatorCount
+            precondition(countAfterBoth == 2, "both scanned transcripts must be tracked")
+
+            // B is no longer in the live session set (its process exited) —
+            // only A survives the eviction pass.
+            await reader.evictAccumulators(keeping: [fileA.path])
+            let countAfterEviction = await reader.accumulatorCount
+            precondition(countAfterEviction == 1,
+                         "a transcript absent from the live set must be evicted, not kept forever")
+
+            try? FileManager.default.removeItem(at: dir)
+            sem.signal()
+        }
+        sem.wait()
     }
 
     // MARK: Fixture builders
@@ -723,7 +916,11 @@ enum SessionSelfTests {
         precondition(acc.turnCosts.count == 1, "the post-compaction turn must (re)start the window")
     }
 
-    // MARK: sidechain exclusion — least-verified path, now abundant in practice
+    // MARK: sidechain exclusion — fixture-only coverage. Current transcripts
+    // put subagent/Task turns in a separate `<sessionId>/subagents/agent-*.jsonl`
+    // file, not inline `isSidechain:true` records in the main transcript this
+    // reader scans (verified against real ~/.claude/projects data) — so this
+    // path is exercised only by the synthetic fixture below, not live traffic.
 
     private static func testSidechainExclusion() {
         var acc = TranscriptReader.Acc()
@@ -764,6 +961,73 @@ enum SessionSelfTests {
         precondition(PathEncoding.encode(cwd: "/Users/alex/.ade/agents/X/worktree")
                      == "-Users-alex--ade-agents-X-worktree")
         precondition(PathEncoding.encode(cwd: "/Users/git/sqlmesh") == "-Users-git-sqlmesh")
+
+        // H1: `_` must map to `-` too — the original two fixtures above are
+        // both underscore-free, which is exactly why this survived. Real
+        // evidence: 6/19 project dirs on this machine are `_`-bearing paths
+        // mis-encoded before this fix, e.g. this pytest tmpdir shape.
+        precondition(
+            PathEncoding.encode(cwd: "/private/var/folders/st/x/T/pytest-of-alex/pytest-120/test_real_cli_denies_shell_com0")
+            == "-private-var-folders-st-x-T-pytest-of-alex-pytest-120-test-real-cli-denies-shell-com0",
+            "underscore must map to '-' exactly like '/' and '.'"
+        )
+    }
+
+    // MARK: H1 fallback — glob for <sessionId>.jsonl when the encoded dir is wrong/absent
+
+    private static func testPathEncodingFallback() {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("path-encoding-fallback-\(UUID().uuidString)")
+        let projectsDir = root.appendingPathComponent("projects")
+        try? FileManager.default.createDirectory(at: projectsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Compares by suffix, not full-path equality: NSTemporaryDirectory()
+        // sits under macOS's `/var` -> `/private/var` symlink, and
+        // `FileManager.contentsOfDirectory` (used inside
+        // resolveTranscriptPath's glob) returns the `/private/var/…`-resolved
+        // form while a URL built directly from NSTemporaryDirectory() does
+        // not — a symlink-representation mismatch that has nothing to do
+        // with the fallback logic actually under test here.
+        func matches(_ url: URL, dir: String, sessionId: String) -> Bool {
+            url.path.hasSuffix("\(dir)/\(sessionId).jsonl")
+        }
+
+        let sessionId = "fallback-session"
+        // The transcript actually lives under some OTHER encoded dir than
+        // what `encode(cwd:)` would produce for our test cwd — simulating a
+        // future encoding-rule mismatch.
+        let actualDir = projectsDir.appendingPathComponent("-some-other-encoded-dir")
+        try? FileManager.default.createDirectory(at: actualDir, withIntermediateDirectories: true)
+        try? "".write(to: actualDir.appendingPathComponent("\(sessionId).jsonl"), atomically: true, encoding: .utf8)
+
+        let resolved = PathEncoding.resolveTranscriptPath(
+            projectsDir: projectsDir, encoded: "-does-not-exist", sessionId: sessionId
+        )
+        precondition(matches(resolved, dir: "-some-other-encoded-dir", sessionId: sessionId),
+                     "exactly one match elsewhere must be used instead of silently blanking the row")
+
+        // Two matches (genuinely ambiguous) must NOT be guessed at — falls
+        // back to the (nonexistent) primary path rather than picking one.
+        let secondDir = projectsDir.appendingPathComponent("-another-encoded-dir")
+        try? FileManager.default.createDirectory(at: secondDir, withIntermediateDirectories: true)
+        try? "".write(to: secondDir.appendingPathComponent("\(sessionId).jsonl"), atomically: true, encoding: .utf8)
+        let ambiguous = PathEncoding.resolveTranscriptPath(
+            projectsDir: projectsDir, encoded: "-does-not-exist", sessionId: sessionId
+        )
+        precondition(!matches(ambiguous, dir: "-some-other-encoded-dir", sessionId: sessionId)
+                     && !matches(ambiguous, dir: "-another-encoded-dir", sessionId: sessionId),
+                     "two matches is ambiguous — must not guess, falls back to the (absent) primary path")
+        precondition(matches(ambiguous, dir: "-does-not-exist", sessionId: sessionId),
+                     "the ambiguous fallback must be the unresolved primary path")
+
+        // A correctly-encoded, existing primary path must be used as-is —
+        // the fallback glob only ever fires when the primary is absent.
+        let goodDir = projectsDir.appendingPathComponent("-good-dir")
+        try? FileManager.default.createDirectory(at: goodDir, withIntermediateDirectories: true)
+        try? "".write(to: goodDir.appendingPathComponent("\(sessionId).jsonl"), atomically: true, encoding: .utf8)
+        let direct = PathEncoding.resolveTranscriptPath(projectsDir: projectsDir, encoded: "-good-dir", sessionId: sessionId)
+        precondition(matches(direct, dir: "-good-dir", sessionId: sessionId))
     }
 
     // MARK: `ps` line parsing
@@ -819,6 +1083,44 @@ enum SessionSelfTests {
         precondition(Liveness.isAlive(pid: ownPid, startedAtMs: nil, procStart: utcString, process: proc),
                      "correction 1: a naive string compare of UTC procStart vs local lstart would reject every " +
                      "live session — the parsed-instant compare must still match")
+
+        // M7: procStart must be tried FIRST and be authoritative, not
+        // startedAt. Prove the precedence, not just that each works alone —
+        // give a wildly wrong startedAt alongside a spot-on procStart and
+        // confirm it still passes (procStart wins) even though the old
+        // startedAt-first code would have rejected this on the startedAt
+        // check before ever looking at procStart.
+        let wrongStartedAtMs = Int64(instant.addingTimeInterval(-3600).timeIntervalSince1970 * 1000)
+        precondition(Liveness.isAlive(pid: ownPid, startedAtMs: wrongStartedAtMs, procStart: utcString, process: proc),
+                     "procStart must be authoritative even when startedAt disagrees by a wide margin")
+
+        // Unparseable procStart must fall back to startedAt, not just fail.
+        precondition(Liveness.isAlive(pid: ownPid, startedAtMs: Int64(instant.timeIntervalSince1970 * 1000),
+                                       procStart: "not a date", process: selfProc),
+                     "an unparseable procStart must fall back to startedAt rather than reporting dead")
+
+        // L12: a zombie (Z) answers kill(pid,0) and keeps its original
+        // lstart, so without an explicit exclusion it would read as alive.
+        let zombieProc = ProcInfo(pid: ownPid, state: "Z", startedLocal: now, comm: "claude")
+        precondition(!Liveness.isAlive(pid: ownPid, startedAtMs: Int64(now.timeIntervalSince1970 * 1000),
+                                        procStart: nil, process: zombieProc),
+                     "a zombie process must never read as a live session")
+    }
+
+    // MARK: M6 — formatter caching, not per-line allocation
+
+    private static func testFormatterCaching() {
+        let before = ProcessTime.formatterAllocationCount
+        // Exercise both parsers many times — simulating a real ~559-line
+        // `ps` scan several times over. If this were still allocating a
+        // fresh DateFormatter per call, formatterAllocationCount would climb
+        // by thousands here.
+        for _ in 0..<2000 {
+            _ = ProcessTime.parseLocal("Tue Aug 11 07:57:58 2026")
+            _ = ProcessTime.parseUTC("Tue Aug 11 07:57:58 2026")
+        }
+        precondition(ProcessTime.formatterAllocationCount == before,
+                     "repeated parses must reuse the two cached formatters, not allocate per call")
     }
 
     private static func testSuspension() {
@@ -827,11 +1129,17 @@ enum SessionSelfTests {
                      "a SIGSTOPed process is not busy however recent its registry status")
         precondition(!Suspension.isBusy(status: "idle", processStopped: false))
 
-        // The regression this replaced: a session on one long turn stops
-        // rewriting its registry file, so age alone cannot distinguish it
-        // from a suspended process. Registry age must not enter into it.
-        precondition(Suspension.isBusy(status: "busy", processStopped: false),
-                     "a busy session mid-long-turn stays busy no matter how stale its registry file is")
+        // L11: the regression this replaced was "a session on one long turn
+        // stops rewriting its registry file, so age alone cannot distinguish
+        // it from a suspended process". isBusy(status:processStopped:) takes
+        // no age parameter at all, so no staleness regression is expressible
+        // by calling it again with the same two arguments — the previous
+        // "guard" here was a verbatim repeat of the first assertion above and
+        // could never fail on its own. The real regression guard lives at
+        // the registry level instead: see testLiveSessionsEndToEnd's stale
+        // statusUpdatedAt case, which drives status through RegistryEntry ->
+        // Suspension.isBusy end-to-end and would catch anyone reintroducing
+        // an age check anywhere in that path.
 
         // ps state codes: the leading letter decides, trailing flags don't.
         precondition(ProcInfo(pid: 1, state: "T", startedLocal: Date(), comm: "claude").isStopped)
@@ -894,7 +1202,14 @@ enum SessionSelfTests {
             for l in [l1, l2, l3] { SessionScanner.claudeFold(line: l, into: &fresh) }
             precondition(fresh.turnCosts == acc.turnCosts, "incremental result must equal a from-scratch parse")
             precondition(fresh.rawInputTokens == acc.rawInputTokens)
-            precondition(SessionScanner.xFloor(turnCosts: fresh.turnCosts) == SessionScanner.xFloor(turnCosts: acc.turnCosts))
+            // L11: comparing xFloor(fresh.turnCosts) to xFloor(acc.turnCosts)
+            // here would be decorative — xFloor is a pure function of
+            // turnCosts alone, and turnCosts equality was already asserted
+            // two lines up, so that comparison could never fail on its own.
+            // Assert the actual, independently-known value instead: only 3
+            // turns exist at this point, under the 5-turn floor.
+            precondition(SessionScanner.xFloor(turnCosts: fresh.turnCosts) == nil,
+                         "under 5 turns must read as nil, not a fabricated multiple")
 
             // Mid-line truncation: a trailing partial line (built at runtime
             // by slicing a complete fixture, so the source text itself stays
@@ -954,10 +1269,15 @@ enum SessionSelfTests {
 
             let ownPid = getpid()
             let now = Date()
+            // L11: statusUpdatedAt is deliberately ancient (an hour stale)
+            // while status stays "busy" — a real regression guard for the
+            // claim testSuspension's comment makes: registry age must never
+            // enter into busy-ness anywhere in the pipeline, not just at the
+            // isBusy() call site in isolation.
             let registry: [String: Any] = [
                 "pid": Int(ownPid), "sessionId": sessionId, "cwd": cwd,
                 "startedAt": Int(now.timeIntervalSince1970 * 1000),
-                "status": "busy", "statusUpdatedAt": Int(now.timeIntervalSince1970 * 1000),
+                "status": "busy", "statusUpdatedAt": Int(now.addingTimeInterval(-3600).timeIntervalSince1970 * 1000),
                 "name": "e2e-test",
             ]
             if let data = try? JSONSerialization.data(withJSONObject: registry) {
@@ -978,17 +1298,36 @@ enum SessionSelfTests {
             }
 
             let processList = [ProcInfo(pid: ownPid, state: "S+", startedLocal: now, comm: "claude")]
+            let sharedReader = TranscriptReader()
             let sessions = await SessionScanner.liveSessions(
                 processList: processList, mappingDir: mappingDir, projectsDir: projectsDir,
                 userSettingsPath: root.appendingPathComponent("nonexistent-settings.json"),
-                reader: TranscriptReader()
+                reader: sharedReader
             )
             precondition(sessions.count == 1, "only the live PID's session must survive — got \(sessions.count)")
             precondition(sessions[0].pid == ownPid)
             precondition(sessions[0].label == "e2e-test")
             precondition(sessions[0].turns == 6)
             precondition(sessions[0].xFloorMultiple != nil)
-            precondition(sessions[0].busy == true)
+            precondition(sessions[0].busy == true,
+                         "status=busy must read as busy end-to-end even with an hour-stale statusUpdatedAt")
+            let countBeforeExit = await sharedReader.accumulatorCount
+            precondition(countBeforeExit == 1)
+
+            // M5, wired end-to-end: the session's registry file disappears
+            // (process exited) — the next scan cycle must evict its
+            // accumulator via liveSessions' own eviction call, not just when
+            // driven directly at the actor level.
+            try? FileManager.default.removeItem(at: mappingDir.appendingPathComponent("\(ownPid).json"))
+            let sessionsAfterExit = await SessionScanner.liveSessions(
+                processList: processList, mappingDir: mappingDir, projectsDir: projectsDir,
+                userSettingsPath: root.appendingPathComponent("nonexistent-settings.json"),
+                reader: sharedReader
+            )
+            precondition(sessionsAfterExit.isEmpty)
+            let countAfterExit = await sharedReader.accumulatorCount
+            precondition(countAfterExit == 0,
+                         "liveSessions must evict a transcript's accumulator once its registry file is gone")
 
             try? FileManager.default.removeItem(at: root)
             sem.signal()

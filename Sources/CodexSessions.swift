@@ -309,6 +309,17 @@ actor CodexRolloutReader {
 
     private var accumulators: [String: Acc] = [:]
 
+    /// Same unbounded-growth trap as TranscriptReader's, in a sibling file:
+    /// without this, every rollout ever scanned keeps its accumulator for the
+    /// life of the process, and this is a menu-bar app expected to run for
+    /// weeks. Called once per scan cycle with the paths still live.
+    func evictAccumulators(keeping livePaths: Set<String>) {
+        accumulators = accumulators.filter { livePaths.contains($0.key) }
+    }
+
+    /// Test-only visibility, mirroring TranscriptReader.accumulatorCount.
+    var accumulatorCount: Int { accumulators.count }
+
     @discardableResult
     func scan(_ url: URL) -> Acc {
         let key = url.path
@@ -429,6 +440,7 @@ enum CodexSessionScanner {
         reader: CodexRolloutReader = .shared
     ) async -> [AgentSession] {
         var sessions: [AgentSession] = []
+        var scannedPaths: Set<String> = []
         for match in CodexMatcher.match(processes: processes, threads: threads) {
             guard let thread = match.thread else {
                 // Live PID, no threads row yet — lazy row creation, verified
@@ -447,6 +459,7 @@ enum CodexSessionScanner {
                 continue
             }
 
+            scannedPaths.insert(thread.rolloutPath)
             let acc = await reader.scan(URL(fileURLWithPath: thread.rolloutPath))
             let cwd = thread.cwd ?? acc.cwd ?? match.process.cwd
             var label = thread.agentNickname ?? acc.agentNickname ?? PathEncoding.label(cwd: cwd)
@@ -475,6 +488,7 @@ enum CodexSessionScanner {
                 hasUsage: acc.hasTokenCountEvent
             ))
         }
+        await reader.evictAccumulators(keeping: scannedPaths)
         return sessions.sorted { $0.label < $1.label }
     }
 }

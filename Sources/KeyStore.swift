@@ -130,3 +130,34 @@ enum APIKeySave {
         }
     }
 }
+
+// MARK: - Legacy config.json import
+
+/// L9: pulled out of SettingsWindow's importLegacyKeys() (which previously
+/// used `if (try? keyStore.set(…)) != nil` — swallowing whatever
+/// KeyStoreError the Keychain returned, so a real failure looked identical
+/// to "nothing to import" with no explanation) so the error-surfacing
+/// behaviour is testable against a fake store without driving a real
+/// NSButton click.
+enum LegacyImport {
+    struct Result {
+        var importedCount: Int
+        var errors: [String]
+    }
+
+    /// Only imports a key that isn't already in the Keychain — Keychain
+    /// always wins over the legacy file (see Config's precedence doc).
+    static func run(legacy: (openRouterKey: String?, xaiKey: String?), store: KeyStore) -> Result {
+        var imported = 0
+        var errors: [String] = []
+        if let value = legacy.openRouterKey, store.get(KeyAccount.openRouter) == nil {
+            do { try store.set(KeyAccount.openRouter, value: value); imported += 1 }
+            catch { errors.append("OpenRouter: \(error.localizedDescription)") }
+        }
+        if let value = legacy.xaiKey, store.get(KeyAccount.xai) == nil {
+            do { try store.set(KeyAccount.xai, value: value); imported += 1 }
+            catch { errors.append("Grok (xAI): \(error.localizedDescription)") }
+        }
+        return Result(importedCount: imported, errors: errors)
+    }
+}
