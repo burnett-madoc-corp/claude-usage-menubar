@@ -31,27 +31,46 @@ protocol Provider: Sendable {
 
 // MARK: - Config
 
-/// Keys live in ~/.config/claude-usage/config.json (or the matching env var),
-/// never in the repo:
-///   { "openrouter_key": "sk-or-v1-…", "xai_key": "xai-…" }
+/// Keys resolve highest-precedence-wins across three tiers:
+///   1. OPENROUTER_API_KEY / XAI_API_KEY env vars (unchanged — keeps
+///      CI/scripting workflows working).
+///   2. The macOS Keychain (KeyStore.swift): service
+///      "local.claude-usage-menubar", accounts "openrouter_key"/"xai_key" —
+///      what the settings window's Save button writes.
+///   3. Legacy ~/.config/claude-usage/config.json — read-only, never
+///      deleted automatically, kept alive forever for anyone who never
+///      opens settings:
+///        { "openrouter_key": "sk-or-v1-…", "xai_key": "xai-…" }
+/// Providers.all() calls Config.load() on every refresh, so a key saved in
+/// settings (or removed) takes effect on the next poll with no restart —
+/// the same property the legacy env-var/file design already had.
 struct Config: Sendable {
     var openRouterKey: String?
     var xaiKey: String?
 
-    static let path = FileManager.default.homeDirectoryForCurrentUser
+    /// var, not let: --self-test points this at a temp-dir fixture instead
+    /// of the real file, mirroring the Prefs.defaults swap pattern.
+    static var legacyPath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/claude-usage/config.json")
 
-    static func load() -> Config {
-        var config = Config()
-        if let data = try? Data(contentsOf: path),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            config.openRouterKey = json["openrouter_key"] as? String
-            config.xaiKey = json["xai_key"] as? String
-        }
+    static func load(store: KeyStore = KeychainStore()) -> Config {
+        let legacy = legacyKeys()
         let env = ProcessInfo.processInfo.environment
-        config.openRouterKey = env["OPENROUTER_API_KEY"] ?? config.openRouterKey
-        config.xaiKey = env["XAI_API_KEY"] ?? config.xaiKey
+
+        var config = Config()
+        config.openRouterKey = env["OPENROUTER_API_KEY"] ?? store.get(KeyAccount.openRouter) ?? legacy.openRouterKey
+        config.xaiKey = env["XAI_API_KEY"] ?? store.get(KeyAccount.xai) ?? legacy.xaiKey
         return config
+    }
+
+    /// Exposed separately (not folded into load()) so SettingsWindow's
+    /// migration banner can ask "does the legacy file hold a key?" without
+    /// touching the Keychain or env vars at all.
+    static func legacyKeys() -> (openRouterKey: String?, xaiKey: String?) {
+        guard let data = try? Data(contentsOf: legacyPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return (nil, nil) }
+        return (json["openrouter_key"] as? String, json["xai_key"] as? String)
     }
 }
 
@@ -223,6 +242,17 @@ struct OpenRouterProvider: Provider {
     let name = "OpenRouter"
     let key: String?
 
+    /// Turns a /v1/credits response into the "valid — $X.XX remaining"
+    /// message SettingsWindow's Test button shows — the same arithmetic
+    /// load() uses for its Row, pulled out so both call sites (and
+    /// --self-test) share one source of truth instead of two copies drifting.
+    static func creditsMessage(from json: [String: Any]) -> String {
+        let data = json["data"] as? [String: Any] ?? [:]
+        let granted = (data["total_credits"] as? NSNumber)?.doubleValue ?? 0
+        let used = (data["total_usage"] as? NSNumber)?.doubleValue ?? 0
+        return "valid — \(Format.usd(granted - used)) remaining"
+    }
+
     func load() async -> Card {
         guard let key, !key.isEmpty else {
             return Card(provider: name, rows: [], error: "no API key — see README")
@@ -262,6 +292,21 @@ struct XAIProvider: Provider {
     let name = "Grok (xAI)"
     let key: String?
 
+    /// The blocked-flags text SettingsWindow's Test button surfaces too —
+    /// factored out of load() so both call sites read the same flags.
+    static func keyHealthMessage(from json: [String: Any]) -> String {
+        let blockedFlags = Self.blockedFlags(from: json)
+        return blockedFlags.isEmpty ? "active" : blockedFlags.joined(separator: ", ")
+    }
+
+    private static func blockedFlags(from json: [String: Any]) -> [String] {
+        [
+            ("team_blocked", "team blocked"),
+            ("api_key_blocked", "key blocked"),
+            ("api_key_disabled", "key disabled"),
+        ].filter { json[$0.0] as? Bool == true }.map(\.1)
+    }
+
     func load() async -> Card {
         guard let key, !key.isEmpty else {
             return Card(provider: name, rows: [], error: "no API key — see README")
@@ -269,11 +314,7 @@ struct XAIProvider: Provider {
         do {
             let json = try await Net.getJSON(URL(string: "https://api.x.ai/v1/api-key")!, bearer: key)
 
-            let blockedFlags = [
-                ("team_blocked", "team blocked"),
-                ("api_key_blocked", "key blocked"),
-                ("api_key_disabled", "key disabled"),
-            ].filter { json[$0.0] as? Bool == true }.map(\.1)
+            let blockedFlags = Self.blockedFlags(from: json)
 
             var rows: [Row] = []
             if blockedFlags.isEmpty {

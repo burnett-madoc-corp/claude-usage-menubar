@@ -479,6 +479,21 @@ enum Providers {
     }
 }
 
+// MARK: - Self-test support
+
+/// In-memory KeyStore for --self-test — lets the Config.load(store:)
+/// precedence logic and the Save/empty-delete semantics be exercised
+/// without ever touching the real Keychain. Self-test code runs
+/// single-threaded on the main thread, so a plain (unlocked) dictionary is
+/// sufficient; @unchecked Sendable mirrors the pattern the headline storage
+/// classes in Providers.swift/main.swift already use for the same reason.
+private final class FakeKeyStore: KeyStore, @unchecked Sendable {
+    private var storage: [String: String] = [:]
+    func get(_ account: String) -> String? { storage[account] }
+    func set(_ account: String, value: String) throws { storage[account] = value }
+    func delete(_ account: String) throws { storage.removeValue(forKey: account) }
+}
+
 // MARK: - Entry point
 
 private func runSelfTests() {
@@ -581,6 +596,95 @@ private func runSelfTests() {
     precondition(Format.color(for: "normal", percent: 79).isEqual(NSColor.systemGreen))
     precondition(Format.color(for: "normal", percent: 80).isEqual(NSColor.systemOrange))
     precondition(Format.color(for: "normal", percent: 95).isEqual(NSColor.systemRed))
+
+    // Config.load(store:) precedence — env > Keychain > legacy JSON —
+    // against an in-memory fake KeyStore and a temp-dir JSON fixture, so
+    // none of this touches the real Keychain or the user's real config
+    // file. Config.legacyPath is swappable exactly like Prefs.defaults.
+    do {
+        let fakeStore = FakeKeyStore()
+        let savedLegacyPath = Config.legacyPath
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-usage-selftest-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let tempConfigPath = tempDir.appendingPathComponent("config.json")
+        Config.legacyPath = tempConfigPath
+        defer {
+            Config.legacyPath = savedLegacyPath
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        // None present -> nil.
+        precondition(Config.load(store: fakeStore).openRouterKey == nil)
+        precondition(Config.load(store: fakeStore).xaiKey == nil)
+
+        // Legacy JSON alone (tier 3).
+        let legacyJSON = #"{"openrouter_key": "legacy-or", "xai_key": "legacy-xai"}"#
+        try? legacyJSON.write(to: tempConfigPath, atomically: true, encoding: .utf8)
+        precondition(Config.load(store: fakeStore).openRouterKey == "legacy-or")
+        precondition(Config.load(store: fakeStore).xaiKey == "legacy-xai")
+
+        // Keychain beats legacy JSON (tier 2 over tier 3) — only the key
+        // that's actually set in the fake is overridden; the untouched one
+        // still falls through to legacy.
+        try? fakeStore.set(KeyAccount.openRouter, value: "keychain-or")
+        precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or")
+        precondition(Config.load(store: fakeStore).xaiKey == "legacy-xai")
+
+        // Env beats Keychain and legacy JSON (tier 1 over everything).
+        setenv("OPENROUTER_API_KEY", "env-or", 1)
+        precondition(Config.load(store: fakeStore).openRouterKey == "env-or")
+        unsetenv("OPENROUTER_API_KEY")
+        precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or") // falls back once env clears
+
+        // Keychain alone (no legacy file at all — the common case on this
+        // machine per the plan: "no file" must not be an error).
+        try? FileManager.default.removeItem(at: tempConfigPath)
+        precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or")
+        precondition(Config.load(store: fakeStore).xaiKey == nil) // never set in Keychain, legacy now gone too
+    }
+
+    // Empty-string-means-delete semantics (the Save button's contract,
+    // exercised as a pure function against a fake store).
+    do {
+        let store = FakeKeyStore()
+        try? APIKeySave.apply("secret123", account: "k", store: store)
+        precondition(store.get("k") == "secret123")
+        try? APIKeySave.apply("", account: "k", store: store)
+        precondition(store.get("k") == nil)
+    }
+
+    // KeychainStore must degrade, never crash, on a lookup miss — this is
+    // the same code path errSecInteractionNotAllowed (a locked login
+    // keychain, e.g. a headless --once over SSH) falls through, so Config
+    // can fall back to the legacy JSON/no-key tiers instead of throwing.
+    precondition(KeychainStore().get("selftest_definitely_absent_key_should_not_exist") == nil)
+
+    // Gated real-Keychain round-trip: a throwaway account under this app's
+    // own service ("local.claude-usage-menubar"), distinct from both real
+    // key accounts and from "Claude Code-credentials" (a different
+    // service entirely) — add -> read -> update -> delete, cleaning up
+    // after itself. Skips cleanly, without failing the run, if the
+    // Keychain is unavailable in this environment.
+    do {
+        let realStore = KeychainStore()
+        let selfTestAccount = "selftest_key"
+        precondition(selfTestAccount != KeyAccount.openRouter && selfTestAccount != KeyAccount.xai)
+
+        try? realStore.delete(selfTestAccount) // clean slate if a prior run crashed mid-test
+
+        if (try? realStore.set(selfTestAccount, value: "round-trip-1")) != nil {
+            precondition(realStore.get(selfTestAccount) == "round-trip-1")
+            if (try? realStore.set(selfTestAccount, value: "round-trip-2")) != nil {
+                precondition(realStore.get(selfTestAccount) == "round-trip-2")
+            }
+            try? realStore.delete(selfTestAccount)
+            precondition(realStore.get(selfTestAccount) == nil)
+            print("Keychain round-trip: ran")
+        } else {
+            print("Keychain round-trip: skipped (Keychain unavailable)")
+        }
+    }
 
     let logo = UsageMenuBar.logoImage(resource: "codex-template")
     precondition(logo != nil)
