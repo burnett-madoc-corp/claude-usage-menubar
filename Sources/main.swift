@@ -709,6 +709,9 @@ private func runSelfTests() {
             }
         }
     } == true)
+
+    SessionSelfTests.run()
+
     print("Self-tests passed")
 }
 
@@ -736,6 +739,36 @@ if CommandLine.arguments.contains("--once") {
                 print("  \(name) \(gauge)\(row.detail)")
             }
             if let note = card.note { print("  (\(note))") }
+        }
+
+        print("Sessions")
+        let sessions = await Sessions.snapshot()
+        if sessions.isEmpty {
+            print("  no live Claude sessions")
+        } else {
+            let labelWidth = max(sessions.map(\.label.count).max() ?? 8, 8)
+            for s in sessions {
+                let name = s.label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
+                let dot = s.busy ? "●" : "○"
+                let gauge = s.contextPercent.map { "\(Format.bar($0)) \(String($0).leftPadded(to: 3))%" } ?? "context —"
+                let multiple = s.xFloorMultiple.map { String(format: "%.1fx", $0) } ?? "—"
+                let compactHint = s.compactionCount > 0 ? " ⌁\(s.compactionCount)" : ""
+                print("  \(dot) \(name) \(gauge)  \(multiple)  \(s.turns)t\(compactHint)  pid \(s.pid)")
+                if let model = s.model {
+                    print("      \(model)  in \(s.inputTokens)  out \(s.outputTokens)  cwd \(s.cwd)")
+                } else if !s.hasUsage {
+                    print("      starting — no usage yet  cwd \(s.cwd)")
+                }
+                if let subagent = s.subagentTokens {
+                    print("      subagents \(subagent) tokens")
+                }
+                if s.compactionCount > 0 {
+                    let pre = s.lastCompactionPreCtx.map(String.init) ?? "—"
+                    let post = s.lastCompactionPostCtx.map(String.init) ?? "pending"
+                    let when = s.lastCompactionAt.map(Format.ago) ?? "—"
+                    print("      last compaction \(when): \(pre) → \(post)")
+                }
+            }
         }
         semaphore.signal()
     }
