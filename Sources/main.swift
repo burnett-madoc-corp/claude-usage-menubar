@@ -1149,14 +1149,14 @@ if CommandLine.arguments.contains("--once") {
         print("Sessions")
         let sessions = await Sessions.snapshot()
         if sessions.isEmpty {
-            print("  no live Claude sessions")
+            print("  no live sessions")
         } else {
             // Reuses the same pure sort/cap/line-composition the Compact
             // dropdown row uses, so this diagnostic output and the live menu
             // can never silently disagree.
             let visible = UsageMenuBar.visibleSessions(sessions)
             for s in visible.rows {
-                print("  \(UsageMenuBar.compactLine(for: s))  pid \(s.pid)")
+                print("  \(UsageMenuBar.compactLine(for: s))  [\(s.kind.rawValue)] pid \(s.pid)")
                 for detail in UsageMenuBar.sessionTooltip(for: s).split(separator: "\n") {
                     print("      \(detail)")
                 }

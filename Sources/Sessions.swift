@@ -597,13 +597,19 @@ enum SessionScanner {
 // MARK: - Entry point for main.swift
 
 enum Sessions {
+    /// Claude and Codex are independent sources: a Codex DB failure (locked,
+    /// missing, schema-drifted) must never block Claude sessions from
+    /// rendering, and vice versa — each degrades to "no sessions from this
+    /// source" on its own.
     static func snapshot() async -> [AgentSession] {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return await SessionScanner.liveSessions(
+        async let claude = SessionScanner.liveSessions(
             processList: ProcessScanner.run(),
             mappingDir: home.appendingPathComponent(".claude/sessions"),
             projectsDir: home.appendingPathComponent(".claude/projects")
         )
+        async let codex = CodexSessions.snapshot()
+        return (await claude + (await codex)).sorted { $0.label < $1.label }
     }
 }
 
@@ -629,6 +635,7 @@ enum SessionSelfTests {
         testLastActivityAt()
         testIncrementalRead()
         testLiveSessionsEndToEnd()
+        CodexSessionSelfTests.run()
     }
 
     // MARK: lastActivityAt — Phase 4b's recency signal, threaded through the

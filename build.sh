@@ -19,7 +19,7 @@ swiftc -O \
   -framework Security \
   -o "$BIN" \
   Sources/Providers.swift Sources/KeyStore.swift Sources/Prefs.swift \
-  Sources/Sessions.swift Sources/SettingsWindow.swift Sources/main.swift
+  Sources/Sessions.swift Sources/CodexSessions.swift Sources/SettingsWindow.swift Sources/main.swift
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
