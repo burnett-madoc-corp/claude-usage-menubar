@@ -429,7 +429,9 @@ private final class APIKeyRow: NSObject, NSTextFieldDelegate {
     /// of the poll loop (its own URLSession call), so users can test before
     /// saving and a Test never shares state with a refresh in flight.
     @objc private func testTapped() {
-        let value = field.stringValue
+        // Same normalisation Save applies, so "Test" can never pass on a
+        // string that Save would then store differently (or vice versa).
+        let value = APIKeySave.normalize(field.stringValue)
         guard !value.isEmpty else {
             statusLabel.stringValue = "enter a key to test"
             statusLabel.textColor = .secondaryLabelColor
@@ -451,7 +453,7 @@ private final class APIKeyRow: NSObject, NSTextFieldDelegate {
     }
 
     @objc private func saveTapped() {
-        let value = field.stringValue
+        let value = APIKeySave.normalize(field.stringValue)
         do {
             try APIKeySave.apply(value, account: account, store: keyStore)
             statusLabel.stringValue = value.isEmpty ? "removed from Keychain" : "saved to Keychain"

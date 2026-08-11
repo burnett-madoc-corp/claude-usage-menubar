@@ -112,11 +112,21 @@ struct KeychainStore: KeyStore {
 /// semantics directly against a fake KeyStore without driving a real
 /// NSButton click.
 enum APIKeySave {
+    /// Keys get pasted, and a copy out of a terminal or a web page routinely
+    /// carries a trailing newline or space. Stored verbatim that becomes
+    /// `Bearer sk-…\n`, which earns a 401 the user cannot diagnose — the
+    /// field looks correct. Normalise in one place so Save, Test, and the
+    /// empty-means-delete check can never disagree about what the key is.
+    static func normalize(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func apply(_ text: String, account: String, store: KeyStore) throws {
-        if text.isEmpty {
+        let value = normalize(text)
+        if value.isEmpty {
             try store.delete(account)
         } else {
-            try store.set(account, value: text)
+            try store.set(account, value: value)
         }
     }
 }

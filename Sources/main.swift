@@ -652,6 +652,16 @@ private func runSelfTests() {
         precondition(store.get("k") == "secret123")
         try? APIKeySave.apply("", account: "k", store: store)
         precondition(store.get("k") == nil)
+
+        // Pasted keys carry trailing whitespace/newlines; storing that
+        // verbatim sends a Bearer token with a newline in it and earns an
+        // undiagnosable 401. Trim on the way in, and treat whitespace-only
+        // input as empty so it deletes rather than storing a blank "key".
+        try? APIKeySave.apply("  secret123\n", account: "k", store: store)
+        precondition(store.get("k") == "secret123")
+        try? APIKeySave.apply("   \n ", account: "k", store: store)
+        precondition(store.get("k") == nil)
+        precondition(APIKeySave.normalize("\tsk-or-v1-abc \n") == "sk-or-v1-abc")
     }
 
     // KeychainStore must degrade, never crash, on a lookup miss — this is
