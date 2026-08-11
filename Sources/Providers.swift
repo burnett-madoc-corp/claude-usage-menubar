@@ -58,9 +58,18 @@ struct Config: Sendable {
         let env = ProcessInfo.processInfo.environment
 
         var config = Config()
-        config.openRouterKey = env["OPENROUTER_API_KEY"] ?? store.get(KeyAccount.openRouter) ?? legacy.openRouterKey
-        config.xaiKey = env["XAI_API_KEY"] ?? store.get(KeyAccount.xai) ?? legacy.xaiKey
+        config.openRouterKey = nonBlank(env["OPENROUTER_API_KEY"]) ?? store.get(KeyAccount.openRouter) ?? legacy.openRouterKey
+        config.xaiKey = nonBlank(env["XAI_API_KEY"]) ?? store.get(KeyAccount.xai) ?? legacy.xaiKey
         return config
+    }
+
+    /// L15: `OPENROUTER_API_KEY=` (set but empty, or whitespace-only) must
+    /// not win tier 1 over a perfectly good Keychain key — without this,
+    /// `env["…"] ?? …` treats `""` as present and the provider reports "no
+    /// API key" while a valid Keychain entry sits unused underneath it.
+    static func nonBlank(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
     }
 
     /// Exposed separately (not folded into load()) so SettingsWindow's

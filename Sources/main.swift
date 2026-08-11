@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 
 // MARK: - Formatting
 
@@ -421,6 +422,15 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     // MARK: Menu
 
+    /// H2: a provider is only polled OR only title-shown but still gets a
+    /// `Card` back from loadAll() — this decides whether that card belongs
+    /// in the dropdown at all. `nil` (unrecognized name) defaults to shown,
+    /// matching `Providers.shouldPoll`.
+    nonisolated static func shouldShowInDropdown(_ card: Card) -> Bool {
+        guard let id = ProviderID(displayName: card.provider) else { return true }
+        return Prefs.showInDropdown(id)
+    }
+
     private func rebuildMenu() {
         menu.removeAllItems()
         sessionRowItems.removeAll()
@@ -428,7 +438,11 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         detailedRowViews.removeAll()
         sessionOverflow = 0
 
-        for card in cards {
+        // H2: `cards` now includes providers polled for the title only (see
+        // Providers.shouldPoll) — those must not also render in the
+        // dropdown, so this filters on Dropdown visibility specifically
+        // rather than assuming "polled" implies "shown here".
+        for card in cards where Self.shouldShowInDropdown(card) {
             addSectionHeader(card.provider)
             if let error = card.error {
                 addLine("  \(error)", color: .systemRed, size: 11)
@@ -793,11 +807,26 @@ extension UsageMenuBar: NSMenuDelegate {
 // MARK: - Provider registry
 
 enum Providers {
+    /// H2: a provider must be polled if EITHER visibility flag would show
+    /// it. Filtering on `showInDropdown` alone meant unticking Dropdown
+    /// while leaving Menu bar ticked stopped ClaudeProvider/CodexProvider's
+    /// `load()` from ever running again — but `headline` (what the title
+    /// renders) is only ever written as a side effect of `load()`, so the
+    /// title froze on whatever numbers were last polled, with no staleness
+    /// marker, and read as confidently wrong quota forever. `nil` (an
+    /// unrecognized name) defaults to shown, matching every other Prefs
+    /// lookup's "never configured means show everything".
+    nonisolated static func shouldPoll(id: ProviderID?) -> Bool {
+        guard let id else { return true }
+        return Prefs.showInDropdown(id) || (id.supportsTitle && Prefs.showInTitle(id))
+    }
+
     /// `includeHidden` is the `--once` escape hatch: headless output is a
     /// diagnostic, not a display, so it deliberately ignores Prefs
     /// visibility and always reports all five providers. The live menu bar
     /// (refresh(), applicationDidFinishLaunching) always calls the default,
-    /// filtered form — hidden providers are not polled at all.
+    /// filtered form — a provider hidden from BOTH the dropdown and the
+    /// title is not polled at all; one shown in either place is.
     static func all(includeHidden: Bool = false) -> [Provider] {
         let config = Config.load()
         let providers: [Provider] = [
@@ -808,10 +837,7 @@ enum Providers {
             XAIProvider(key: config.xaiKey),
         ]
         if includeHidden { return providers }
-        return providers.filter { provider in
-            guard let id = ProviderID(displayName: provider.name) else { return true }
-            return Prefs.showInDropdown(id)
-        }
+        return providers.filter { shouldPoll(id: ProviderID(displayName: $0.name)) }
     }
 
     /// Fetch every provider concurrently but keep registry order in the menu,
@@ -842,6 +868,14 @@ private final class FakeKeyStore: KeyStore, @unchecked Sendable {
     func get(_ account: String) -> String? { storage[account] }
     func set(_ account: String, value: String) throws { storage[account] = value }
     func delete(_ account: String) throws { storage.removeValue(forKey: account) }
+}
+
+/// L9: a KeyStore whose `set` always fails — exercises LegacyImport's error
+/// path without needing a real Keychain in a failed state.
+private final class FailingKeyStore: KeyStore, @unchecked Sendable {
+    func get(_ account: String) -> String? { nil }
+    func set(_ account: String, value: String) throws { throw KeyStoreError.osStatus(errSecIO) }
+    func delete(_ account: String) throws { throw KeyStoreError.osStatus(errSecIO) }
 }
 
 // MARK: - Compact session-row self-tests
@@ -1036,6 +1070,31 @@ private func runSelfTests() {
     precondition(Prefs.showInTitle(.codex) == false)
     precondition(Prefs.showInTitle(.claude) == true)
 
+    // H2: the four Dropdown x Menu-bar visibility combinations for a
+    // title-capable provider (.claude) — must poll whenever EITHER is on,
+    // and rebuildMenu must still hide it from the dropdown when only the
+    // title is on. Plus a non-title-capable provider, where title state
+    // must never matter at all.
+    Prefs.setShowInDropdown(.claude, true); Prefs.setShowInTitle(.claude, true)
+    precondition(Providers.shouldPoll(id: .claude))
+    Prefs.setShowInDropdown(.claude, true); Prefs.setShowInTitle(.claude, false)
+    precondition(Providers.shouldPoll(id: .claude))
+    Prefs.setShowInDropdown(.claude, false); Prefs.setShowInTitle(.claude, true)
+    precondition(Providers.shouldPoll(id: .claude), "menu-bar-title-only visibility must still be polled")
+    precondition(!UsageMenuBar.shouldShowInDropdown(Card(provider: "Claude", rows: [])),
+                 "title-only visibility must still be hidden from the dropdown")
+    Prefs.setShowInDropdown(.claude, false); Prefs.setShowInTitle(.claude, false)
+    precondition(!Providers.shouldPoll(id: .claude), "both hidden must not be polled")
+
+    Prefs.setShowInDropdown(.antigravity, false); Prefs.setShowInTitle(.antigravity, true) // no-op: doesn't support title
+    precondition(!Providers.shouldPoll(id: .antigravity),
+                 "a non-title-capable provider's title flag must never matter")
+    precondition(Providers.shouldPoll(id: nil), "an unrecognized provider id must default to polled")
+
+    Prefs.setShowInDropdown(.claude, true) // restore a clean default for anything reading after this point
+    precondition(UsageMenuBar.shouldShowInDropdown(Card(provider: "unrecognized-name", rows: [])),
+                 "an unrecognized provider name must default to shown in the dropdown")
+
     precondition(Prefs.refreshInterval() == 120) // default
     Prefs.setRefreshInterval(5)
     precondition(Prefs.refreshInterval() == 60) // clamped low on write
@@ -1096,7 +1155,21 @@ private func runSelfTests() {
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tempConfigPath = tempDir.appendingPathComponent("config.json")
         Config.legacyPath = tempConfigPath
+
+        // M4: env is tier 1 of the precedence being tested here, but unlike
+        // Prefs.defaults/Config.legacyPath/the KeyStore it was never
+        // isolated — a real OPENROUTER_API_KEY/XAI_API_KEY in the runner's
+        // environment made "None present -> nil" false and crashed the run
+        // (SIGTRAP). Save and clear both up front, restore in the same
+        // defer that already restores legacyPath, so this block can never
+        // observe (or clobber) the user's real environment.
+        let savedOpenRouterEnv = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"]
+        let savedXaiEnv = ProcessInfo.processInfo.environment["XAI_API_KEY"]
+        unsetenv("OPENROUTER_API_KEY")
+        unsetenv("XAI_API_KEY")
         defer {
+            if let savedOpenRouterEnv { setenv("OPENROUTER_API_KEY", savedOpenRouterEnv, 1) } else { unsetenv("OPENROUTER_API_KEY") }
+            if let savedXaiEnv { setenv("XAI_API_KEY", savedXaiEnv, 1) } else { unsetenv("XAI_API_KEY") }
             Config.legacyPath = savedLegacyPath
             try? FileManager.default.removeItem(at: tempDir)
         }
@@ -1124,6 +1197,16 @@ private func runSelfTests() {
         unsetenv("OPENROUTER_API_KEY")
         precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or") // falls back once env clears
 
+        // L15: an empty (or whitespace-only) env var must not shadow a good
+        // Keychain key — `env["…"] ?? …` alone treats "" as present.
+        setenv("OPENROUTER_API_KEY", "", 1)
+        precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or",
+                     "an empty env var must not win tier 1 over a valid Keychain key")
+        setenv("OPENROUTER_API_KEY", "   ", 1)
+        precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or",
+                     "a whitespace-only env var must be treated as absent")
+        unsetenv("OPENROUTER_API_KEY")
+
         // Keychain alone (no legacy file at all — the common case on this
         // machine per the plan: "no file" must not be an error).
         try? FileManager.default.removeItem(at: tempConfigPath)
@@ -1149,6 +1232,29 @@ private func runSelfTests() {
         try? APIKeySave.apply("   \n ", account: "k", store: store)
         precondition(store.get("k") == nil)
         precondition(APIKeySave.normalize("\tsk-or-v1-abc \n") == "sk-or-v1-abc")
+    }
+
+    // L9: LegacyImport must surface a store failure per-key instead of
+    // swallowing it (the original `if (try? …) != nil` bug — indistinguishable
+    // from "0 keys found to import").
+    do {
+        let store = FakeKeyStore()
+        let clean = LegacyImport.run(legacy: (openRouterKey: "or-1", xaiKey: "xai-1"), store: store)
+        precondition(clean.importedCount == 2 && clean.errors.isEmpty)
+        precondition(store.get(KeyAccount.openRouter) == "or-1")
+        precondition(store.get(KeyAccount.xai) == "xai-1")
+
+        // Already-present Keychain values are left untouched, not re-imported.
+        let noop = LegacyImport.run(legacy: (openRouterKey: "or-2", xaiKey: "xai-2"), store: store)
+        precondition(noop.importedCount == 0 && noop.errors.isEmpty)
+        precondition(store.get(KeyAccount.openRouter) == "or-1", "an existing Keychain value must win, never be overwritten by import")
+
+        let failingStore = FailingKeyStore()
+        let failed = LegacyImport.run(legacy: (openRouterKey: "or-3", xaiKey: "xai-3"), store: failingStore)
+        precondition(failed.importedCount == 0, "a store failure must not be counted as a successful import")
+        precondition(failed.errors.count == 2, "both key failures must be reported, not just the first")
+        precondition(failed.errors.contains { $0.contains("OpenRouter") })
+        precondition(failed.errors.contains { $0.contains("Grok") })
     }
 
     // KeychainStore must degrade, never crash, on a lookup miss — this is

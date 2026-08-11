@@ -16,6 +16,7 @@ final class SettingsWindowController: NSObject {
     private var grokRow: APIKeyRow!
     private var migrationBanner: NSStackView?
     private var justImportedCount: Int?
+    private var importError: String?
 
     private override init() { super.init() }
 
@@ -24,6 +25,10 @@ final class SettingsWindowController: NSObject {
     /// currently has focus — makeKeyAndOrderFront alone isn't enough.
     func show() {
         if window == nil { window = makeWindow() }
+        // L10: "Imported N keys" is a one-time notice about the Import click
+        // that just happened — without this it survived close/reopen and
+        // read as permanently true on every future visit to Settings.
+        justImportedCount = nil
         // Not app-launch: refreshed here, every time the window opens, so
         // there is no surprise Keychain read/write at login via the
         // LaunchAgent, and the env-var/migration state (which can change
@@ -246,6 +251,7 @@ final class SettingsWindowController: NSObject {
     /// independently.
     private func keyRowSaved() {
         justImportedCount = nil
+        importError = nil
         refreshMigrationBanner()
     }
 
@@ -254,6 +260,18 @@ final class SettingsWindowController: NSObject {
         for view in banner.arrangedSubviews {
             banner.removeArrangedSubview(view)
             view.removeFromSuperview()
+        }
+
+        // L9: a failed import (e.g. a Keychain write error) is shown
+        // explicitly rather than silently looking identical to "0 keys to
+        // import".
+        if let importError {
+            let notice = NSTextField(wrappingLabelWithString: "Import failed — \(importError)")
+            notice.font = .systemFont(ofSize: 11)
+            notice.textColor = .systemRed
+            notice.preferredMaxLayoutWidth = 380
+            banner.addArrangedSubview(notice)
+            return
         }
 
         if let count = justImportedCount, count > 0 {
@@ -291,19 +309,13 @@ final class SettingsWindowController: NSObject {
     }
 
     @objc private func importLegacyKeys() {
-        let legacy = Config.legacyKeys()
-        var imported = 0
         // Import = SecItemAdd (via KeyStore.set), file left untouched. Only
         // where the Keychain item is still absent — if it appeared between
         // refreshAPIKeysUI() and this click, Keychain already wins and we
         // must not clobber a value the user may have just typed and saved.
-        if let value = legacy.openRouterKey, keyStore.get(KeyAccount.openRouter) == nil {
-            if (try? keyStore.set(KeyAccount.openRouter, value: value)) != nil { imported += 1 }
-        }
-        if let value = legacy.xaiKey, keyStore.get(KeyAccount.xai) == nil {
-            if (try? keyStore.set(KeyAccount.xai, value: value)) != nil { imported += 1 }
-        }
-        justImportedCount = imported
+        let result = LegacyImport.run(legacy: Config.legacyKeys(), store: keyStore)
+        justImportedCount = result.importedCount
+        importError = result.errors.isEmpty ? nil : result.errors.joined(separator: "; ")
         openRouterRow.refresh()
         grokRow.refresh()
         refreshMigrationBanner()
@@ -438,6 +450,13 @@ private final class APIKeyRow: NSObject, NSTextFieldDelegate {
     /// this row controls changing (Save, delete, or an Import elsewhere in
     /// the window).
     func refresh() {
+        // L16: a typed-but-unsaved secret must not survive close/reopen —
+        // the window is a shared instance that's never released
+        // (isReleasedWhenClosed = false), so without this the field kept
+        // whatever text was last typed, saved or not. Cleared unconditionally
+        // here, not just in the env-overridden branch below.
+        field.stringValue = ""
+
         let envValue = ProcessInfo.processInfo.environment[envVarName]
         let hasKeychainValue = keyStore.get(account) != nil
 
@@ -450,7 +469,6 @@ private final class APIKeyRow: NSObject, NSTextFieldDelegate {
         saveButton.isEnabled = false
 
         if envOverridden {
-            field.stringValue = ""
             field.placeholderString = "(set by environment variable)"
             statusLabel.stringValue = "\(envVarName) overrides this — see README"
         } else if hasKeychainValue {
