@@ -215,6 +215,16 @@ struct AgentSession: Sendable {
     var lastCompactionPreCtx: Int64?
     var lastCompactionPostCtx: Int64?   // nil = reclaim pending, never 0 or 100%
     var hasUsage: Bool
+    // Newest non-sidechain usage-record timestamp. Purely additive bookkeeping
+    // (populated in claudeFold alongside lastCompactionAt, same parsing) added
+    // for Phase 4b's "sort by most-recent transcript activity" requirement —
+    // this file's existing scan/metric logic is otherwise untouched.
+    var lastActivityAt: Date?
+    // False only via a heuristic PID<->transcript fallback. liveSessions()
+    // today matches exclusively through the deterministic registry file, so
+    // this is always true in practice until that fallback is implemented;
+    // the field exists so the renderer's "(?)" handling is ready for it.
+    var matched: Bool = true
 
     var contextPercent: Int? {
         guard let contextTokens, let contextWindow, contextWindow > 0 else { return nil }
@@ -250,6 +260,7 @@ actor TranscriptReader {
 
         var turnCosts: [Int64] = []        // deduped, non-sidechain, since last compaction boundary
         var contextTokens: Int64?          // newest non-sidechain per-turn quantity
+        var lastActivityAt: Date?          // newest usage-record timestamp, main or sidechain
         var lastModel: String?
         var resolvedModels: [String] = []  // resolvedModel corroboration votes, in order seen
 
@@ -387,6 +398,12 @@ enum SessionScanner {
         // chain feeds turn counts, both xFloor windows, and contextPercent.
         acc.rawInputTokens += quantity
         acc.rawOutputTokens += output
+
+        // Activity recency counts any usage record, sidechain included — a
+        // subagent turn still means the file was touched just now.
+        if let ts = obj.string("timestamp") {
+            acc.lastActivityAt = (Format.iso.date(from: ts) ?? ISO8601DateFormatter().date(from: ts)) ?? acc.lastActivityAt
+        }
 
         guard obj.bool("isSidechain") != true else { return }
 
@@ -569,7 +586,8 @@ enum SessionScanner {
                 lastCompactionAt: acc.lastCompactionAt,
                 lastCompactionPreCtx: acc.lastCompactionPreCtx,
                 lastCompactionPostCtx: acc.lastCompactionPostCtx,
-                hasUsage: acc.contextTokens != nil
+                hasUsage: acc.contextTokens != nil,
+                lastActivityAt: acc.lastActivityAt
             ))
         }
         return sessions.sorted { $0.label < $1.label }
@@ -608,8 +626,29 @@ enum SessionSelfTests {
         testLiveness()
         testSuspension()
         testSeverityAndNoUsage()
+        testLastActivityAt()
         testIncrementalRead()
         testLiveSessionsEndToEnd()
+    }
+
+    // MARK: lastActivityAt — Phase 4b's recency signal, threaded through the
+    // same per-record timestamp parsing lastCompactionAt already uses.
+
+    private static func testLastActivityAt() {
+        var acc = TranscriptReader.Acc()
+        precondition(acc.lastActivityAt == nil, "no records seen yet must read as no activity, not epoch zero")
+
+        SessionScanner.claudeFold(line: usageLine(id: "t1", timestamp: "2026-08-11T12:00:00.000Z"), into: &acc)
+        let first = acc.lastActivityAt
+        precondition(first != nil)
+
+        SessionScanner.claudeFold(line: usageLine(id: "t2", timestamp: "2026-08-11T13:00:00.000Z"), into: &acc)
+        precondition(acc.lastActivityAt! > first!, "a later record must advance the recency timestamp")
+
+        // A sidechain record still counts as activity — the subagent touched
+        // the file just now, even though it's excluded from turns/xFloor/ctx.
+        SessionScanner.claudeFold(line: usageLine(id: "t3", sidechain: true, timestamp: "2026-08-11T14:00:00.000Z"), into: &acc)
+        precondition(acc.lastActivityAt! > first!, "sidechain records must still move the recency signal")
     }
 
     // MARK: Fixture builders

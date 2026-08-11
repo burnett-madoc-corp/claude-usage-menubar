@@ -49,6 +49,31 @@ enum Format {
         let filled = max(0, min(width, Int((Double(percent) / 100.0 * Double(width)).rounded())))
         return String(repeating: "█", count: filled) + String(repeating: "░", count: width - filled)
     }
+
+    /// Compact token-count formatter for session rows/tooltips ("1.2M",
+    /// "45k") — raw counts here run into the tens of millions and would blow
+    /// the row width budget.
+    static func tokens(_ count: Int64) -> String {
+        let value = Double(count)
+        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+        if value >= 1_000 { return String(format: "%.0fk", value / 1_000) }
+        return String(count)
+    }
+}
+
+/// Maps the Sessions worse-of-two severity onto the same colour family the
+/// rest of the app already uses (Format.color), so a session row and a
+/// provider row agree on what "orange" means.
+extension SessionScanner.Severity {
+    var color: NSColor {
+        switch self {
+        case .green: return .systemGreen
+        case .dimGreen: return NSColor.systemGreen.withAlphaComponent(0.65)
+        case .yellow: return .systemYellow
+        case .orange: return .systemOrange
+        case .red: return .systemRed
+        }
+    }
 }
 
 // MARK: - Claude
@@ -168,6 +193,12 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private var prefsRefreshDebounce: Timer?
     private var cards: [Card] = []
     private var lastUpdated: Date?
+    private var sessions: [AgentSession] = []
+    // Only ticks while the menu is actually open — session files change on
+    // the order of seconds, much faster than the provider poll interval, so
+    // the dropdown re-scans them while visible rather than waiting for the
+    // next full refresh(). Stopped in menuDidClose so it costs nothing idle.
+    private var sessionsTick: Timer?
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
     private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
@@ -178,10 +209,22 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         menu.delegate = self
         renderTitle()
         refresh()
+        refreshSessions()
         scheduleTimer()
 
         Prefs.onChange = { [weak self] in
             Task { @MainActor in self?.handlePrefsChanged() }
+        }
+    }
+
+    /// Local/cheap by design (no network I/O) — see Sessions.swift. Called on
+    /// launch, on every provider refresh, and on the menuWillOpen/2s-tick
+    /// cycle below so the dropdown reflects appended transcript bytes while
+    /// it's actually visible.
+    private func refreshSessions() {
+        Task { @MainActor in
+            self.sessions = await Sessions.snapshot()
+            self.rebuildMenu()
         }
     }
 
@@ -229,6 +272,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             renderTitle()
             rebuildMenu()
         }
+        refreshSessions()
     }
 
     /// A failed poll (a 429, a dropped network) should not blank a provider
@@ -371,6 +415,8 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
+        addSessionsSection()
+
         if let updated = lastUpdated {
             addLine("Updated \(Self.clock.string(from: updated))", color: .tertiaryLabelColor, size: 10)
         }
@@ -387,6 +433,162 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     @objc func openSettings() {
         SettingsWindowController.shared.show()
+    }
+
+    // MARK: Sessions section (Compact — Phase 4b)
+    //
+    // Renders through the same NSMenuItem.attributedTitle mechanism addRow
+    // uses (no custom NSMenuItem.view — that's Phase 4c), so it inherits
+    // highlight, sizing, dark-mode, and accessibility rendering for free.
+    // Hidden entirely (header included) when there are no live sessions or
+    // Prefs.showSessions() is off.
+
+    private func addSessionsSection() {
+        guard Prefs.showSessions(), !sessions.isEmpty else { return }
+        addSectionHeader("Sessions")
+        let visible = Self.visibleSessions(sessions)
+        for session in visible.rows { addSessionRow(session) }
+        if visible.overflow > 0 {
+            addLine("  +\(visible.overflow) more", color: .tertiaryLabelColor, size: 10)
+        }
+        menu.addItem(.separator())
+    }
+
+    /// Sort by most-recent transcript activity, cap at 8 rows, report the
+    /// rest as a count for a single "+N more" line — NSMenu has no internal
+    /// scrolling worth fighting. Pure and nonisolated so it's fixture-testable.
+    nonisolated static func visibleSessions(_ sessions: [AgentSession], cap: Int = 8) -> (rows: [AgentSession], overflow: Int) {
+        let sorted = sessions.sorted { ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast) }
+        guard sorted.count > cap else { return (sorted, 0) }
+        return (Array(sorted.prefix(cap)), sorted.count - cap)
+    }
+
+    /// Labels truncate around 14 chars with an ellipsis so the bar column
+    /// stays aligned. `padding(toLength:)` alone would silently truncate a
+    /// too-long string with no ellipsis (the hazard already noted at the
+    /// --once printer below) — this always applies the ellipsis itself
+    /// first, then only ever pads a string that's already short enough.
+    nonisolated static func truncateLabel(_ label: String, maxLength: Int) -> String {
+        guard label.count > maxLength else {
+            return label.padding(toLength: maxLength, withPad: " ", startingAt: 0)
+        }
+        let cut = String(label.prefix(maxLength - 1))
+        return cut + "…"
+    }
+
+    nonisolated static let sessionLabelWidth = 14
+
+    /// Heuristically-matched sessions (not yet possible in Phase 4a's
+    /// registry-only matching, but the field exists for when they are) get a
+    /// "(?)" suffix rather than folding into the fixed-width column.
+    nonisolated static func sessionLabel(for session: AgentSession) -> String {
+        let truncated = truncateLabel(session.label, maxLength: sessionLabelWidth)
+        return session.matched ? truncated : truncated + "(?)"
+    }
+
+    /// The context bar/percent, or one of the three non-bar states the plan
+    /// calls out by name: no usage yet, unknown window, or (unreachable
+    /// today, since Claude sessions never leave contextTokens nil once
+    /// hasUsage is true — kept for Codex, Phase 5, whose "pending" state is
+    /// exactly this) a token count is known but a window truly isn't there
+    /// either. A 0% bar never stands in for any of these — that would read
+    /// as an empty context, the opposite of the truth.
+    nonisolated static func sessionGauge(for session: AgentSession) -> String {
+        if !session.hasUsage { return "starting — no usage yet" }
+        if let percent = session.contextPercent {
+            return "\(Format.bar(percent)) \(String(percent).leftPadded(to: 3))%"
+        }
+        if let tokens = session.contextTokens {
+            return "\(Format.tokens(tokens)) ctx  window unknown"
+        }
+        return "context —"
+    }
+
+    /// `nil` under 5 deduped turns since the last compaction boundary reads
+    /// as "—", never a fabricated 1.0x (Sessions.swift's contract).
+    nonisolated static func sessionMultiple(for session: AgentSession) -> String {
+        session.xFloorMultiple.map { String(format: "%.1fx", $0) } ?? "—"
+    }
+
+    /// "⌁0" must never render — absence of compactions is the display.
+    nonisolated static func sessionCompactHint(for session: AgentSession) -> String {
+        session.compactionCount > 0 ? " ⌁\(session.compactionCount)" : ""
+    }
+
+    /// Pure line composition, mirroring how `headlineText` is structured —
+    /// fixture-testable with zero UI involvement. The coloured menu row
+    /// below renders the same sub-strings with severity colour applied;
+    /// this is the plain-text form used by self-tests, the --once printer,
+    /// and as the basis for the row's accessibility text.
+    nonisolated static func compactLine(for session: AgentSession) -> String {
+        let dot = session.busy ? "●" : "○"
+        let label = sessionLabel(for: session)
+        let gauge = sessionGauge(for: session)
+        let multiple = sessionMultiple(for: session)
+        let turns = session.hasUsage ? "  \(session.turns)t" : ""
+        let hint = sessionCompactHint(for: session)
+        return "\(dot) \(label)  \(gauge)  \(multiple)\(turns)\(hint)"
+    }
+
+    /// Detail that doesn't fit on the line — cwd, last-compaction reclaim,
+    /// subagent burn — rides the item's native tooltip. Compact deliberately
+    /// has no click-to-expand: an attributedTitle item click natively
+    /// dismisses the menu, and Compact embraces that rather than fighting it.
+    nonisolated static func sessionTooltip(for session: AgentSession) -> String {
+        var lines: [String] = [session.cwd]
+        if let model = session.model { lines.append("model: \(model)") }
+        if session.hasUsage {
+            lines.append("in \(Format.tokens(session.inputTokens))  out \(Format.tokens(session.outputTokens))")
+        }
+        if session.compactionCount > 0 {
+            let when = session.lastCompactionAt.map(Format.ago) ?? "—"
+            let pre = session.lastCompactionPreCtx.map { Format.tokens($0) } ?? "—"
+            let post = session.lastCompactionPostCtx.map { Format.tokens($0) } ?? "pending"
+            lines.append("last compaction \(when): \(pre) → \(post)")
+        }
+        if let subagent = session.subagentTokens {
+            lines.append("subagents: \(Format.tokens(subagent)) tokens")
+        }
+        if !session.matched {
+            lines.append("(?) matched heuristically — the PID↔transcript link is a best guess, not exact")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func addSessionRow(_ session: AgentSession) {
+        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let line = NSMutableAttributedString()
+        let severityColor = session.severity.color
+
+        func append(_ text: String, _ color: NSColor) {
+            line.append(NSAttributedString(string: text, attributes: [.font: mono, .foregroundColor: color]))
+        }
+
+        append("  \(session.busy ? "●" : "○") ", .labelColor)
+        append(Self.sessionLabel(for: session) + "  ", .labelColor)
+
+        if !session.hasUsage {
+            append(Self.sessionGauge(for: session), .secondaryLabelColor)
+        } else if session.contextPercent != nil {
+            // Bar + percent are the same coloured metric — worse-of-two
+            // severity, not the provider rows' 80/95-only mapping.
+            append(Self.sessionGauge(for: session), severityColor)
+        } else {
+            append(Self.sessionGauge(for: session), .secondaryLabelColor)
+        }
+
+        append("  " + Self.sessionMultiple(for: session), severityColor)
+        if session.hasUsage {
+            append("  \(session.turns)t", .secondaryLabelColor)
+        }
+        if session.compactionCount > 0 {
+            append(" ⌁\(session.compactionCount)", .secondaryLabelColor)
+        }
+
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.attributedTitle = line
+        item.toolTip = Self.sessionTooltip(for: session)
+        menu.addItem(item)
     }
 
     private func addRow(_ row: Row, labelWidth: Int) {
@@ -437,6 +639,24 @@ extension UsageMenuBar: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu()
         if let updated = lastUpdated, Date().timeIntervalSince(updated) > refreshInterval / 2 { refresh() }
+        refreshSessions()
+
+        // Session transcript files change on the order of seconds while a
+        // session is active — much faster than the provider poll interval —
+        // so re-scan every 2s for as long as the menu stays open. .common
+        // mode is required so this keeps firing during the menu's modal
+        // event-tracking loop, same reasoning as the main refresh timer.
+        sessionsTick?.invalidate()
+        let tick = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshSessions() }
+        }
+        RunLoop.main.add(tick, forMode: .common)
+        sessionsTick = tick
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        sessionsTick?.invalidate()
+        sessionsTick = nil
     }
 }
 
@@ -492,6 +712,110 @@ private final class FakeKeyStore: KeyStore, @unchecked Sendable {
     func get(_ account: String) -> String? { storage[account] }
     func set(_ account: String, value: String) throws { storage[account] = value }
     func delete(_ account: String) throws { storage.removeValue(forKey: account) }
+}
+
+// MARK: - Compact session-row self-tests
+//
+// Fixture-only — no live process, no file I/O — covering `compactLine`'s
+// composition (mirroring the `headlineText` fixture-testing pattern) plus
+// the sort/cap rule that feeds it. `AgentSession` fixtures below fill in
+// every field explicitly via keyword args so a future field addition can't
+// silently leave a test using a stale default.
+
+private func makeSession(
+    label: String = "session",
+    busy: Bool = false,
+    turns: Int = 12,
+    contextTokens: Int64? = 100_000,
+    contextWindow: Int64? = 200_000,
+    xFloorMultiple: Double? = 2.0,
+    compactionCount: Int = 0,
+    hasUsage: Bool = true,
+    matched: Bool = true,
+    lastActivityAt: Date? = nil
+) -> AgentSession {
+    AgentSession(
+        kind: .claude, pid: 1, label: label, cwd: "/Users/alex/\(label)", model: "claude-opus-5",
+        busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, subagentTokens: nil,
+        contextTokens: contextTokens, contextWindow: contextWindow, xFloorMultiple: xFloorMultiple,
+        compactionCount: compactionCount, lastCompactionAt: nil, lastCompactionPreCtx: nil,
+        lastCompactionPostCtx: nil, hasUsage: hasUsage, lastActivityAt: lastActivityAt, matched: matched
+    )
+}
+
+private func testCompactSessionRendering() {
+    // Format.tokens — the compact formatter session rows/tooltips rely on.
+    precondition(Format.tokens(1_200_000) == "1.2M")
+    precondition(Format.tokens(45_000) == "45k")
+    precondition(Format.tokens(999) == "999")
+
+    // Busy vs idle glyph.
+    precondition(UsageMenuBar.compactLine(for: makeSession(busy: true)).hasPrefix("●"))
+    precondition(UsageMenuBar.compactLine(for: makeSession(busy: false)).hasPrefix("○"))
+
+    // ⌁N present vs absent — "⌁0" must never render; absence is the display.
+    precondition(!UsageMenuBar.compactLine(for: makeSession(compactionCount: 0)).contains("⌁"))
+    precondition(UsageMenuBar.compactLine(for: makeSession(compactionCount: 3)).contains("⌁3"))
+
+    // Nil xFloor → "—", never a fabricated 1.0x.
+    precondition(UsageMenuBar.sessionMultiple(for: makeSession(xFloorMultiple: nil)) == "—")
+    precondition(UsageMenuBar.sessionMultiple(for: makeSession(xFloorMultiple: 3.2)) == "3.2x")
+
+    // Unknown context window → tokens shown, no bar, "window unknown". A 0%
+    // bar must never stand in for unknown.
+    let unknownWindow = makeSession(contextTokens: 488_000, contextWindow: nil)
+    let unknownGauge = UsageMenuBar.sessionGauge(for: unknownWindow)
+    precondition(unknownGauge.contains("window unknown"))
+    precondition(!unknownGauge.contains("█") && !unknownGauge.contains("░"),
+                 "no bar beats a fabricated denominator")
+    precondition(unknownGauge.contains("488k") || unknownGauge.contains("0.5M"),
+                 "the known token count must still be shown even with no window")
+
+    // No usage yet → label + "starting — no usage yet", no bar, no turns.
+    let noUsage = makeSession(turns: 0, contextTokens: nil, contextWindow: nil, hasUsage: false)
+    precondition(UsageMenuBar.sessionGauge(for: noUsage) == "starting — no usage yet")
+    let noUsageLine = UsageMenuBar.compactLine(for: noUsage)
+    precondition(!noUsageLine.contains("█") && !noUsageLine.contains("░"))
+    precondition(!noUsageLine.contains("0t"), "turns must not render for a session with no usage yet")
+
+    // Heuristically-matched (?) suffix.
+    precondition(UsageMenuBar.sessionLabel(for: makeSession(label: "short", matched: false)).hasSuffix("(?)"))
+    precondition(!UsageMenuBar.sessionLabel(for: makeSession(label: "short", matched: true)).contains("?"))
+    precondition(UsageMenuBar.sessionTooltip(for: makeSession(matched: false)).contains("heuristically"))
+
+    // Long-label truncation around 14 chars with an ellipsis, and short
+    // labels pad out to the same width so the bar column stays aligned.
+    let longLabel = UsageMenuBar.sessionLabel(for: makeSession(label: "a-very-long-project-directory-name"))
+    precondition(longLabel.count == UsageMenuBar.sessionLabelWidth)
+    precondition(longLabel.hasSuffix("…"))
+    let shortLabel = UsageMenuBar.sessionLabel(for: makeSession(label: "abc"))
+    precondition(shortLabel.count == UsageMenuBar.sessionLabelWidth)
+
+    // A known context window renders the bar via the worse-of-two severity
+    // colour, not the provider rows' plain percent mapping — exercised via
+    // Sessions.swift's own severity(), already self-tested there; here we
+    // only check the gauge text carries the bar and percent.
+    let normal = makeSession(contextTokens: 84_000, contextWindow: 200_000)
+    precondition(UsageMenuBar.sessionGauge(for: normal).contains("42%"))
+
+    // Sorting: most-recent transcript activity first, cap at 8, "+N more".
+    let now = Date()
+    let many = (0..<10).map { i in makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i))) }
+    let capped = UsageMenuBar.visibleSessions(many)
+    precondition(capped.rows.count == 8)
+    precondition(capped.overflow == 2)
+    precondition(capped.rows.first?.label == "s0", "most-recent activity must sort first")
+    precondition(capped.rows.last?.label == "s7")
+
+    let few = UsageMenuBar.visibleSessions(Array(many.prefix(5)))
+    precondition(few.rows.count == 5 && few.overflow == 0)
+
+    // A session with no activity timestamp at all must sort last, not crash
+    // the comparator and not be dropped.
+    let mixed = [makeSession(label: "known", lastActivityAt: now),
+                 makeSession(label: "unknown", lastActivityAt: nil)]
+    let mixedSorted = UsageMenuBar.visibleSessions(mixed)
+    precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
 }
 
 // MARK: - Entry point
@@ -592,6 +916,39 @@ private func runSelfTests() {
     precondition(Prefs.refreshInterval() == 60)
     testDefaults.set(5000.0, forKey: "refreshInterval")
     precondition(Prefs.refreshInterval() == 900)
+
+    // Sessions prefs (Phase 4b). Unset showSessions reads true, matching the
+    // provider-visibility flags' "never configured means show everything".
+    precondition(Prefs.showSessions() == true)
+    Prefs.setShowSessions(false)
+    precondition(Prefs.showSessions() == false)
+    Prefs.setShowSessions(true)
+    precondition(Prefs.showSessions() == true)
+
+    // The stored default is Detailed *deliberately* — see Prefs.swift — so
+    // an install that never touches Settings gets the rich rows the moment
+    // Phase 4c ships a renderer for them.
+    precondition(Prefs.sessionRowStyle() == .detailed)
+    Prefs.setSessionRowStyle(.compact)
+    precondition(Prefs.sessionRowStyle() == .compact)
+    Prefs.setSessionRowStyle(.detailed)
+    precondition(Prefs.sessionRowStyle() == .detailed)
+
+    // An unrecognized stored raw value (a stray value from a future build,
+    // or hand-edited defaults) must not crash — falls back to the default
+    // rather than blowing up SessionRowStyle(rawValue:).
+    testDefaults.set("garbage-value", forKey: "sessions.rowStyle")
+    precondition(Prefs.sessionRowStyle() == .detailed)
+    Prefs.setSessionRowStyle(.detailed) // restore a clean value for anything reading after this point
+
+    // Phase 4b has no Detailed renderer yet, so every stored value —
+    // including the deliberate Detailed default — must still render as
+    // Compact rather than draw nothing. Phase 4c flips this by changing
+    // Prefs.rendersCompact's body, not by adding a second fallback path
+    // somewhere else.
+    precondition(Prefs.rendersCompact(.compact))
+    precondition(Prefs.rendersCompact(.detailed),
+                 "non-Compact must fall back to Compact rendering until Phase 4c ships a Detailed renderer")
 
     precondition(Format.color(for: "normal", percent: 79).isEqual(NSColor.systemGreen))
     precondition(Format.color(for: "normal", percent: 80).isEqual(NSColor.systemOrange))
@@ -711,6 +1068,7 @@ private func runSelfTests() {
     } == true)
 
     SessionSelfTests.run()
+    testCompactSessionRendering()
 
     print("Self-tests passed")
 }
@@ -746,28 +1104,18 @@ if CommandLine.arguments.contains("--once") {
         if sessions.isEmpty {
             print("  no live Claude sessions")
         } else {
-            let labelWidth = max(sessions.map(\.label.count).max() ?? 8, 8)
-            for s in sessions {
-                let name = s.label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
-                let dot = s.busy ? "●" : "○"
-                let gauge = s.contextPercent.map { "\(Format.bar($0)) \(String($0).leftPadded(to: 3))%" } ?? "context —"
-                let multiple = s.xFloorMultiple.map { String(format: "%.1fx", $0) } ?? "—"
-                let compactHint = s.compactionCount > 0 ? " ⌁\(s.compactionCount)" : ""
-                print("  \(dot) \(name) \(gauge)  \(multiple)  \(s.turns)t\(compactHint)  pid \(s.pid)")
-                if let model = s.model {
-                    print("      \(model)  in \(s.inputTokens)  out \(s.outputTokens)  cwd \(s.cwd)")
-                } else if !s.hasUsage {
-                    print("      starting — no usage yet  cwd \(s.cwd)")
+            // Reuses the same pure sort/cap/line-composition the Compact
+            // dropdown row uses, so this diagnostic output and the live menu
+            // can never silently disagree.
+            let visible = UsageMenuBar.visibleSessions(sessions)
+            for s in visible.rows {
+                print("  \(UsageMenuBar.compactLine(for: s))  pid \(s.pid)")
+                for detail in UsageMenuBar.sessionTooltip(for: s).split(separator: "\n") {
+                    print("      \(detail)")
                 }
-                if let subagent = s.subagentTokens {
-                    print("      subagents \(subagent) tokens")
-                }
-                if s.compactionCount > 0 {
-                    let pre = s.lastCompactionPreCtx.map(String.init) ?? "—"
-                    let post = s.lastCompactionPostCtx.map(String.init) ?? "pending"
-                    let when = s.lastCompactionAt.map(Format.ago) ?? "—"
-                    print("      last compaction \(when): \(pre) → \(post)")
-                }
+            }
+            if visible.overflow > 0 {
+                print("  +\(visible.overflow) more")
             }
         }
         semaphore.signal()
