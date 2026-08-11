@@ -199,6 +199,12 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     // the dropdown re-scans them while visible rather than waiting for the
     // next full refresh(). Stopped in menuDidClose so it costs nothing idle.
     private var sessionsTick: Timer?
+    // Identity + handles for the session rows currently in the menu, so an
+    // update while the menu is open can patch them in place (see
+    // applySessionUpdates) instead of rebuilding and killing the tooltip.
+    private var sessionRowItems: [NSMenuItem] = []
+    private var sessionRowKeys: [String] = []
+    private var sessionOverflow = 0
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
     private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
@@ -224,7 +230,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private func refreshSessions() {
         Task { @MainActor in
             self.sessions = await Sessions.snapshot()
-            self.rebuildMenu()
+            // While the menu is open, patch rows in place; a full rebuild
+            // would dismiss the tooltip the user is reading. Closed, a
+            // rebuild is free and keeps the code path simple.
+            if self.sessionsTick != nil { self.applySessionUpdates() } else { self.rebuildMenu() }
         }
     }
 
@@ -401,6 +410,9 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     private func rebuildMenu() {
         menu.removeAllItems()
+        sessionRowItems.removeAll()
+        sessionRowKeys.removeAll()
+        sessionOverflow = 0
 
         for card in cards {
             addSectionHeader(card.provider)
@@ -448,10 +460,34 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         addSectionHeader("Sessions")
         let visible = Self.visibleSessions(sessions)
         for session in visible.rows { addSessionRow(session) }
+        sessionOverflow = visible.overflow
         if visible.overflow > 0 {
             addLine("  +\(visible.overflow) more", color: .tertiaryLabelColor, size: 10)
         }
         menu.addItem(.separator())
+    }
+
+    /// Refreshing session rows while the menu is OPEN must not rebuild the
+    /// menu: `removeAllItems` destroys and recreates the item under the
+    /// cursor, which dismisses its tooltip — and in Compact mode the tooltip
+    /// carries cwd, reclaim and subagent burn, i.e. every detail the row
+    /// itself has no width for. It also drops the keyboard highlight.
+    ///
+    /// So when the visible sessions are structurally unchanged (same rows, in
+    /// the same order, same overflow count) only the text and tooltips are
+    /// swapped in place. Anything else — a session appearing, exiting, or
+    /// reordering — still needs a real rebuild.
+    private func applySessionUpdates() {
+        guard Prefs.showSessions(), !sessions.isEmpty else { rebuildMenu(); return }
+        let visible = Self.visibleSessions(sessions)
+        guard visible.rows.map(Self.sessionKey) == sessionRowKeys,
+              visible.overflow == sessionOverflow
+        else { rebuildMenu(); return }
+
+        for (item, session) in zip(sessionRowItems, visible.rows) {
+            item.attributedTitle = Self.sessionRowText(for: session)
+            item.toolTip = Self.sessionTooltip(for: session)
+        }
     }
 
     /// Sort by most-recent transcript activity, cap at 8 rows, report the
@@ -556,6 +592,21 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     }
 
     private func addSessionRow(_ session: AgentSession) {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.attributedTitle = Self.sessionRowText(for: session)
+        item.toolTip = Self.sessionTooltip(for: session)
+        menu.addItem(item)
+        sessionRowItems.append(item)
+        sessionRowKeys.append(Self.sessionKey(for: session))
+    }
+
+    /// Identity of a row, so an in-place update can tell "same sessions, new
+    /// numbers" from "the set of sessions changed and the menu must be rebuilt".
+    nonisolated static func sessionKey(for session: AgentSession) -> String {
+        "\(session.kind.rawValue):\(session.pid)"
+    }
+
+    nonisolated static func sessionRowText(for session: AgentSession) -> NSAttributedString {
         let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let line = NSMutableAttributedString()
         let severityColor = session.severity.color
@@ -584,11 +635,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         if session.compactionCount > 0 {
             append(" ⌁\(session.compactionCount)", .secondaryLabelColor)
         }
-
-        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        item.attributedTitle = line
-        item.toolTip = Self.sessionTooltip(for: session)
-        menu.addItem(item)
+        return line
     }
 
     private func addRow(_ row: Row, labelWidth: Int) {
