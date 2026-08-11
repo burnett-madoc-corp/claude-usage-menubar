@@ -165,11 +165,12 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var timer: Timer?
+    private var prefsRefreshDebounce: Timer?
     private var cards: [Card] = []
     private var lastUpdated: Date?
-    // The Anthropic usage endpoint rate-limits aggressively; 2 minutes keeps
-    // well clear while still feeling live.
-    private let refreshInterval: TimeInterval = 120
+    // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
+    // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
+    private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -177,11 +178,48 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         menu.delegate = self
         renderTitle()
         refresh()
+        scheduleTimer()
 
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        Prefs.onChange = { [weak self] in
+            Task { @MainActor in self?.handlePrefsChanged() }
+        }
+    }
+
+    /// Invalidate + reschedule rather than mutating in place — Timer has no
+    /// mutable interval, and this keeps .common run-loop mode registration
+    /// (needed so the timer keeps firing while a menu's modal tracking loop
+    /// is open) in exactly one place.
+    private func scheduleTimer() {
+        timer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    /// Fires for any settings change (visibility or interval).
+    ///
+    /// The title is re-rendered synchronously because a title-visibility
+    /// toggle needs no new data — only a redraw from the headline values
+    /// already in hand.
+    ///
+    /// The poll itself is coalesced. A newly-shown provider does need a
+    /// refresh (it has no `previous` card for merge() to fall back on), but
+    /// firing one per checkbox would mean five polls of the Anthropic usage
+    /// endpoint while someone ticks their way down the list — and that
+    /// endpoint rate-limits aggressively enough that the app already surfaces
+    /// 429s. One poll, shortly after the user stops clicking, is what's
+    /// actually wanted.
+    private func handlePrefsChanged() {
+        scheduleTimer()
+        renderTitle()
+        prefsRefreshDebounce?.invalidate()
+        let debounce = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        RunLoop.main.add(debounce, forMode: .common)
+        prefsRefreshDebounce = debounce
     }
 
     @objc func refresh() {
@@ -208,13 +246,31 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Title — Claude and Codex stay visible; other providers live in the dropdown.
+    // MARK: Title — Claude and Codex are the only providers with a headline
+    // value; other providers live in the dropdown only.
 
-    nonisolated static func headlineText(claude: (session: Int, weekly: Int)?, codex: Int?) -> String {
-        let session = claude.map { "\($0.session)%" } ?? "—"
-        let weekly = claude.map { "\($0.weekly)%" } ?? "—"
-        let codexWeekly = codex.map { "\($0)%" } ?? "—"
-        return "Claude 5h \(session) wk \(weekly)   Codex wk \(codexWeekly)"
+    /// Plain-text title: the source of truth for the tooltip/accessibility
+    /// label, and the decision renderTitle() mirrors when building the
+    /// attributed (logo-bearing) version, so the two never drift apart.
+    ///
+    /// Both groups hidden must still produce a non-empty string — an empty
+    /// title makes the status item zero-width and unclickable, and with no
+    /// Dock icon (LSUIElement) that would make the app unreachable.
+    nonisolated static func headlineText(
+        claudeVisible: Bool, codexVisible: Bool,
+        claude: (session: Int, weekly: Int)?, codex: Int?
+    ) -> String {
+        var groups: [String] = []
+        if claudeVisible {
+            let session = claude.map { "\($0.session)%" } ?? "—"
+            let weekly = claude.map { "\($0.weekly)%" } ?? "—"
+            groups.append("Claude 5h \(session) wk \(weekly)")
+        }
+        if codexVisible {
+            let weekly = codex.map { "\($0)%" } ?? "—"
+            groups.append("Codex wk \(weekly)")
+        }
+        return groups.isEmpty ? "AI" : groups.joined(separator: "   ")
     }
 
     nonisolated static func logoImage(resource: String) -> NSImage? {
@@ -239,6 +295,8 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         let title = NSMutableAttributedString()
         let claude = ClaudeProvider.headline.value
         let codex = CodexProvider.headline.value
+        let claudeVisible = Prefs.showInTitle(.claude)
+        let codexVisible = Prefs.showInTitle(.codex)
 
         func append(_ text: String, _ color: NSColor) {
             title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
@@ -255,21 +313,33 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             title.append(NSAttributedString(attachment: attachment))
         }
 
-        appendLogo("claude-template", fallback: "Claude")
-        append(" 5h ", .secondaryLabelColor)
-        append(claude.map { "\($0.session)%" } ?? "—",
-               claude.map { Format.color(for: $0.severity, percent: $0.session) } ?? .secondaryLabelColor)
-        append("  wk ", .secondaryLabelColor)
-        append(claude.map { "\($0.weekly)%" } ?? "—",
-               claude.map { Format.color(for: $0.severity, percent: $0.weekly) } ?? .secondaryLabelColor)
-        append("   ", .secondaryLabelColor)
-        appendLogo("codex-template", fallback: "Codex")
-        append(" wk ", .secondaryLabelColor)
-        append(codex.map { "\($0.percent)%" } ?? "—",
-               codex.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
+        if claudeVisible {
+            appendLogo("claude-template", fallback: "Claude")
+            append(" 5h ", .secondaryLabelColor)
+            append(claude.map { "\($0.session)%" } ?? "—",
+                   claude.map { Format.color(for: $0.severity, percent: $0.session) } ?? .secondaryLabelColor)
+            append("  wk ", .secondaryLabelColor)
+            append(claude.map { "\($0.weekly)%" } ?? "—",
+                   claude.map { Format.color(for: $0.severity, percent: $0.weekly) } ?? .secondaryLabelColor)
+        }
+        if claudeVisible && codexVisible {
+            append("   ", .secondaryLabelColor)
+        }
+        if codexVisible {
+            appendLogo("codex-template", fallback: "Codex")
+            append(" wk ", .secondaryLabelColor)
+            append(codex.map { "\($0.percent)%" } ?? "—",
+                   codex.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
+        }
+        if !claudeVisible && !codexVisible {
+            // Both title providers hidden: fall back to a literal label so
+            // the status item is never zero-width (see headlineText's doc).
+            append("AI", .labelColor)
+        }
 
         button.attributedTitle = title
         let plainText = Self.headlineText(
+            claudeVisible: claudeVisible, codexVisible: codexVisible,
             claude: claude.map { ($0.session, $0.weekly) },
             codex: codex?.percent
         )
@@ -305,10 +375,18 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             addLine("Updated \(Self.clock.string(from: updated))", color: .tertiaryLabelColor, size: 10)
         }
 
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    @objc func openSettings() {
+        SettingsWindowController.shared.show()
     }
 
     private func addRow(_ row: Row, labelWidth: Int) {
@@ -365,21 +443,31 @@ extension UsageMenuBar: NSMenuDelegate {
 // MARK: - Provider registry
 
 enum Providers {
-    static func all() -> [Provider] {
+    /// `includeHidden` is the `--once` escape hatch: headless output is a
+    /// diagnostic, not a display, so it deliberately ignores Prefs
+    /// visibility and always reports all five providers. The live menu bar
+    /// (refresh(), applicationDidFinishLaunching) always calls the default,
+    /// filtered form — hidden providers are not polled at all.
+    static func all(includeHidden: Bool = false) -> [Provider] {
         let config = Config.load()
-        return [
+        let providers: [Provider] = [
             ClaudeProvider(),
             CodexProvider(),
             AntigravityProvider(),
             OpenRouterProvider(key: config.openRouterKey),
             XAIProvider(key: config.xaiKey),
         ]
+        if includeHidden { return providers }
+        return providers.filter { provider in
+            guard let id = ProviderID(displayName: provider.name) else { return true }
+            return Prefs.showInDropdown(id)
+        }
     }
 
     /// Fetch every provider concurrently but keep registry order in the menu,
     /// so rows don't jump around between refreshes.
-    static func loadAll() async -> [Card] {
-        let providers = all()
+    static func loadAll(includeHidden: Bool = false) async -> [Card] {
+        let providers = all(includeHidden: includeHidden)
         return await withTaskGroup(of: (Int, Card).self) { group in
             for (index, provider) in providers.enumerated() {
                 group.addTask { (index, await provider.load()) }
@@ -407,12 +495,88 @@ private func runSelfTests() {
     ]
     precondition(CodexProvider.extractWeeklyHeadline(from: criticalLimits)?.severity == "critical")
 
-    precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: 42)
+    // Title composition, all four visibility combinations (claudeVisible x
+    // codexVisible) — including the both-hidden fallback, which must be
+    // non-empty or the status item becomes a zero-width, unclickable dead
+    // end (no Dock icon to fall back on).
+    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: true, claude: (17, 85), codex: 42)
                  == "Claude 5h 17% wk 85%   Codex wk 42%")
-    precondition(UsageMenuBar.headlineText(claude: nil, codex: 42)
+    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: true, claude: nil, codex: 42)
                  == "Claude 5h — wk —   Codex wk 42%")
-    precondition(UsageMenuBar.headlineText(claude: (17, 85), codex: nil)
+    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: true, claude: (17, 85), codex: nil)
                  == "Claude 5h 17% wk 85%   Codex wk —")
+    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: false, claude: (17, 85), codex: 42)
+                 == "Claude 5h 17% wk 85%")
+    precondition(UsageMenuBar.headlineText(claudeVisible: false, codexVisible: true, claude: (17, 85), codex: 42)
+                 == "Codex wk 42%")
+    precondition(UsageMenuBar.headlineText(claudeVisible: false, codexVisible: false, claude: (17, 85), codex: 42)
+                 == "AI")
+    for claudeVisible in [true, false] {
+        for codexVisible in [true, false] {
+            precondition(!UsageMenuBar.headlineText(
+                claudeVisible: claudeVisible, codexVisible: codexVisible, claude: nil, codex: nil
+            ).isEmpty)
+        }
+    }
+
+    // Provider-filter mapping: ProviderID.displayName must round-trip
+    // through ProviderID(displayName:) for every case (this is the mapping
+    // Providers.all() relies on to filter by Prefs.showInDropdown), and an
+    // unrecognized name must not crash — it returns nil.
+    for id in ProviderID.allCases {
+        precondition(ProviderID(displayName: id.displayName) == id)
+    }
+    precondition(ProviderID(displayName: "Nonexistent") == nil)
+    precondition(ProviderID.claude.displayName == "Claude")
+    precondition(ProviderID.codex.displayName == "Codex")
+    precondition(ProviderID.antigravity.displayName == "Antigravity")
+    precondition(ProviderID.openrouter.displayName == "OpenRouter")
+    precondition(ProviderID.grok.displayName == "Grok (xAI)")
+    precondition(ProviderID.claude.supportsTitle && ProviderID.codex.supportsTitle)
+    precondition(!ProviderID.antigravity.supportsTitle
+                 && !ProviderID.openrouter.supportsTitle
+                 && !ProviderID.grok.supportsTitle)
+
+    // Prefs — run against an isolated UserDefaults suite, never
+    // UserDefaults.standard, so --self-test can't clobber the user's real
+    // preferences. Save/restore Prefs.defaults around the suite and wipe
+    // the suite's persistent domain both before (in case a previous crashed
+    // run left it dirty) and after.
+    let selfTestSuite = "local.claude-usage-menubar.self-test"
+    let testDefaults = UserDefaults(suiteName: selfTestSuite)!
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+    let savedDefaults = Prefs.defaults
+    Prefs.defaults = testDefaults
+    defer {
+        testDefaults.removePersistentDomain(forName: selfTestSuite)
+        Prefs.defaults = savedDefaults
+    }
+
+    // Unset reads true — "never configured" means "show everything".
+    for id in ProviderID.allCases {
+        precondition(Prefs.showInDropdown(id) == true)
+        precondition(Prefs.showInTitle(id) == true)
+    }
+    Prefs.setShowInDropdown(.grok, false)
+    precondition(Prefs.showInDropdown(.grok) == false)
+    precondition(Prefs.showInDropdown(.claude) == true) // untouched keys stay default-true
+    Prefs.setShowInTitle(.codex, false)
+    precondition(Prefs.showInTitle(.codex) == false)
+    precondition(Prefs.showInTitle(.claude) == true)
+
+    precondition(Prefs.refreshInterval() == 120) // default
+    Prefs.setRefreshInterval(5)
+    precondition(Prefs.refreshInterval() == 60) // clamped low on write
+    Prefs.setRefreshInterval(5000)
+    precondition(Prefs.refreshInterval() == 900) // clamped high on write
+
+    // Clamping must also apply to values read back from defaults, not just
+    // values Prefs itself wrote — a hand-edited plist must not produce a
+    // 5-second poll.
+    testDefaults.set(5.0, forKey: "refreshInterval")
+    precondition(Prefs.refreshInterval() == 60)
+    testDefaults.set(5000.0, forKey: "refreshInterval")
+    precondition(Prefs.refreshInterval() == 900)
 
     precondition(Format.color(for: "normal", percent: 79).isEqual(NSColor.systemGreen))
     precondition(Format.color(for: "normal", percent: 80).isEqual(NSColor.systemOrange))
@@ -442,7 +606,11 @@ if CommandLine.arguments.contains("--self-test") {
 if CommandLine.arguments.contains("--once") {
     let semaphore = DispatchSemaphore(value: 0)
     Task {
-        for card in await Providers.loadAll() {
+        // --once ignores visibility on purpose (Providers.all's doc
+        // comment): headless output is a diagnostic, not a display, so it
+        // always reports all five providers regardless of what's hidden
+        // from the live dropdown/title.
+        for card in await Providers.loadAll(includeHidden: true) {
             print(card.provider)
             if let error = card.error { print("  \(error)") }
             let width = card.rows.map(\.label.count).max() ?? 0
