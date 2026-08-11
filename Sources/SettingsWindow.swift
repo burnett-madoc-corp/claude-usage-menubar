@@ -58,13 +58,7 @@ final class SettingsWindowController: NSObject {
         root.addArrangedSubview(providersSection())
         root.addArrangedSubview(refreshSection())
         root.addArrangedSubview(apiKeysSection())
-
-        // --- Extension seam --------------------------------------------
-        // A later phase adds a "Sessions" section (Feature C) here — one
-        // more root.addArrangedSubview(_:) call with its own private
-        // builder method below, following the same section shape as the
-        // ones above. Nothing above this comment should need to change.
-        // -----------------------------------------------------------------
+        root.addArrangedSubview(sessionsSection())
 
         // Plain container, not a scroll view: the window is fixed-size and
         // the content is short enough to fit. A later phase adding sections
@@ -313,6 +307,61 @@ final class SettingsWindowController: NSObject {
         openRouterRow.refresh()
         grokRow.refresh()
         refreshMigrationBanner()
+    }
+
+    // MARK: Sessions section (Feature C, Phase 4b)
+    //
+    // Both row-style options ship visible now — Detailed disabled/greyed
+    // out — so the pref plumbing is exercised once here and Phase 4c only
+    // flips the enablement. The stored default is Detailed (Prefs.swift),
+    // so the popup opens with "Detailed" selected even though only
+    // "Compact" can actually be chosen from this menu today.
+
+    private func sessionsSection() -> NSView {
+        let header = NSTextField(labelWithString: "Sessions")
+        header.font = .boldSystemFont(ofSize: 13)
+
+        let showCheck = NSButton(checkboxWithTitle: "Show sessions", target: self, action: #selector(showSessionsToggled(_:)))
+        showCheck.state = Prefs.showSessions() ? .on : .off
+
+        let styleLabel = NSTextField(labelWithString: "Row style")
+        let stylePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        stylePopup.addItem(withTitle: "Compact")
+        stylePopup.addItem(withTitle: "Detailed")
+        stylePopup.item(at: 1)?.isEnabled = false
+        stylePopup.target = self
+        stylePopup.action = #selector(sessionRowStyleChanged(_:))
+        stylePopup.selectItem(at: Prefs.sessionRowStyle() == .detailed ? 1 : 0)
+
+        let styleRow = NSStackView(views: [styleLabel, stylePopup])
+        styleRow.orientation = .horizontal
+        styleRow.spacing = 8
+
+        let caption = NSTextField(wrappingLabelWithString:
+            "Detailed rows are richer two-line entries arriving in a later version — Compact is the only " +
+            "style available for now.")
+        caption.font = .systemFont(ofSize: 11)
+        caption.textColor = .secondaryLabelColor
+        caption.preferredMaxLayoutWidth = 320
+
+        let stack = NSStackView(views: [header, showCheck, styleRow, caption])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        return stack
+    }
+
+    @objc private func showSessionsToggled(_ sender: NSButton) {
+        Prefs.setShowSessions(sender.state == .on)
+    }
+
+    @objc private func sessionRowStyleChanged(_ sender: NSPopUpButton) {
+        // Detailed's item is disabled, so a click can only ever land on
+        // Compact (index 0) — this still reads the selection explicitly
+        // rather than hardcoding .compact, so the moment Phase 4c enables
+        // the Detailed item this keeps working with no change here.
+        let style: SessionRowStyle = sender.indexOfSelectedItem == 1 ? .detailed : .compact
+        Prefs.setSessionRowStyle(style)
     }
 }
 

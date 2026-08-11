@@ -31,6 +31,17 @@ enum ProviderID: String, CaseIterable {
     }
 }
 
+// MARK: - Sessions row style
+
+/// Two shipped values, per the plan's "both options ship visible now, the
+/// pref plumbing is exercised once" decision. Phase 4b only has a Compact
+/// renderer; Detailed is real data but no view yet, so the stored default is
+/// deliberately Detailed — see `Prefs.rendersCompact(_:)` for the renderer's
+/// fallback until Phase 4c lands.
+enum SessionRowStyle: String {
+    case compact, detailed
+}
+
 // MARK: - Preferences
 
 /// Non-secret prefs, namespaced over UserDefaults. `defaults` is swappable so
@@ -53,6 +64,38 @@ enum Prefs {
 
     static func showInTitle(_ id: ProviderID) -> Bool { flag("title.\(id.rawValue)") }
     static func setShowInTitle(_ id: ProviderID, _ value: Bool) { setFlag("title.\(id.rawValue)", value) }
+
+    // Unset reads true, matching the provider-visibility flags above: "never
+    // configured" means "show everything".
+    static func showSessions() -> Bool { flag("sessions.enabled") }
+    static func setShowSessions(_ value: Bool) { setFlag("sessions.enabled", value) }
+
+    /// The stored default is Detailed *deliberately* (per the plan): a user
+    /// who never opens Settings gets the rich rows automatically the moment
+    /// Phase 4c ships a Detailed renderer, with no migration step needed.
+    static func sessionRowStyle() -> SessionRowStyle {
+        guard let raw = defaults.string(forKey: "sessions.rowStyle"), let style = SessionRowStyle(rawValue: raw) else {
+            return .detailed
+        }
+        return style
+    }
+
+    static func setSessionRowStyle(_ value: SessionRowStyle) {
+        defaults.set(value.rawValue, forKey: "sessions.rowStyle")
+        onChange?()
+    }
+
+    /// Phase 4b ships only a Compact renderer. Until Phase 4c adds a Detailed
+    /// one, every stored value — including the deliberate Detailed default —
+    /// must render as Compact rather than draw nothing. This is the one
+    /// place that fallback lives, so 4c flips it by making this an identity
+    /// function instead of re-deriving the rule at each call site.
+    nonisolated static func rendersCompact(_ style: SessionRowStyle) -> Bool {
+        switch style {
+        case .compact: return true
+        case .detailed: return true // no Detailed renderer yet — falls back to Compact
+        }
+    }
 
     static func refreshInterval() -> TimeInterval {
         let stored = defaults.object(forKey: "refreshInterval") as? Double ?? defaultRefreshInterval
