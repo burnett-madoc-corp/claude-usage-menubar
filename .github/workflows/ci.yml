@@ -23,17 +23,10 @@ jobs:
     if: ${{ (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.draft == false }}
     name: merge-gate
     # This app links AppKit, so a real `swiftc` build only happens on macOS.
-    # Hosted macOS runners are free for public repositories but refused on this
-    # org's private ones (the Actions quota is exhausted -- a hosted job dies in
-    # ~3s with a billing error and no runner assigned), so the runner is chosen
-    # by visibility. While this repo is private the gate runs on skynet and
-    # verifies structure and the committed charts only; the moment it is made
-    # public the same job lands on macos-latest and additionally compiles and
-    # self-tests, with no variable to flip. Fork PRs never touch the self-hosted
-    # box. Do NOT close the gap with a `|| true` / `|| echo` pattern -- an
+    # Do NOT close the gap with a `|| true` / `|| echo` pattern -- an
     # earlier version of this job did exactly that and reported green without
     # checking anything.
-    runs-on: ${{ (github.event.repository.visibility == 'public' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'macos-latest' || fromJSON('["self-hosted","linux","x64","skynet"]') }}
+    runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,9 +42,7 @@ jobs:
         run: python3 tools/check_charts.py
 
       - name: Build
-        if: runner.os == 'macOS'
         run: ./build.sh
 
       - name: Self tests
-        if: runner.os == 'macOS'
         run: build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --self-test
