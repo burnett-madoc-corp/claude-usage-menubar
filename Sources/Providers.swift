@@ -12,11 +12,22 @@ struct Row {
 }
 
 /// A provider's section in the menu: a title plus its rows, or an error.
+///
+/// `badge` is the small pill drawn beside the provider name. It is set
+/// structurally at the point the condition is known — staleness in
+/// `UsageMenuBar.merge`, snapshot age in `CodexProvider.card` — rather than
+/// recovered later by pattern-matching `note`, which the renderer would
+/// otherwise have to parse back out of a human-readable sentence.
 struct Card {
     var provider: String
     var rows: [Row]
     var note: String?
     var error: String?
+    var badge: Badge?
+    /// Distinguishes "you have not set this provider up yet" from "the fetch
+    /// failed", which read identically as an error string but call for
+    /// completely different rows — a setup hint versus a diagnostic.
+    var missingKey: Bool = false
 }
 
 struct HeadlineValue {
@@ -210,12 +221,16 @@ struct CodexProvider: Provider {
 
         guard !rows.isEmpty else { return nil }
 
-        var note = (limits["plan_type"] as? String).map { "plan: \($0)" }
+        // Snapshot age and plan are two different things and now render in two
+        // different places — the age as the header badge, since "how old is
+        // this reading" qualifies every row in the block, and the plan as the
+        // block's own note. They used to be joined into one note string.
+        let note = (limits["plan_type"] as? String).map { "plan: \($0)" }
+        var badge: Badge?
         if let timestamp, let date = Format.iso.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) {
-            let age = Format.ago(date)
-            note = [note, "as of \(age)"].compactMap { $0 }.joined(separator: " · ")
+            badge = Badge(text: "as of \(Format.ago(date))", kind: .gray)
         }
-        return Card(provider: name, rows: rows, note: note)
+        return Card(provider: name, rows: rows, note: note, badge: badge)
     }
 
     /// 10080 minutes is the weekly window, 300 the 5-hour one.
@@ -264,7 +279,7 @@ struct OpenRouterProvider: Provider {
 
     func load() async -> Card {
         guard let key, !key.isEmpty else {
-            return Card(provider: name, rows: [], error: "no API key — see README")
+            return Card(provider: name, rows: [], error: "no API key — see README", missingKey: true)
         }
         do {
             let json = try await Net.getJSON(URL(string: "https://openrouter.ai/api/v1/credits")!, bearer: key)
@@ -318,7 +333,7 @@ struct XAIProvider: Provider {
 
     func load() async -> Card {
         guard let key, !key.isEmpty else {
-            return Card(provider: name, rows: [], error: "no API key — see README")
+            return Card(provider: name, rows: [], error: "no API key — see README", missingKey: true)
         }
         do {
             let json = try await Net.getJSON(URL(string: "https://api.x.ai/v1/api-key")!, bearer: key)

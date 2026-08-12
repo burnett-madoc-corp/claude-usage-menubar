@@ -218,7 +218,11 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private var detailedRowViews: [SessionRowView] = []
     private var expandedSessionKeys: Set<String> = []
     private var isMenuOpen = false
-    private var detailedRowWidth: CGFloat = 330
+    /// Every custom view in the panel is drawn to one fixed width. The old
+    /// "measure the widest attributedTitle row and clamp it" approach has no
+    /// input left now that the quota blocks are custom views too — and a fixed
+    /// width is what stops the panel breathing as labels change length.
+    private var detailedRowWidth: CGFloat { Panel.width }
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
     private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
@@ -308,7 +312,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
                   let old = byName[card.provider], !old.rows.isEmpty
             else { return card }
             var stale = old
-            stale.note = "stale — \(error)"
+            // The staleness marker moved from the block's note line to its
+            // header badge: it qualifies every row underneath it, so it
+            // belongs beside the provider name rather than below the numbers.
+            stale.badge = Badge(text: "stale — \(error)", kind: .amber)
             return stale
         }
     }
@@ -442,20 +449,19 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         // Providers.shouldPoll) — those must not also render in the
         // dropdown, so this filters on Dropdown visibility specifically
         // rather than assuming "polled" implies "shown here".
-        for card in cards where Self.shouldShowInDropdown(card) {
-            addSectionHeader(card.provider)
-            if let error = card.error {
-                addLine("  \(error)", color: .systemRed, size: 11)
-            }
-            let labelWidth = card.rows.map(\.label.count).max() ?? 8
-            for row in card.rows { addRow(row, labelWidth: labelWidth) }
-            if let note = card.note {
-                addLine("  \(note)", color: .tertiaryLabelColor, size: 10)
-            }
-            menu.addItem(.separator())
+        // Quota blocks are joined by inset hairlines — they are one section,
+        // not five — while the breaks before Sessions and before the footer
+        // are NSMenu's own full-width separators.
+        let visibleCards = cards.filter(Self.shouldShowInDropdown)
+        for (index, card) in visibleCards.enumerated() {
+            if index > 0 { addInsetDivider() }
+            addQuotaBlock(card)
         }
+        if !visibleCards.isEmpty { menu.addItem(.separator()) }
 
         addSessionsSection()
+
+        if !(menu.items.last?.isSeparatorItem ?? true) { menu.addItem(.separator()) }
 
         if let updated = lastUpdated {
             addLine("Updated \(Self.clock.string(from: updated))", color: .tertiaryLabelColor, size: 10)
@@ -492,30 +498,34 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         addSectionHeader("Sessions")
         let visible = Self.visibleSessions(sessions)
         let detailed = !Prefs.rendersCompact(Prefs.sessionRowStyle())
-        // Obligation 2 (explicit sizing): measured once here, from the
-        // provider rows already built above in this same rebuild — not
-        // recomputed per frame, and not recomputed again by
-        // applySessionUpdates()'s in-place patch path.
-        if detailed { detailedRowWidth = Self.computeDetailedRowWidth(from: menu) }
-        for session in visible.rows {
+        // Detailed reads as a table, so it is ordered by what the table is
+        // for — worst first. Compact keeps the recency order it was designed
+        // around. Both draw the same cap/overflow selection, so switching
+        // styles never changes *which* sessions you can see, only their order.
+        let rows = detailed ? Self.severityOrdered(visible.rows) : visible.rows
+        if detailed {
+            let header = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            header.view = SessionHeaderView(width: detailedRowWidth)
+            menu.addItem(header)
+        }
+        for session in rows {
             if detailed { addDetailedSessionRow(session) } else { addSessionRow(session) }
         }
         sessionOverflow = visible.overflow
         if visible.overflow > 0 {
             addLine("  +\(visible.overflow) more", color: .tertiaryLabelColor, size: 10)
         }
-        menu.addItem(.separator())
     }
 
-    /// NSMenu auto-measures attributed-title rows (the provider cards and
-    /// Compact session rows above this section) but has no notion of what
-    /// width a custom view "should" be — so Detailed rows are given an
-    /// explicit width derived from what's already on screen, clamped into
-    /// the plan's 300–360pt range, so the menu doesn't visibly jump wider
-    /// or narrower than the rows above it.
-    private static func computeDetailedRowWidth(from menu: NSMenu) -> CGFloat {
-        let maxProviderWidth = menu.items.compactMap { $0.attributedTitle?.size().width }.max() ?? 0
-        return min(360, max(300, maxProviderWidth + 20))
+    /// Worst-first, with most-recent activity breaking ties. The tiebreak is
+    /// not cosmetic: `sorted(by:)` is not guaranteed stable, so without a
+    /// total order two equally-severe rows could swap places on any tick,
+    /// and every swap costs a full menu rebuild (see applySessionUpdates).
+    nonisolated static func severityOrdered(_ rows: [AgentSession]) -> [AgentSession] {
+        rows.sorted {
+            if $0.severity != $1.severity { return $0.severity > $1.severity }
+            return ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast)
+        }
     }
 
     /// Refreshing session rows while the menu is OPEN must not rebuild the
@@ -531,12 +541,18 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private func applySessionUpdates() {
         guard Prefs.showSessions(), !sessions.isEmpty else { rebuildMenu(); return }
         let visible = Self.visibleSessions(sessions)
-        guard visible.rows.map(Self.sessionKey) == sessionRowKeys,
+        let compact = Prefs.rendersCompact(Prefs.sessionRowStyle())
+        // Must apply the SAME ordering the rows were built with, or the
+        // key comparison below reports a structural change on every tick
+        // (and, worse, a matching key list could pair a view with the wrong
+        // session's data).
+        let rows = compact ? visible.rows : Self.severityOrdered(visible.rows)
+        guard rows.map(Self.sessionKey) == sessionRowKeys,
               visible.overflow == sessionOverflow
         else { rebuildMenu(); return }
 
-        if Prefs.rendersCompact(Prefs.sessionRowStyle()) {
-            for (item, session) in zip(sessionRowItems, visible.rows) {
+        if compact {
+            for (item, session) in zip(sessionRowItems, rows) {
                 item.attributedTitle = Self.sessionRowText(for: session)
                 item.toolTip = Self.sessionTooltip(for: session)
             }
@@ -544,7 +560,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             // Patches the SAME SessionRowView instances in place — this is
             // what lets the pulsing dot and any expanded row survive a 2s
             // tick instead of being torn down and recreated.
-            for (view, session) in zip(detailedRowViews, visible.rows) {
+            for (view, session) in zip(detailedRowViews, rows) {
                 view.update(session: session, animate: isMenuOpen)
             }
         }
@@ -725,28 +741,21 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         return line
     }
 
-    private func addRow(_ row: Row, labelWidth: Int) {
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let line = NSMutableAttributedString()
-        let name = "  " + row.label.padding(toLength: max(labelWidth, row.label.count) + 1,
-                                            withPad: " ", startingAt: 0)
-        line.append(NSAttributedString(string: name, attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
-
-        if let percent = row.percent {
-            let color = Format.color(for: row.severity, percent: percent)
-            line.append(NSAttributedString(string: Format.bar(percent) + " ",
-                                          attributes: [.font: mono, .foregroundColor: color]))
-            line.append(NSAttributedString(string: String(percent).leftPadded(to: 3) + "%",
-                                          attributes: [.font: mono, .foregroundColor: color]))
-        }
-        if !row.detail.isEmpty {
-            let color: NSColor = row.severity == "critical" ? .systemRed : .secondaryLabelColor
-            line.append(NSAttributedString(string: (row.percent == nil ? "" : "   ") + row.detail,
-                                          attributes: [.font: mono, .foregroundColor: color]))
-        }
-
+    /// A provider's whole quota block — header, badge and window rows — as one
+    /// custom view. The four columns only line up if a single drawing pass
+    /// owns the block, which is why this replaced the per-row attributedTitle
+    /// items and their text `████░░` bars.
+    private func addQuotaBlock(_ card: Card) {
+        let view = QuotaBlockView(card: card, width: detailedRowWidth)
+        view.onOpenSettings = { [weak self] in self?.openSettings() }
         let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        item.attributedTitle = line
+        item.view = view
+        menu.addItem(item)
+    }
+
+    private func addInsetDivider() {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.view = InsetDividerView(width: detailedRowWidth)
         menu.addItem(item)
     }
 
@@ -983,6 +992,51 @@ private func testCompactSessionRendering() {
                  makeSession(label: "unknown", lastActivityAt: nil)]
     let mixedSorted = UsageMenuBar.visibleSessions(mixed)
     precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
+}
+
+// MARK: - Detailed-table ordering self-tests
+//
+// Detailed rows are ordered worst-first; Compact and the `--once` printer keep
+// the recency order `visibleSessions` produces. Both facts are asserted here
+// so the redesign can't quietly re-order the two surfaces it left alone.
+
+private func testSeverityOrdering() {
+    let now = Date()
+    // xFloor thresholds (Sessions.swift): <1.5 green, <4.0 yellow, >=7.0 red.
+    let calm = makeSession(label: "calm", contextTokens: 20_000, xFloorMultiple: 1.0,
+                           lastActivityAt: now)
+    let warm = makeSession(label: "warm", contextTokens: 20_000, xFloorMultiple: 3.0,
+                           lastActivityAt: now.addingTimeInterval(-60))
+    let hot = makeSession(label: "hot", contextTokens: 20_000, xFloorMultiple: 8.0,
+                          lastActivityAt: now.addingTimeInterval(-120))
+
+    precondition(calm.severity < warm.severity && warm.severity < hot.severity,
+                 "fixtures must actually span three severities for this test to mean anything")
+
+    let ordered = UsageMenuBar.severityOrdered([calm, warm, hot])
+    precondition(ordered.map(\.label) == ["hot", "warm", "calm"], "worst first")
+
+    // Equal severity falls back to most-recent activity, giving a total order
+    // — without it, an unstable sort could swap rows on any tick and force a
+    // full menu rebuild every time.
+    let older = makeSession(label: "older", contextTokens: 20_000, xFloorMultiple: 1.0,
+                            lastActivityAt: now.addingTimeInterval(-600))
+    let newer = makeSession(label: "newer", contextTokens: 20_000, xFloorMultiple: 1.0,
+                            lastActivityAt: now)
+    precondition(UsageMenuBar.severityOrdered([older, newer]).map(\.label) == ["newer", "older"])
+    precondition(UsageMenuBar.severityOrdered([newer, older]).map(\.label) == ["newer", "older"],
+                 "the tiebreak must not depend on input order")
+
+    // A session with no activity timestamp still sorts, and still isn't dropped.
+    let unknown = makeSession(label: "unknown", contextTokens: 20_000, xFloorMultiple: 1.0,
+                              lastActivityAt: nil)
+    precondition(UsageMenuBar.severityOrdered([unknown, newer]).map(\.label) == ["newer", "unknown"])
+
+    // Re-ordering is Detailed-only: the shared selection helper that Compact
+    // and --once use is untouched and still recency-ordered.
+    precondition(UsageMenuBar.visibleSessions([calm, warm, hot]).rows.map(\.label)
+                 == ["calm", "warm", "hot"],
+                 "visibleSessions must stay recency-ordered for Compact and --once")
 }
 
 // MARK: - Entry point
@@ -1306,6 +1360,9 @@ private func runSelfTests() {
     SessionSelfTests.run()
     testCompactSessionRendering()
     DetailedSessionRowSelfTests.run()
+    ThemeSelfTests.run()
+    QuotaBlockSelfTests.run()
+    testSeverityOrdering()
 
     print("Self-tests passed")
 }
@@ -1333,7 +1390,11 @@ if CommandLine.arguments.contains("--once") {
                 let gauge = row.percent.map { "\(Format.bar($0)) \(String($0).leftPadded(to: 3))%  " } ?? ""
                 print("  \(name) \(gauge)\(row.detail)")
             }
-            if let note = card.note { print("  (\(note))") }
+            // Note and badge used to be one joined `note` string; the panel
+            // now draws them in two different places, so this rejoins them to
+            // keep the headless diagnostic's output exactly as it was.
+            let annotations = [card.note, card.badge?.text].compactMap { $0 }
+            if !annotations.isEmpty { print("  (\(annotations.joined(separator: " · ")))") }
         }
 
         print("Sessions")
