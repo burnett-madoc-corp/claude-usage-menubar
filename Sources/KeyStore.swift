@@ -43,7 +43,79 @@ enum KeyStoreError: LocalizedError {
 /// and a CLI round-trip is the only option. For items this app itself
 /// creates, the SecItem* API is cleaner and, once the item's ACL grants this
 /// app access, prompt-free for the creating app.
+/// Bounded, cached front end to a KeyStore, for the polling path.
+///
+/// `Config.load` reads the Keychain inside `Providers.all`, before any
+/// provider starts. The app is ad-hoc signed, so every install is a new code
+/// identity and macOS wants to ask about it — and `SecItemCopyMatching`
+/// answers that question by blocking *inside the call* until somebody clicks
+/// the dialog. One unanswered dialog therefore stopped `loadAll` from ever
+/// returning, and the entire usage section disappeared, including the
+/// providers that never touch the Keychain.
+///
+/// Forbidding UI does not fix it: `kSecUseAuthenticationUIFail` governs
+/// authentication UI, not this legacy ACL trust prompt — verified by
+/// measurement, the call still blocked with the flag set. So the read moves
+/// off the critical path instead. It runs on its own thread; the caller waits
+/// a bounded time and otherwise carries on with the last known value. The
+/// dialog still appears, so the user can still grant access — it just no
+/// longer holds the menu hostage while it waits.
+final class BoundedKeyStore: KeyStore, @unchecked Sendable {
+    private let underlying: KeyStore
+    private let timeout: TimeInterval
+    private let lock = NSLock()
+    private var cache: [String: String] = [:]
+    /// Accounts whose read is still stuck behind a dialog. Without this, every
+    /// poll would start another blocked thread for the same key and leak one
+    /// per refresh for as long as the dialog went unanswered.
+    private var inFlight: Set<String> = []
+
+    init(_ underlying: KeyStore = KeychainStore(), timeout: TimeInterval = 3) {
+        self.underlying = underlying
+        self.timeout = timeout
+    }
+
+    func get(_ account: String) -> String? {
+        lock.lock()
+        let cached = cache[account]
+        let alreadyReading = inFlight.contains(account)
+        if !alreadyReading { inFlight.insert(account) }
+        lock.unlock()
+        if alreadyReading { return cached }
+
+        let finished = DispatchSemaphore(value: 0)
+        Thread.detachNewThread { [self] in
+            let value = underlying.get(account)
+            lock.lock()
+            if let value { cache[account] = value } else { cache[account] = nil }
+            inFlight.remove(account)
+            lock.unlock()
+            finished.signal()
+        }
+
+        guard finished.wait(timeout: .now() + timeout) == .success else { return cached }
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[account]
+    }
+
+    func set(_ account: String, value: String) throws {
+        try underlying.set(account, value: value)
+        lock.lock()
+        cache[account] = value
+        lock.unlock()
+    }
+
+    func delete(_ account: String) throws {
+        try underlying.delete(account)
+        lock.lock()
+        cache[account] = nil
+        lock.unlock()
+    }
+}
+
 struct KeychainStore: KeyStore {
+
     static let service = "local.claude-usage-menubar"
 
     func get(_ account: String) -> String? {

@@ -1100,6 +1100,48 @@ private func testCompactSessionRendering() {
 // and a blocked one never returns. So the bound itself is asserted, not just
 // the parsing around it.
 
+/// A store that never returns, standing in for a Keychain read parked behind
+/// an unanswered approval dialog.
+private final class BlockingKeyStore: KeyStore, @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    func get(_ account: String) -> String? {
+        entered.signal()
+        Thread.sleep(forTimeInterval: 30)
+        return "never"
+    }
+    func set(_ account: String, value: String) throws {}
+    func delete(_ account: String) throws {}
+}
+
+private func testBoundedKeyStore() {
+    let blocking = BlockingKeyStore()
+    let bounded = BoundedKeyStore(blocking, timeout: 0.2)
+
+    // The whole point: a read that never returns must not stall the caller.
+    let started = Date()
+    precondition(bounded.get(KeyAccount.openRouter) == nil, "a blocked read yields no key, not a hang")
+    let elapsed = Date().timeIntervalSince(started)
+    precondition(elapsed < 5, "the bounded read took \(elapsed)s — it is not bounded")
+
+    // The blocked thread is still in there; a second call must not start
+    // another one, or every poll leaks a thread while the dialog sits unanswered.
+    precondition(blocking.entered.wait(timeout: .now() + 2) == .success)
+    let secondStart = Date()
+    precondition(bounded.get(KeyAccount.openRouter) == nil)
+    precondition(Date().timeIntervalSince(secondStart) < 0.15,
+                 "a call made while a read is in flight must return at once from cache")
+
+    // A store that answers promptly still works, and its value is cached.
+    let fast = FakeKeyStore()
+    try? fast.set(KeyAccount.xai, value: "xai-abc")
+    let quick = BoundedKeyStore(fast, timeout: 5)
+    precondition(quick.get(KeyAccount.xai) == "xai-abc")
+    try? quick.set(KeyAccount.xai, value: "xai-def")
+    precondition(quick.get(KeyAccount.xai) == "xai-def", "set must not leave a stale cache entry")
+    try? quick.delete(KeyAccount.xai)
+    precondition(quick.get(KeyAccount.xai) == nil, "delete must not leave a stale cache entry")
+}
+
 private func testKeychainBounds() {
     // A command that never exits must come back as .blocked within the
     // timeout, not hang — this is the actual regression being prevented.
@@ -1538,6 +1580,7 @@ private func runSelfTests() {
     testEditMenu()
     PollPolicySelfTests.run()
     testKeychainBounds()
+    testBoundedKeyStore()
 
     print("Self-tests passed")
 }

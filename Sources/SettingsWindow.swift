@@ -11,6 +11,9 @@ final class SettingsWindowController: NSObject {
     private var intervalPopup: NSPopUpButton?
     private var intervalChoices: [(title: String, seconds: TimeInterval)] = []
 
+    /// Unbounded on purpose: the user opened this window to manage keys, so a
+    /// Keychain prompt is expected here and waiting for it is correct. Only
+    /// the background poll needs the bounded store.
     private let keyStore: KeyStore = KeychainStore()
     private var openRouterRow: APIKeyRow!
     private var grokRow: APIKeyRow!

@@ -69,7 +69,12 @@ struct Config: Sendable {
     static var legacyPath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/claude-usage/config.json")
 
-    static func load(store: KeyStore = KeychainStore()) -> Config {
+    /// One shared bounded store for the polling path, so its cache and its
+    /// in-flight guard persist across refreshes rather than being rebuilt
+    /// (and re-blocked) every two minutes.
+    static let pollingStore: KeyStore = BoundedKeyStore()
+
+    static func load(store: KeyStore = Config.pollingStore) -> Config {
         let legacy = legacyKeys()
         let env = ProcessInfo.processInfo.environment
 
