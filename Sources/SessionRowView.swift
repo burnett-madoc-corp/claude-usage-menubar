@@ -9,6 +9,12 @@ import AppKit
 // project names vary wildly in length.
 enum SessionGrid {
     static let dotColumn: CGFloat = 14
+    /// The model+window gets its own fixed column rather than trailing the
+    /// session name. Names vary from "codex-ui" to a 60-character task title,
+    /// so following them left every model at a different x — the one ragged
+    /// edge in an otherwise column-aligned panel. 124pt clears the widest pair
+    /// the app can produce ("gpt-5.2-codex (200k)", 110.8pt).
+    static let modelWidth: CGFloat = 124
     static let contextWidth: CGFloat = 76
     static let multipleWidth: CGFloat = 44
     static let turnsWidth: CGFloat = 34
@@ -26,22 +32,10 @@ enum SessionGrid {
     /// rather than a known one. `testContextFallbacksFit` pins this.
     static let fallbackFont = PanelFont.text(9)
 
-    /// Floor for the project label once the model+window has taken its share
-    /// of the name cell. At 470pt the cell is ~166pt and a long pair such as
-    /// "worktree-ee  gpt-5.2-codex (200k)" cannot fit whole — something must
-    /// truncate. The model wins: a clipped window suffix destroys the value
-    /// outright, whereas a clipped project name still identifies its row, and
-    /// the full label rides the row's tooltip and accessibility text anyway.
-    /// 54pt: the name cell is 166pt and the widest model+window the app can
-    /// produce ("  gpt-5.2-codex (200k)") measures 110.8pt, so this is the
-    /// largest floor that still lets that pair render whole. A longer model id
-    /// than today's degrades gracefully — it truncates itself rather than
-    /// eating further into the label. `testNameCellBudget` pins the arithmetic.
-    static let minLabelWidth: CGFloat = 54
-
     struct Columns {
         var dot: NSRect
         var name: NSRect
+        var model: NSRect
         var context: NSRect
         var multiple: NSRect
         var turns: NSRect
@@ -78,9 +72,11 @@ enum SessionGrid {
         let multipleX = turnsX - Panel.columnGap - multipleWidth
         let contextX = multipleX - Panel.columnGap - contextWidth
         let nameX = Panel.inset + dotColumn
+        let modelX = contextX - Panel.columnGap - modelWidth
         return Columns(
             dot: NSRect(x: Panel.inset, y: y, width: dotColumn, height: height),
-            name: NSRect(x: nameX, y: y, width: max(0, contextX - Panel.columnGap - nameX), height: height),
+            name: NSRect(x: nameX, y: y, width: max(0, modelX - Panel.columnGap - nameX), height: height),
+            model: NSRect(x: modelX, y: y, width: modelWidth, height: height),
             context: NSRect(x: contextX, y: y, width: contextWidth, height: height),
             multiple: NSRect(x: multipleX, y: y, width: multipleWidth, height: height),
             turns: NSRect(x: turnsX, y: y, width: turnsWidth, height: height),
@@ -103,12 +99,22 @@ enum SessionGrid {
 // below uses the `×` glyph and draws its context as a bar with no percentage
 // at all, so the two now compose their strings separately on purpose.
 enum DetailedSessionRow {
-    /// The session's own identity cell: project label, then the shortened
-    /// model. Kept as one string for the accessibility text and self-tests;
+    /// What the row calls this session: its task title when Claude Code has
+    /// named one, otherwise the directory it runs in. The fallback is a plain
+    /// substitution, drawn identically — a session without a title yet is not
+    /// a degraded row, just a new one.
+    nonisolated static func displayName(for session: AgentSession) -> String {
+        guard let title = session.taskTitle, !title.isEmpty else { return session.label }
+        return title
+    }
+
+    /// The whole identity cell: name, then the shortened model and its context
+    /// window. Kept as one string for the accessibility text and self-tests;
     /// the view draws the two halves in different fonts and colours.
     nonisolated static func nameAndModel(for session: AgentSession) -> String {
-        guard let model = session.model else { return session.label }
-        return "\(session.label)  \(Display.modelWithWindow(model, window: session.contextWindow))"
+        let name = displayName(for: session)
+        guard let model = session.model else { return name }
+        return "\(name)  \(Display.modelWithWindow(model, window: session.contextWindow))"
     }
 
     /// The ×start multiple, with the `×` glyph. `nil` still reads "—", never
@@ -170,7 +176,7 @@ enum DetailedSessionRow {
     /// only place that value is stated, and it is stated as what it is: the
     /// bar's value.
     nonisolated static func accessibilityLabel(for session: AgentSession) -> String {
-        var parts: [String] = [session.busy ? "busy" : "idle", session.label]
+        var parts: [String] = [session.busy ? "busy" : "idle", displayName(for: session)]
         if let model = session.model {
             parts.append(Display.modelWithWindow(model, window: session.contextWindow))
         }
@@ -191,7 +197,8 @@ enum DetailedSessionRow {
     /// The tiny uppercase column-header line above the table. Exposed as text
     /// so the header view and the accessibility label agree on the wording.
     nonisolated static let columnHeaders =
-        (name: "SESSION · MODEL", context: "CONTEXT", multiple: "×START", turns: "TURNS", inOut: "IN/OUT")
+        (name: "SESSION", model: "MODEL", context: "CONTEXT",
+         multiple: "×START", turns: "TURNS", inOut: "IN/OUT")
 }
 
 // MARK: - Column-header line
@@ -215,6 +222,7 @@ final class SessionHeaderView: NSView {
         let color = NSColor.tertiaryLabelColor
         let headers = DetailedSessionRow.columnHeaders
         Draw.text(headers.name, font: font, color: color, in: columns.name)
+        Draw.text(headers.model, font: font, color: color, in: columns.model)
         Draw.text(headers.context, font: font, color: color, in: columns.context)
         Draw.text(headers.multiple, font: font, color: color,
                   in: columns.headerCell(columns.multiple), alignment: .right)
@@ -424,7 +432,7 @@ final class SessionRowView: NSView {
         let severity = highlighted ? NSColor.selectedMenuItemTextColor : session.severity.color
 
         drawDot(in: columns.dot, accent: accent)
-        drawName(in: columns.name, label: label, accent: accent)
+        drawName(in: columns.name, modelRect: columns.model, label: label, accent: accent)
         drawContext(columns: columns, severity: severity, secondary: secondary)
         drawMultiple(in: columns.multiple, severity: severity)
         drawTurns(in: columns.turns, highlighted: highlighted)
@@ -452,37 +460,20 @@ final class SessionRowView: NSView {
                  filled: session.busy)
     }
 
-    /// The project label is the variable-length half of this cell and the
-    /// model+window is the fixed, identity-carrying half — so the model gets
-    /// its width reserved first and the label truncates into what remains.
-    /// Drawing both as one run let a long project name push "(200k)" off the
-    /// end, which is precisely the part that cannot be inferred from anything
-    /// else on the row.
-    private func drawName(in rect: NSRect, label: NSColor, accent: NSColor) {
-        let labelFont = PanelFont.text(13, .semibold)
-        let smallFont = PanelFont.text(10)
-        var trailing: [(String, NSFont, NSColor)] = []
-        if !session.matched { trailing.append(("(?)", smallFont, label)) }
-        if let model = session.model {
-            trailing.append(("  " + Display.modelWithWindow(model, window: session.contextWindow),
-                             smallFont, accent))
-        }
+    /// Name and model are two fixed cells, not one run: the name is a task
+    /// title of unbounded length and the model is a short bounded string, so
+    /// letting the former push the latter around produced both a ragged model
+    /// edge and, at narrower widths, a clipped "(200k)" — the one part of the
+    /// row that cannot be inferred from anything else.
+    private func drawName(in nameRect: NSRect, modelRect: NSRect, label: NSColor, accent: NSColor) {
+        var runs: [(String, NSFont, NSColor)] =
+            [(DetailedSessionRow.displayName(for: session), PanelFont.text(13, .semibold), label)]
+        if !session.matched { runs.append(("(?)", PanelFont.text(10), label)) }
+        Draw.runs(runs, in: nameRect)
 
-        let trailingWidth = trailing.reduce(CGFloat(0)) {
-            $0 + ($1.0 as NSString).size(withAttributes: [.font: $1.1]).width
-        }
-        // A pathologically long model id must still leave the project name
-        // legible — the reservation is capped rather than unbounded.
-        let reserved = min(trailingWidth, max(0, rect.width - SessionGrid.minLabelWidth))
-        let labelBox = NSRect(x: rect.minX, y: rect.minY,
-                              width: max(0, rect.width - reserved), height: rect.height)
-        Draw.text(session.label, font: labelFont, color: label, in: labelBox)
-
-        guard !trailing.isEmpty else { return }
-        let drawn = min((session.label as NSString).size(withAttributes: [.font: labelFont]).width,
-                        labelBox.width)
-        Draw.runs(trailing, in: NSRect(x: rect.minX + drawn, y: rect.minY,
-                                       width: max(0, rect.maxX - rect.minX - drawn), height: rect.height))
+        guard let model = session.model else { return }
+        Draw.text(Display.modelWithWindow(model, window: session.contextWindow),
+                  font: PanelFont.text(10), color: accent, in: modelRect)
     }
 
     private func drawContext(columns: SessionGrid.Columns, severity: NSColor, secondary: NSColor) {
@@ -535,6 +526,7 @@ final class SessionRowView: NSView {
 
 enum DetailedSessionRowSelfTests {
     static func run() {
+        testDisplayName()
         testNameAndModel()
         testCells()
         testContextFallbacksFit()
@@ -542,6 +534,26 @@ enum DetailedSessionRowSelfTests {
         testExpandedText()
         testAccessibilityLabel()
         testGrid()
+    }
+
+    private static func testDisplayName() {
+        // A titled session is named by what it is doing…
+        let titled = makeSession(label: "worktree-ee",
+                                 taskTitle: "Redesign dropdown menu layout")
+        precondition(DetailedSessionRow.displayName(for: titled) == "Redesign dropdown menu layout")
+        precondition(DetailedSessionRow.accessibilityLabel(for: titled).contains("Redesign"))
+
+        // …and an untitled one falls back to where it is running, never blank.
+        let untitled = makeSession(label: "worktree-a7", taskTitle: nil)
+        precondition(DetailedSessionRow.displayName(for: untitled) == "worktree-a7")
+
+        // An empty title is a missing title, not a blank row.
+        precondition(DetailedSessionRow.displayName(for: makeSession(label: "fallback", taskTitle: ""))
+                     == "fallback")
+
+        // Compact and --once still key off `label` — the title is Detailed-only.
+        precondition(UsageMenuBar.compactLine(for: titled).contains("worktree-ee"))
+        precondition(!UsageMenuBar.compactLine(for: titled).contains("Redesign"))
     }
 
     private static func testNameAndModel() {
@@ -616,17 +628,18 @@ enum DetailedSessionRowSelfTests {
         precondition(width(spanning) <= columns.contextSpanningMultiple.width)
     }
 
-    /// The name cell splits between a variable label and a bounded
-    /// model+window; this pins which one survives when they cannot both fit.
+    /// The model column is fixed, so the one thing that can silently break is
+    /// the widest model+window no longer fitting it.
     private static func testNameCellBudget() {
         let columns = SessionGrid.columns(width: Panel.width, y: 0, height: SessionGrid.rowHeight)
         let font = PanelFont.text(10)
-        // The widest model+window pair the app can actually produce today.
-        let widest = "  " + Display.modelWithWindow("gpt-5.2-codex", window: 200_000)
-        let width = (widest as NSString).size(withAttributes: [.font: font]).width
-        precondition(width <= columns.name.width - SessionGrid.minLabelWidth,
-                     "the model+window must always fit beside a minimum-width label")
-        precondition(SessionGrid.minLabelWidth > 0 && SessionGrid.minLabelWidth < columns.name.width)
+        let widest = Display.modelWithWindow("gpt-5.2-codex", window: 200_000)
+        precondition((widest as NSString).size(withAttributes: [.font: font]).width <= columns.model.width,
+                     "the widest model+window must fit its own column without truncating")
+        precondition((DetailedSessionRow.columnHeaders.model as NSString)
+                     .size(withAttributes: [.font: PanelFont.text(10, .medium)]).width <= columns.model.width)
+        // The name column still has to be worth reading after the split.
+        precondition(columns.name.width > 150, "a task title needs room to say what the task is")
     }
 
     private static func testExpandedText() {
@@ -684,7 +697,8 @@ enum DetailedSessionRowSelfTests {
         // Columns march left to right without overlapping, and the last one
         // ends exactly on the panel's right margin.
         precondition(columns.dot.maxX <= columns.name.minX)
-        precondition(columns.name.maxX <= columns.context.minX)
+        precondition(columns.name.maxX <= columns.model.minX)
+        precondition(columns.model.maxX <= columns.context.minX)
         precondition(columns.context.maxX <= columns.multiple.minX)
         precondition(columns.multiple.maxX <= columns.turns.minX)
         precondition(columns.turns.maxX <= columns.inOut.minX)

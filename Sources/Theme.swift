@@ -8,7 +8,11 @@ import AppKit
 // to have auto-sized the rows above it — that older approach made the panel
 // visibly breathe in and out as provider labels changed length.
 enum Panel {
-    static let width: CGFloat = 470
+    /// Widened from 470pt so a session's task title has room to read. At 470
+    /// the name cell was ~166pt, and once the model+window took its share a
+    /// title had ~7 characters — enough to show that a title exists and not
+    /// enough to say what it is.
+    static let width: CGFloat = 640
     /// Left/right text margin. Intra-quota dividers are inset by this much on
     /// each side; the dividers before Sessions and before the footer are
     /// NSMenu's own full-width separators.

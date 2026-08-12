@@ -900,6 +900,7 @@ private final class FailingKeyStore: KeyStore, @unchecked Sendable {
 // silently diverge on what a given AgentSession fixture actually contains.
 func makeSession(
     label: String = "session",
+    taskTitle: String? = nil,
     busy: Bool = false,
     turns: Int = 12,
     contextTokens: Int64? = 100_000,
@@ -911,7 +912,8 @@ func makeSession(
     lastActivityAt: Date? = nil
 ) -> AgentSession {
     AgentSession(
-        kind: .claude, pid: 1, label: label, cwd: "/Users/alex/\(label)", model: "claude-opus-5",
+        kind: .claude, pid: 1, label: label, taskTitle: taskTitle,
+        cwd: "/Users/alex/\(label)", model: "claude-opus-5",
         busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, subagentTokens: nil,
         contextTokens: contextTokens, contextWindow: contextWindow, xFloorMultiple: xFloorMultiple,
         compactionCount: compactionCount, lastCompactionAt: nil, lastCompactionPreCtx: nil,
