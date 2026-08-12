@@ -8,20 +8,8 @@ menu bar title. Reset times, credit balances and live agent sessions are one
 click away, alongside a Settings window (⌘,) for provider visibility, refresh
 interval and API keys.
 
-```
-[Claude] 5h 17%  wk 85%   [Codex] wk 42%  ← menu bar title (RAG coloured)
-
-Claude
-  5-hour   ██░░░░░░░░   17%   resets in 3h 23m
-  Weekly   █████████░   85%   resets in 1d 15h
-  Fable    ████░░░░░░   37%   resets in 1d 15h
-Codex
-  Weekly   ██████████  100%   resets in 59m
-  (plan: plus · as of 6d ago)
-OpenRouter
-  Used     ██░░░░░░░░   18%   $1.80 of $10.00
-  Remaining                   $8.20
-```
+![The menu bar title and its dropdown: Claude, Codex and OpenRouter quota
+bars above the live Sessions panel](docs/menu-bar.png)
 
 ## Providers
 

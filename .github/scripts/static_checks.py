@@ -62,6 +62,19 @@ def tracked_files() -> list[Path]:
     return [REPO_ROOT / line for line in out.splitlines() if line]
 
 
+# The encoding/CRLF/conflict-marker checks below decode every tracked file as
+# UTF-8, which is right for source and prose and meaningless for an image. The
+# repo carries one binary asset (the README screenshot), so those checks skip
+# by extension rather than by sniffing for NUL bytes -- an allowlist cannot be
+# fooled by a text file that happens to contain one, and a new binary type has
+# to be added here deliberately rather than silently escaping every check.
+BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".icns"}
+
+
+def is_binary(path: Path) -> bool:
+    return path.suffix.lower() in BINARY_SUFFIXES
+
+
 def check_encoding_and_line_endings(files: list[Path]) -> None:
     for f in files:
         raw = f.read_bytes()
@@ -140,8 +153,10 @@ def main() -> int:
     svg_files = [f for f in files if f.suffix == ".svg"]
     build_sh = REPO_ROOT / "build.sh"
 
-    check_encoding_and_line_endings(files)
-    check_no_conflict_markers(files)
+    text_files = [f for f in files if not is_binary(f)]
+
+    check_encoding_and_line_endings(text_files)
+    check_no_conflict_markers(text_files)
     check_no_debug_leftovers(swift_files)
     check_not_empty(swift_files)
     if build_sh.is_file():
@@ -151,7 +166,10 @@ def main() -> int:
     if failures:
         print(f"\n{len(failures)} static check(s) failed.")
         return 1
-    print(f"All static checks passed ({len(files)} tracked files, {len(swift_files)} Swift sources).")
+    print(
+        f"All static checks passed ({len(text_files)} tracked text files, "
+        f"{len(files) - len(text_files)} binary, {len(swift_files)} Swift sources)."
+    )
     return 0
 
 
