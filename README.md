@@ -165,11 +165,15 @@ rather than a fabricated denominator.
 ## Install
 
 ```bash
+git clone https://github.com/burnett-madoc-corp/claude-usage-menubar.git
+cd claude-usage-menubar
 ./install.sh
 ```
 
-Copies the app to `/Applications` and registers a LaunchAgent so it starts at
-login. To build and run without installing:
+Needs macOS 13+ and Xcode command line tools — see
+[Requirements](#requirements) below. Copies the app to `/Applications` and
+registers a LaunchAgent so it starts at login. To build and run without
+installing:
 
 ```bash
 ./build.sh && open build/ClaudeUsage.app
@@ -246,8 +250,11 @@ Sessions carries its own, smaller set:
 
 ## Requirements
 
-macOS 13+, Xcode command line tools (for `swiftc`), and a logged-in Claude Code
-install. No third-party dependencies.
+macOS 13+ and Xcode command line tools (for `swiftc`) to build. `build.sh`
+compiles an arm64 slice and an x86_64 slice separately and combines them with
+`lipo` into one universal binary, so the built app runs natively on both
+Apple Silicon and Intel Macs — there is no per-architecture build to choose.
+Also needs a logged-in Claude Code install. No third-party dependencies.
 
 ## Contributing
 
@@ -260,8 +267,9 @@ for the build/test loop and PR conventions, and
 ```
 
 CI runs exactly that on a hosted macOS runner, plus
-`.github/scripts/static_checks.py`. CodeQL analyses the Swift sources on every
-push to `main` and weekly.
+`.github/scripts/static_checks.py` and `tools/check_charts.py` (geometry and
+cross-chart number checks over the committed SVGs). CodeQL analyses the Swift
+sources on every push to `main`, on every pull request, and weekly.
 
 ## Security
 

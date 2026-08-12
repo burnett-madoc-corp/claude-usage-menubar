@@ -1007,8 +1007,8 @@ enum SessionSelfTests {
     // MARK: cwd encoding
 
     private static func testPathEncoding() {
-        precondition(PathEncoding.encode(cwd: "/Users/alex/.ade/agents/X/worktree")
-                     == "-Users-alex--ade-agents-X-worktree")
+        precondition(PathEncoding.encode(cwd: "/Users/dev/.ade/agents/X/worktree")
+                     == "-Users-dev--ade-agents-X-worktree")
         precondition(PathEncoding.encode(cwd: "/Users/git/sqlmesh") == "-Users-git-sqlmesh")
 
         // H1: `_` must map to `-` too — the original two fixtures above are
@@ -1016,8 +1016,8 @@ enum SessionSelfTests {
         // evidence: 6/19 project dirs on this machine are `_`-bearing paths
         // mis-encoded before this fix, e.g. this pytest tmpdir shape.
         precondition(
-            PathEncoding.encode(cwd: "/private/var/folders/st/x/T/pytest-of-alex/pytest-120/test_real_cli_denies_shell_com0")
-            == "-private-var-folders-st-x-T-pytest-of-alex-pytest-120-test-real-cli-denies-shell-com0",
+            PathEncoding.encode(cwd: "/private/var/folders/st/x/T/pytest-of-dev/pytest-120/test_real_cli_denies_shell_com0")
+            == "-private-var-folders-st-x-T-pytest-of-dev-pytest-120-test-real-cli-denies-shell-com0",
             "underscore must map to '-' exactly like '/' and '.'"
         )
     }
@@ -1084,7 +1084,7 @@ enum SessionSelfTests {
     private static func testProcessScannerParsing() {
         // Real `ps -axo pid=,state=,lstart=,comm=` shapes: a stopped process,
         // a running one, and a comm containing spaces and parentheses.
-        let sample = " 9123 T    Sat Aug  8 10:32:27 2026     /Users/alex/.local/bin/claude\n"
+        let sample = " 9123 T    Sat Aug  8 10:32:27 2026     /Users/dev/.local/bin/claude\n"
                    + "45210 S+   Tue Aug 11 07:57:58 2026     claude\n"
                    + "  777 R    Tue Aug 11 07:57:58 2026     Claude Helper (Renderer)"
         let parsed = ProcessScanner.parse(psOutput: sample)

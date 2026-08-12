@@ -29,5 +29,8 @@ paste the real output rather than describing it.
 - **A green scheduled job is not evidence it did anything.** Check what it
   skipped and why before concluding it works. A job can report SUCCESS on every
   tick for days while every item it was meant to process is silently dropped.
-- **`merge-gate` is the only required check.** It builds on `macos-latest` and
-  runs `--self-test`, so it is a real gate, not a structural approximation.
+- **`merge-gate` and `pr-title-lint` are both required checks.** `merge-gate`
+  is the substantive one: it builds on `macos-latest` and runs `--self-test`,
+  so it is a real gate, not a structural approximation. `pr-title-lint` only
+  enforces the `[type][scope]` title convention, but it is required too — a
+  bad title blocks the merge the same as a failing build.

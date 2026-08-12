@@ -43,9 +43,19 @@ exist under that same service. Nothing reads it any more, but nothing deletes
 it either — remove it yourself with `security delete-generic-password -s
 local.claude-usage-menubar -a xai_key`.
 
-**Local state it reads:** `~/.claude/sessions/<pid>.json`, Codex's
-`state_*.sqlite`, and `lsof`/`ps` output to match live agent processes to their
-working directories. Session working directory paths are shown in the dropdown.
+**Local state it reads:** `~/.claude/sessions/<pid>.json` (the registry of
+live Claude Code processes); `~/.claude/projects/**/*.jsonl` — full Claude
+Code conversation transcripts, parsed for per-session token and
+context-window statistics. This is the most privacy-sensitive read the app
+performs: a transcript is not just token counts, it is everything you typed
+and everything the model wrote back. Also Codex's `state_*.sqlite` and the
+rollout/session logs under `~/.codex/` that its `rollout_path` column points
+to, read the same way and for the same reason (per-session token/context
+stats); and `lsof`/`ps` output to match live agent processes to their working
+directories. Every one of these reads is local-only — nothing parsed from a
+transcript or rollout log is ever transmitted anywhere, it only feeds the
+Sessions section's on-screen display. Session working directory paths are
+shown in the dropdown.
 
 **Network egress** is limited to the two provider endpoints documented in the
 README (`api.anthropic.com`, `openrouter.ai`) and nothing else — Codex is read

@@ -12,6 +12,13 @@ Usage::
     echo "[fix][data] correct FX conversion" | python validate_pr_title.py
     python validate_pr_title.py --list
 
+    # CI invocation (pr-title-lint.yml): the title comes from the PR_TITLE
+    # env var, not argv, and always wins when set. This closes a bypass
+    # where a PR literally titled `--list` (or any other registered flag)
+    # was parsed by argparse as that flag instead of as the title text,
+    # and validate() never ran on it.
+    PR_TITLE="$PR_TITLE" python validate_pr_title.py "$PR_TITLE"
+
 Exit 0 when the title conforms (warnings do not fail), 1 otherwise.
 """
 
@@ -19,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 
@@ -175,11 +183,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit a JSON result")
     args = parser.parse_args(argv)
 
-    if args.list:
+    # PR_TITLE, when set, IS the title -- and always wins over argv, even
+    # over a flag argparse would otherwise have parsed. The workflow always
+    # exports it from `github.event.pull_request.title` (see
+    # pr-title-lint.yml), specifically so this script never has to trust
+    # argv's shape: an attacker who titles a PR `--list` (or `--json`, or
+    # any future flag) must not get it parsed as that flag and skip
+    # validation entirely -- it must be validated as the literal string it
+    # is, and rejected for not matching the grammar.
+    env_title = os.environ.get("PR_TITLE")
+
+    if env_title is not None:
+        title = env_title
+    elif args.list:
         _print_reference()
         return 0
+    else:
+        title = args.title if args.title is not None else sys.stdin.read()
 
-    title = args.title if args.title is not None else sys.stdin.read()
     errors, warnings, parsed = validate(title)
 
     if args.json:

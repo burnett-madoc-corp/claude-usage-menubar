@@ -55,13 +55,35 @@ enum KeychainCommand {
         ["find-generic-password", "-s", service, "-a", account, "-w"]
     }
 
-    static func add(service: String, account: String, value: String) -> [String] {
-        // Deliberately no -U. Updating in place needs *decrypt* authorization
-        // on the existing item, which is exactly what an item left over from
-        // the Security.framework era will not grant without a dialog. set()
-        // deletes first instead, so a surviving item means the delete failed
-        // and the resulting "duplicate" error is worth seeing.
-        ["add-generic-password", "-s", service, "-a", account, "-w", value]
+    /// One argument, quoted for `security -i`'s stdin command line rather
+    /// than handed to the process as an argv element: wrap in double quotes
+    /// and backslash-escape the two characters that would otherwise end the
+    /// quoted span early or start a stray escape — `\` and `"` themselves.
+    /// Verified against the real `security -i` binary: a value containing
+    /// both round-trips byte-for-byte through add then find.
+    static func quoteForStdin(_ value: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(value.count)
+        for char in value {
+            if char == "\\" || char == "\"" { escaped.append("\\") }
+            escaped.append(char)
+        }
+        return "\"\(escaped)\""
+    }
+
+    /// A full `security -i` command line, fed on stdin rather than built as
+    /// an argv array — see KeychainStore's doc comment for why a `-w` value
+    /// must never be an argv element. `security -i` parses this the same way
+    /// it would parse the equivalent argv, exit code included, so the
+    /// itemNotFound/duplicateItem handling in KeychainStore.set is unchanged.
+    ///
+    /// Deliberately no -U. Updating in place needs *decrypt* authorization
+    /// on the existing item, which is exactly what an item left over from
+    /// the Security.framework era will not grant without a dialog. set()
+    /// deletes first instead, so a surviving item means the delete failed
+    /// and the resulting "duplicate" error is worth seeing.
+    static func addLine(service: String, account: String, value: String) -> String {
+        "add-generic-password -s \(quoteForStdin(service)) -a \(quoteForStdin(account)) -w \(quoteForStdin(value))\n"
     }
 
     static func delete(service: String, account: String) -> [String] {
@@ -111,6 +133,14 @@ enum KeychainCommand {
 /// Keychain item this app reads, and the code-identity gate it replaces was
 /// not buying confidentiality — an ad-hoc app cannot hold one — it was only
 /// buying a dialog.
+///
+/// Saving a value still goes through `security -i` on stdin rather than a
+/// `-w` argv element, though, for a cheaper and unrelated reason: an argv
+/// element is visible in `ps`/Activity Monitor to *every* local process for
+/// the entire lifetime of the child, with no `security` invocation of their
+/// own required to see it. The trade-off above concedes the value is not
+/// confidential from a process that goes looking for it; it should not also
+/// be handed to one that is not looking, just because it walked past `ps`.
 /// Accounts whose read parked behind an approval dialog, for the life of this
 /// process.
 ///
@@ -182,7 +212,7 @@ struct KeychainStore: KeyStore {
         // A miss here is the normal case — nothing was stored yet.
         _ = KeychainCLI.read(KeychainCommand.delete(service: Self.service, account: account))
 
-        switch KeychainCLI.read(KeychainCommand.add(service: Self.service, account: account, value: value)) {
+        switch KeychainCLI.readStdin(KeychainCommand.addLine(service: Self.service, account: account, value: value)) {
         case .success:
             break
         case .failure(.blocked):

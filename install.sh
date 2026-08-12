@@ -9,7 +9,11 @@ DEST="/Applications/ClaudeUsage.app"
 PLIST="$HOME/Library/LaunchAgents/local.claude-usage-menubar.plist"
 
 echo "Installing to ${DEST}..."
-pkill -f "ClaudeUsage.app/Contents/MacOS/ClaudeUsage" 2>/dev/null || true
+# -x, not -f: an -f match is a substring of the full argv, so an editor or
+# debugger with this app's binary path open on its command line (e.g.
+# `lldb ClaudeUsage.app/Contents/MacOS/ClaudeUsage`) would match and get
+# killed too. -x matches only the process name itself.
+pkill -x ClaudeUsage 2>/dev/null || true
 rm -rf "$DEST"
 cp -R build/ClaudeUsage.app "$DEST"
 

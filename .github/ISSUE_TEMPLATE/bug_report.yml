@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Please do not report anything credential-related here — see
-        [SECURITY.md](../blob/main/SECURITY.md) for private reporting.
+        [SECURITY.md](https://github.com/burnett-madoc-corp/claude-usage-menubar/blob/main/SECURITY.md) for private reporting.
 
   - type: textarea
     id: what-happened
@@ -35,9 +35,11 @@ body:
     attributes:
       label: Output of `--once`
       description: |
-        `build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --once` prints
-        everything the app would show, headlessly. Redact anything you would
-        rather not publish — working directory paths appear in session rows.
+        `/Applications/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --once`
+        prints everything the app would show, headlessly. Building from
+        source instead? Use `build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage
+        --once`. Redact anything you would rather not publish — working
+        directory paths appear in session rows.
       render: text
     validations:
       required: false

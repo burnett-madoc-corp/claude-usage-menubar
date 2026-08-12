@@ -150,6 +150,42 @@ enum KeychainCLI {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
     }
+
+    /// Same shape as read(), for the one call site (KeychainStore.set) that
+    /// cannot use argv: `security -i` reads one command line off stdin
+    /// instead, so a secret value never becomes a `ps`-visible argument. The
+    /// timeout/zombie-pipe handling is identical to read()'s — a stdin write
+    /// can park behind the same approval dialog a find/delete does, and an
+    /// abandoned child must not become a zombie the caller forgot to reap.
+    static func readStdin(_ commandLine: String, timeout: TimeInterval = timeout) -> Result<Data, Failure> {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = ["-i"]
+        let stdin = Pipe()
+        let stdout = Pipe()
+        task.standardInput = stdin
+        task.standardOutput = stdout
+        task.standardError = FileHandle.nullDevice
+
+        let finished = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in finished.signal() }
+        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
+
+        // The command line is at most a few hundred bytes, so this write
+        // cannot fill the pipe and block; closing afterwards is what makes
+        // `security -i` see EOF and act on the one command it was given.
+        stdin.fileHandleForWriting.write(commandLine.data(using: .utf8) ?? Data())
+        try? stdin.fileHandleForWriting.close()
+
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            // Leaves the approval dialog up — answering it makes the next poll
+            // succeed. Only this write is abandoned, not the user's decision.
+            task.terminate()
+            return .failure(.blocked)
+        }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+    }
 }
 
 enum Net {
