@@ -63,8 +63,7 @@ rate-limits aggressively.
 **Refresh interval** — 1/2/5/10/15 minutes, default 2, floored at 60s for the
 same reason: a faster poll trades a working title for a string of 429s.
 
-**Sessions** — show/hide for the whole section, plus a Compact/Detailed row
-style. See [Sessions](#sessions).
+**Sessions** — show/hide for the whole section. See [Sessions](#sessions).
 
 ## API keys
 
@@ -111,6 +110,16 @@ turns — and individually heavier per turn, which is the whole reason the
 
 ![Total input, cumulative](docs/charts/02-cumulative-input.svg)
 
+What each turn is actually carrying — history crowds out everything else, and
+the fixed 38k floor of system prompt and tool definitions is paid every time:
+
+![What each turn's input is made of](docs/charts/07-input-composition-by-turn.svg)
+
+Which is why a turn gets steadily more expensive the longer a session runs —
+from the 38k floor to roughly 2.5× it by 100 turns:
+
+![Average input per turn, by session length](docs/charts/04-input-per-turn-by-band.svg)
+
 [docs/token-metering.md](docs/token-metering.md) has the rest: the anatomy of
 one turn, the context window filling, per-turn cost by session length, when
 caching helps, and why output is a rounding error. Every chart is generated
@@ -145,24 +154,13 @@ what it reclaimed (context before → after). A session with zero compactions
 shows nothing for it, and one with no usage recorded since a compaction fired
 shows reclaim as pending (`—`), never a fabricated 0% or 100%.
 
-Two row styles. **Detailed** (the default) gives each session two lines, and
-clicking one expands `cwd` and compaction detail in place without closing the
-menu; **Compact** puts the same data on one line, with `cwd` and detail in the
-tooltip:
+Clicking a row expands its `cwd` and compaction detail in place, without the
+menu closing.
 
-```
-Sessions                          Sessions
-  ● worktree-a   5.2x               ● worktree-a  ████░░░░░░ 37%  5.2x 217t
-    opus-5  ████░░░░░░ 37%  217t    ○ sqlmesh     █░░░░░░░░░ 12%  2.5x  57t
-  ○ sqlmesh   2.5x                  ○ scratch-2   ████░░░░░░ 38%  9.7x 363t
-    opus-5  █░░░░░░░░░ 12%   57t
-         (Detailed)                            (Compact)
-```
-
-The `●`/`○` glyph tracks whether the process is currently busy (Detailed
-pulses it; Compact stays static). A brand-new session shows "starting — no
-usage yet" instead of a bar, and one whose context window couldn't be resolved
-shows raw tokens with "window unknown" rather than a fabricated denominator.
+The `●`/`○` glyph tracks whether the process is currently busy. A brand-new
+session shows "starting — no usage yet" instead of a bar, and one whose
+context window couldn't be resolved shows raw tokens with "window unknown"
+rather than a fabricated denominator.
 
 ## Install
 
