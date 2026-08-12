@@ -258,6 +258,11 @@ struct AgentSession: Sendable {
     var kind: AgentKind
     var pid: pid_t
     var label: String
+    /// What the session is *doing*, when Claude Code has named it — distinct
+    /// from `label`, which is where it is running. Nil for Codex sessions and
+    /// for a Claude session in its first minute; the renderer falls back to
+    /// `label` rather than showing nothing.
+    var taskTitle: String?
     var cwd: String
     var model: String?
     var busy: Bool
@@ -328,6 +333,9 @@ actor TranscriptReader {
         var contextTokens: Int64?          // newest non-sidechain per-turn quantity
         var lastActivityAt: Date?          // newest usage-record timestamp, main or sidechain
         var lastModel: String?
+        /// Claude Code's own AI-generated title for the conversation. Rewritten
+        /// as the session evolves, so the newest record in the file wins.
+        var aiTitle: String?
         // Only .last was ever read — an unbounded array of every corroboration
         // vote ever seen was pure growth for no benefit. One slot instead.
         var lastResolvedModel: String?
@@ -454,6 +462,14 @@ enum SessionScanner {
             acc.lastCompactionPostCtx = nil
             acc.awaitingPostCompaction = true
             acc.turnCosts = []   // xFloor baseline/live window reset at the boundary
+            return
+        }
+
+        // The session's own AI-generated title — "Redesign dropdown menu layout
+        // and provider color coding" rather than the directory it happens to
+        // run in. A control record with no usage; the newest one wins.
+        if obj.string("type") == "ai-title" {
+            if let title = obj.string("aiTitle"), !title.isEmpty { acc.aiTitle = title }
             return
         }
 
@@ -680,6 +696,7 @@ enum SessionScanner {
                 kind: .claude,
                 pid: registry.pid,
                 label: registry.name ?? PathEncoding.label(cwd: registry.cwd),
+                taskTitle: acc.aiTitle,
                 cwd: registry.cwd,
                 model: acc.lastModel,
                 busy: Suspension.isBusy(status: registry.status,
@@ -750,7 +767,39 @@ enum SessionSelfTests {
         testAccumulatorEviction()
         testIncrementalRead()
         testLiveSessionsEndToEnd()
+        testAiTitle()
         CodexSessionSelfTests.run()
+    }
+
+    // MARK: ai-title — Claude Code's own name for what the session is doing,
+    // folded from the transcript alongside the usage records.
+
+    private static func testAiTitle() {
+        var acc = TranscriptReader.Acc()
+        precondition(acc.aiTitle == nil, "no title record yet must read as no title")
+
+        SessionScanner.claudeFold(
+            line: #"{"type":"ai-title","aiTitle":"Redesign dropdown menu layout","sessionId":"s1"}"#,
+            into: &acc)
+        precondition(acc.aiTitle == "Redesign dropdown menu layout")
+
+        // Rewritten as the conversation evolves — the newest record wins.
+        SessionScanner.claudeFold(
+            line: #"{"type":"ai-title","aiTitle":"Add context window to the model cell","sessionId":"s1"}"#,
+            into: &acc)
+        precondition(acc.aiTitle == "Add context window to the model cell")
+
+        // A malformed or empty title must not blank a good one.
+        SessionScanner.claudeFold(line: #"{"type":"ai-title","aiTitle":"","sessionId":"s1"}"#, into: &acc)
+        SessionScanner.claudeFold(line: #"{"type":"ai-title","sessionId":"s1"}"#, into: &acc)
+        precondition(acc.aiTitle == "Add context window to the model cell")
+
+        // It is a control record: it must contribute no usage, no turn cost
+        // and no activity timestamp of its own.
+        precondition(acc.turnCosts.isEmpty)
+        precondition(acc.rawInputTokens == 0 && acc.rawOutputTokens == 0)
+        precondition(acc.lastActivityAt == nil)
+        precondition(acc.contextTokens == nil)
     }
 
     // MARK: lastActivityAt — Phase 4b's recency signal, threaded through the
