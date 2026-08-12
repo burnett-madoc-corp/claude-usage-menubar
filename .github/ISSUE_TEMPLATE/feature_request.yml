@@ -16,8 +16,9 @@ body:
       label: Where would the data come from
       description: |
         For a new provider this is the important part. Is there a pollable
-        endpoint, or a local file the tool already writes? The Gemini CLI is
-        deliberately unsupported because it exposes neither — see the README.
+        endpoint that reports real usage, or a local file the tool already
+        writes? The Gemini CLI, Antigravity and Grok are all unsupported for
+        failing that test — see "Providers that aren't here" in the README.
     validations:
       required: false
 

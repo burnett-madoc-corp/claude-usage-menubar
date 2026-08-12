@@ -12,13 +12,13 @@ enum QuotaBlock {
     static let topPadding: CGFloat = 6
     static let bottomPadding: CGFloat = 7
 
-    /// The label column is 56pt for the providers whose windows are named
-    /// "5-hour" and "Weekly", but Antigravity labels its rows with model ids —
-    /// "gemini-2.5-flash-lite" and three siblings that share a long prefix. At
-    /// a fixed 56pt all four truncate to the same "gemini-2.…", which is worse
-    /// than useless: four rows that no longer say which model they are. So the
-    /// column grows to the widest label in *its own* block, capped so the bar
-    /// keeps a usable minimum width.
+    /// The label column is 56pt for the windows named "5-hour" and "Weekly",
+    /// but Claude's `weekly_scoped` rows are labelled with whatever
+    /// `scope.model.display_name` the API returns, and those are neither
+    /// short nor fixed. At a fixed 56pt, siblings sharing a long prefix all
+    /// truncate to the same string — rows that no longer say which model they
+    /// are. So the column grows to the widest label in *its own* block,
+    /// capped so the bar keeps a usable minimum width.
     static let minLabelWidth: CGFloat = 56
     static let maxLabelWidth: CGFloat = 132
     static let percentWidth: CGFloat = 40
@@ -301,16 +301,16 @@ enum QuotaBlockSelfTests {
         ])
         precondition(QuotaBlock.labelWidth(for: short) == QuotaBlock.minLabelWidth)
 
-        // Antigravity's model-id labels must not all collapse to the same
-        // truncated prefix — the column grows, but only up to the cap.
-        let long = makeCard(provider: "Antigravity", rows: [
-            Row(label: "gemini-2.5-flash-lite", percent: 0, detail: "resets in 1d 0h"),
-            Row(label: "gemini-2.5-pro", percent: 0, detail: "resets in 1d 0h"),
+        // Scoped-model labels must not all collapse to the same truncated
+        // prefix — the column grows, but only up to the cap.
+        let long = makeCard(rows: [
+            Row(label: "Weekly (Fable)", percent: 0, detail: "resets in 1d 0h"),
+            Row(label: "Weekly (Opus)", percent: 0, detail: "resets in 1d 0h"),
         ])
         let grown = QuotaBlock.labelWidth(for: long)
         precondition(grown > QuotaBlock.minLabelWidth, "a long label must widen its own block's column")
         precondition(grown <= QuotaBlock.maxLabelWidth, "the bar keeps a usable minimum width")
-        let widest = ("gemini-2.5-flash-lite" as NSString)
+        let widest = ("Weekly (Fable)" as NSString)
             .size(withAttributes: [.font: QuotaBlock.labelFont]).width
         precondition(grown >= widest, "the widest label in the block must fit without truncation")
 

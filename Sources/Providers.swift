@@ -48,21 +48,20 @@ protocol Provider: Sendable {
 // MARK: - Config
 
 /// Keys resolve highest-precedence-wins across three tiers:
-///   1. OPENROUTER_API_KEY / XAI_API_KEY env vars (unchanged — keeps
-///      CI/scripting workflows working).
+///   1. The OPENROUTER_API_KEY env var (unchanged — keeps CI/scripting
+///      workflows working).
 ///   2. The macOS Keychain (KeyStore.swift): service
-///      "local.claude-usage-menubar", accounts "openrouter_key"/"xai_key" —
-///      what the settings window's Save button writes.
+///      "local.claude-usage-menubar", account "openrouter_key" — what the
+///      settings window's Save button writes.
 ///   3. Legacy ~/.config/claude-usage/config.json — read-only, never
 ///      deleted automatically, kept alive forever for anyone who never
 ///      opens settings:
-///        { "openrouter_key": "sk-or-v1-…", "xai_key": "xai-…" }
+///        { "openrouter_key": "sk-or-v1-…" }
 /// Providers.all() calls Config.load() on every refresh, so a key saved in
 /// settings (or removed) takes effect on the next poll with no restart —
 /// the same property the legacy env-var/file design already had.
 struct Config: Sendable {
     var openRouterKey: String?
-    var xaiKey: String?
 
     /// var, not let: --self-test points this at a temp-dir fixture instead
     /// of the real file, mirroring the Prefs.defaults swap pattern.
@@ -78,12 +77,10 @@ struct Config: Sendable {
     static let pollingStore: KeyStore = KeychainStore()
 
     static func load(store: KeyStore = Config.pollingStore) -> Config {
-        let legacy = legacyKeys()
         let env = ProcessInfo.processInfo.environment
 
         var config = Config()
-        config.openRouterKey = nonBlank(env["OPENROUTER_API_KEY"]) ?? store.get(KeyAccount.openRouter) ?? legacy.openRouterKey
-        config.xaiKey = nonBlank(env["XAI_API_KEY"]) ?? store.get(KeyAccount.xai) ?? legacy.xaiKey
+        config.openRouterKey = nonBlank(env["OPENROUTER_API_KEY"]) ?? store.get(KeyAccount.openRouter) ?? legacyOpenRouterKey()
         return config
     }
 
@@ -99,11 +96,11 @@ struct Config: Sendable {
     /// Exposed separately (not folded into load()) so SettingsWindow's
     /// migration banner can ask "does the legacy file hold a key?" without
     /// touching the Keychain or env vars at all.
-    static func legacyKeys() -> (openRouterKey: String?, xaiKey: String?) {
+    static func legacyOpenRouterKey() -> String? {
         guard let data = try? Data(contentsOf: legacyPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return (nil, nil) }
-        return (json["openrouter_key"] as? String, json["xai_key"] as? String)
+        else { return nil }
+        return json["openrouter_key"] as? String
     }
 }
 
@@ -116,10 +113,9 @@ struct Config: Sendable {
 /// takes down the others with it, including those that touch no Keychain at
 /// all.
 ///
-/// This app's own keys no longer trigger that dialog (see KeychainStore), but
-/// the items it reads from *other* apps — Claude Code's OAuth token,
-/// Antigravity's go-keyring blob — are written by those apps under their own
-/// access rules, so the timeout stays.
+/// This app's own key no longer triggers that dialog (see KeychainStore), but
+/// the item it reads from *another* app — Claude Code's OAuth token — is
+/// written under that app's own access rules, so the timeout stays.
 enum KeychainCLI {
     /// Long enough that a genuinely slow read succeeds, short enough that the
     /// menu is not held hostage to a dialog nobody is looking at.
@@ -157,14 +153,9 @@ enum KeychainCLI {
 }
 
 enum Net {
-    static func getJSON(_ url: URL, bearer: String, extraHeaders: [String: String] = [:],
-                        postBody: Data? = nil) async throws -> [String: Any] {
+    static func getJSON(_ url: URL, bearer: String,
+                        extraHeaders: [String: String] = [:]) async throws -> [String: Any] {
         var request = URLRequest(url: url)
-        if let postBody {
-            request.httpMethod = "POST"
-            request.httpBody = postBody
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        }
         request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         for (key, value) in extraHeaders { request.setValue(value, forHTTPHeaderField: key) }
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -366,128 +357,5 @@ struct OpenRouterProvider: Provider {
         } catch {
             return Card(provider: name, rows: [], error: error.localizedDescription)
         }
-    }
-}
-
-// MARK: - xAI / Grok
-
-/// xAI publishes no credit-balance endpoint. GET /v1/api-key returns key
-/// metadata, including the blocked flags that are what actually go wrong when
-/// you run out — so we surface key health rather than inventing a balance.
-struct XAIProvider: Provider {
-    let name = "Grok (xAI)"
-    let key: String?
-
-    /// The blocked-flags text SettingsWindow's Test button surfaces too —
-    /// factored out of load() so both call sites read the same flags.
-    static func keyHealthMessage(from json: [String: Any]) -> String {
-        let blockedFlags = Self.blockedFlags(from: json)
-        return blockedFlags.isEmpty ? "active" : blockedFlags.joined(separator: ", ")
-    }
-
-    private static func blockedFlags(from json: [String: Any]) -> [String] {
-        [
-            ("team_blocked", "team blocked"),
-            ("api_key_blocked", "key blocked"),
-            ("api_key_disabled", "key disabled"),
-        ].filter { json[$0.0] as? Bool == true }.map(\.1)
-    }
-
-    func load() async -> Card {
-        guard let key, !key.isEmpty else {
-            return Card(provider: name, rows: [], error: "no API key — see README", missingKey: true)
-        }
-        do {
-            let json = try await Net.getJSON(URL(string: "https://api.x.ai/v1/api-key")!, bearer: key)
-
-            let blockedFlags = Self.blockedFlags(from: json)
-
-            var rows: [Row] = []
-            if blockedFlags.isEmpty {
-                rows.append(Row(label: "Key", detail: "active"))
-            } else {
-                rows.append(Row(label: "Key", detail: blockedFlags.joined(separator: ", "), severity: "critical"))
-            }
-            if let keyName = json["name"] as? String, !keyName.isEmpty {
-                rows.append(Row(label: "Name", detail: keyName))
-            }
-            return Card(provider: name, rows: rows, note: "xAI exposes no credit balance API")
-        } catch {
-            return Card(provider: name, rows: [], error: error.localizedDescription)
-        }
-    }
-}
-
-// MARK: - Antigravity (agy)
-
-/// Antigravity's own quota RPC:
-///   POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota
-/// → { buckets: [{ modelId, tokenType, remainingFraction, resetTime }] }
-///
-/// `remainingFraction` is what is LEFT (1.0 = untouched), so used = 1 - it.
-///
-/// The live token is in the login Keychain under service "gemini", account
-/// "antigravity", stored by go-keyring as base64 JSON. The plain file at
-/// ~/.gemini/antigravity-cli/antigravity-oauth-token goes stale — the CLI and
-/// IDE refresh into the Keychain, not the file — so we read the Keychain.
-struct AntigravityProvider: Provider {
-    let name = "Antigravity"
-
-    func load() async -> Card {
-        guard let token = keychainToken() else {
-            return Card(provider: name, rows: [], error: "not signed in — run `agy`")
-        }
-        if let expiry = token.expiry, expiry < Date() {
-            return Card(provider: name, rows: [], error: "token expired — run `agy` to refresh")
-        }
-        do {
-            let json = try await Net.getJSON(
-                URL(string: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")!,
-                bearer: token.accessToken,
-                postBody: Data("{}".utf8)
-            )
-            let buckets = json["buckets"] as? [Any] ?? []
-            var rows: [Row] = []
-            for case let bucket as [String: Any] in buckets {
-                guard let remaining = (bucket["remainingFraction"] as? NSNumber)?.doubleValue else { continue }
-                let used = Int(((1 - remaining) * 100).rounded())
-                let reset = (bucket["resetTime"] as? String).flatMap {
-                    Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
-                }
-                rows.append(Row(
-                    label: (bucket["modelId"] as? String) ?? "model",
-                    percent: used,
-                    detail: "resets in \(Format.countdown(to: reset))",
-                    severity: used >= 95 ? "critical" : (used >= 80 ? "warning" : "normal")
-                ))
-            }
-            if rows.isEmpty { return Card(provider: name, rows: [], error: "no quota buckets returned") }
-            return Card(provider: name, rows: rows)
-        } catch {
-            return Card(provider: name, rows: [], error: error.localizedDescription)
-        }
-    }
-
-    private struct Token { let accessToken: String; let expiry: Date? }
-
-    private func keychainToken() -> Token? {
-        guard case let .success(data) = KeychainCLI.read(
-            ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"]
-        ) else { return nil }
-
-        var raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        if raw.hasPrefix("go-keyring-base64:") {
-            raw = String(raw.dropFirst("go-keyring-base64:".count))
-        }
-        guard let decoded = Data(base64Encoded: raw),
-              let json = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any],
-              let token = json["token"] as? [String: Any],
-              let accessToken = token["access_token"] as? String
-        else { return nil }
-
-        let expiry = (token["expiry"] as? String).flatMap {
-            Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
-        }
-        return Token(accessToken: accessToken, expiry: expiry)
     }
 }

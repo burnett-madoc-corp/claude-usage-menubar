@@ -30,23 +30,27 @@ vulnerability here could break.
 | Source | What | How |
 |---|---|---|
 | Keychain item `Claude Code-credentials` | Claude Code's OAuth token | shelling out to `security find-generic-password` |
-| Keychain service `gemini`, account `antigravity` | Antigravity's OAuth token, stored there by go-keyring | Keychain read |
 | `~/.codex/sessions/**.jsonl` | Codex's recorded `rate_limits` payloads | file read |
 
 **Credentials it stores on your behalf**, in the login Keychain under service
-`local.claude-usage-menubar`, accounts `openrouter_key` and `xai_key`: the
-OpenRouter and xAI API keys you paste into Settings. These are yours, entered
-deliberately, and can be removed from Settings or with `security
-delete-generic-password -s local.claude-usage-menubar`.
+`local.claude-usage-menubar`, account `openrouter_key`: the OpenRouter API key
+you paste into Settings. It is yours, entered deliberately, and can be removed
+from Settings or with `security delete-generic-password -s
+local.claude-usage-menubar -a openrouter_key`.
+
+If you ran a build before xAI support was removed, an `xai_key` item may still
+exist under that same service. Nothing reads it any more, but nothing deletes
+it either — remove it yourself with `security delete-generic-password -s
+local.claude-usage-menubar -a xai_key`.
 
 **Local state it reads:** `~/.claude/sessions/<pid>.json`, Codex's
 `state_*.sqlite`, and `lsof`/`ps` output to match live agent processes to their
 working directories. Session working directory paths are shown in the dropdown.
 
-**Network egress** is limited to the five provider endpoints documented in the
-README (`api.anthropic.com`, `openrouter.ai`, `api.x.ai`,
-`cloudcode-pa.googleapis.com`) plus nothing else. There is no telemetry, no
-analytics, no crash reporting, and no update check.
+**Network egress** is limited to the two provider endpoints documented in the
+README (`api.anthropic.com`, `openrouter.ai`) and nothing else — Codex is read
+entirely from local files. There is no telemetry, no analytics, no crash
+reporting, and no update check.
 
 ## The refresh-token boundary
 

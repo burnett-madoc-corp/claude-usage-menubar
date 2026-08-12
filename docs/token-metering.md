@@ -10,9 +10,18 @@ mid-session pays off.
 
 ## Anatomy of one turn
 
+A **turn** is one request to the model and its reply. Not one thing you type:
+if the model calls three tools before answering you, that is four turns, each
+one re-sending everything that came before it. This is why turn counts climb
+so much faster than the number of messages you actually send, and it is the
+unit every number below is expressed in.
+
 ![Anatomy of one turn](charts/01-anatomy-of-a-turn.svg)
 
 ![Input composition by turn](charts/07-input-composition-by-turn.svg)
+
+The fixed part — system prompt and tool definitions — is paid on every single
+turn. The part that grows is the conversation history behind it.
 
 ## Input grows faster than session length
 
@@ -33,6 +42,12 @@ they ride along on every subsequent turn, cost tokens each time, and crowd out
 the window. Past ~80% the tooling starts compacting for you — on its schedule,
 not yours.
 
+The app's `BLOAT` column is this, measured: how much a turn costs *now* versus
+what the same session's first few turns cost. `2.5x` means every turn is
+currently dragging two and a half times the context it started with. It resets
+when the session compacts, because that is exactly when the drag is thrown
+away.
+
 ## Per-turn cost by session length
 
 ![Input per turn by band](charts/04-input-per-turn-by-band.svg)
@@ -47,12 +62,11 @@ charts follow a single cohort — the 25 sessions that ran past 100 turns. That 
 why this chart alone carries an `n` per row: the 5–25 and 700+ bands rest on one
 session each and should not be read as firmly as the middle ones.
 
-The app's `BLOAT` column answers the same question with a different baseline:
-it compares the current turn against *that session's own* first few turns
-(or since its last compaction) rather than against an absolute 38k. That makes
-it robust to a session whose floor is genuinely higher — a big system prompt,
-many MCP tools — at the cost of being uncomparable between sessions. The bands
-above are the cross-session view; `BLOAT` is the within-session one.
+Note that `BLOAT` measures against a session's *own* first turns, not against
+this absolute 38k. That makes it robust to a session whose floor is genuinely
+higher — a big system prompt, many MCP tools — at the cost of being
+uncomparable between sessions: these bands are the cross-session view, `BLOAT`
+the within-session one.
 
 ## Prompt caching softens the blow — conditionally
 
