@@ -1,0 +1,6 @@
+# Every change requests a review from the maintainer. This does NOT require an
+# approval to merge -- the ruleset on main gates on CI, not on review, and a
+# sole maintainer cannot approve their own pull request. Its job is to make
+# sure an outside contribution lands in someone's review queue rather than
+# waiting to be noticed.
+*  @alecburnett
