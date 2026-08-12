@@ -12,13 +12,12 @@ protocol KeyStore: Sendable {
     func delete(_ account: String) throws
 }
 
-/// Stable account names for the two keys this app owns in the Keychain —
-/// shared by Config.load, SettingsWindow's rows, and the legacy-JSON field
-/// names (they match on purpose: "openrouter_key" / "xai_key" either way),
-/// so the mapping lives in exactly one place.
+/// Stable account name for the one key this app owns in the Keychain —
+/// shared by Config.load, SettingsWindow's row, and the legacy-JSON field
+/// name (they match on purpose: "openrouter_key" either way), so the mapping
+/// lives in exactly one place.
 enum KeyAccount {
     static let openRouter = "openrouter_key"
-    static let xai = "xai_key"
 }
 
 enum KeyStoreError: LocalizedError {
@@ -104,8 +103,8 @@ enum KeychainCommand {
 /// Routing through `security` borrows an identity that does not change:
 /// the item's partition becomes `apple-tool:` and its trusted application is
 /// `security` itself, neither of which cares what this app's cdhash is
-/// today. It is also the path AntigravityProvider and the Claude Code token
-/// reader already take, and the reason those reads never prompted.
+/// today. It is also the path the Claude Code token reader already takes, and
+/// the reason that read never prompted.
 ///
 /// The trade-off is explicit: any process running as this user can also run
 /// `security` and read these keys back. That was already true of every other
@@ -264,16 +263,12 @@ enum LegacyImport {
 
     /// Only imports a key that isn't already in the Keychain — Keychain
     /// always wins over the legacy file (see Config's precedence doc).
-    static func run(legacy: (openRouterKey: String?, xaiKey: String?), store: KeyStore) -> Result {
+    static func run(legacyOpenRouterKey: String?, store: KeyStore) -> Result {
         var imported = 0
         var errors: [String] = []
-        if let value = legacy.openRouterKey, store.get(KeyAccount.openRouter) == nil {
+        if let value = legacyOpenRouterKey, store.get(KeyAccount.openRouter) == nil {
             do { try store.set(KeyAccount.openRouter, value: value); imported += 1 }
             catch { errors.append("OpenRouter: \(error.localizedDescription)") }
-        }
-        if let value = legacy.xaiKey, store.get(KeyAccount.xai) == nil {
-            do { try store.set(KeyAccount.xai, value: value); imported += 1 }
-            catch { errors.append("Grok (xAI): \(error.localizedDescription)") }
         }
         return Result(importedCount: imported, errors: errors)
     }

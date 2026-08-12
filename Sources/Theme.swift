@@ -412,8 +412,9 @@ enum ThemeSelfTests {
         precondition(ProviderAccent.forProvider("Claude") == .claude)
         precondition(ProviderAccent.forProvider("Codex") == .codex)
         precondition(ProviderAccent.forProvider("OpenRouter") == .neutral)
-        precondition(ProviderAccent.forProvider("Grok (xAI)") == .neutral)
-        precondition(ProviderAccent.forProvider("Antigravity") == .neutral)
+        // A provider with no bespoke accent — and an unrecognized name —
+        // must fall through to neutral rather than borrowing Claude's.
+        precondition(ProviderAccent.forProvider("Nonexistent") == .neutral)
         precondition(ProviderAccent.forSession(.claude) == .claude)
         precondition(ProviderAccent.forSession(.codex) == .codex)
     }

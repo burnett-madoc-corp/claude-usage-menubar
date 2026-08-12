@@ -2,16 +2,16 @@ import Foundation
 
 // MARK: - Provider identity
 
-/// Stable identifiers for the fixed provider registry (main.swift:367-377).
+/// Stable identifiers for the fixed provider registry (`Providers.all`).
 /// `displayName` matches each Provider's `name` string exactly — this is the
 /// one place that mapping lives, so the registry filter in Providers.all()
 /// never risks drifting from what's on screen.
 enum ProviderID: String, CaseIterable {
-    case claude, codex, antigravity, openrouter, grok
+    case claude, codex, openrouter
 
     /// Only Claude and Codex publish a headline value (main.swift:103,
-    /// Providers.swift:103) — the other three have nothing to put in the
-    /// title, so their "Menu bar" checkbox doesn't exist rather than being
+    /// Providers.swift:103) — OpenRouter has nothing to put in the title, so
+    /// its "Menu bar" checkbox doesn't exist rather than being
     /// disabled-but-visible.
     var supportsTitle: Bool { self == .claude || self == .codex }
 
@@ -19,9 +19,7 @@ enum ProviderID: String, CaseIterable {
         switch self {
         case .claude: return "Claude"
         case .codex: return "Codex"
-        case .antigravity: return "Antigravity"
         case .openrouter: return "OpenRouter"
-        case .grok: return "Grok (xAI)"
         }
     }
 

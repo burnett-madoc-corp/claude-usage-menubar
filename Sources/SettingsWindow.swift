@@ -16,7 +16,6 @@ final class SettingsWindowController: NSObject {
     /// the background poll needs the bounded store.
     private let keyStore: KeyStore = KeychainStore()
     private var openRouterRow: APIKeyRow!
-    private var grokRow: APIKeyRow!
     private var migrationBanner: NSStackView?
     private var justImportedCount: Int?
     private var importError: String?
@@ -207,25 +206,13 @@ final class SettingsWindowController: NSObject {
             account: KeyAccount.openRouter,
             envVarName: "OPENROUTER_API_KEY",
             keyStore: keyStore,
-            legacyValue: { Config.legacyKeys().openRouterKey },
+            legacyValue: { Config.legacyOpenRouterKey() },
             validate: { key in
                 let json = try await Net.getJSON(URL(string: "https://openrouter.ai/api/v1/credits")!, bearer: key)
                 return OpenRouterProvider.creditsMessage(from: json)
             }
         )
-        grokRow = APIKeyRow(
-            providerLabel: "Grok (xAI)",
-            account: KeyAccount.xai,
-            envVarName: "XAI_API_KEY",
-            keyStore: keyStore,
-            legacyValue: { Config.legacyKeys().xaiKey },
-            validate: { key in
-                let json = try await Net.getJSON(URL(string: "https://api.x.ai/v1/api-key")!, bearer: key)
-                return XAIProvider.keyHealthMessage(from: json)
-            }
-        )
         openRouterRow.onSaved = { [weak self] in self?.keyRowSaved() }
-        grokRow.onSaved = { [weak self] in self?.keyRowSaved() }
 
         let banner = NSStackView()
         banner.orientation = .vertical
@@ -233,7 +220,7 @@ final class SettingsWindowController: NSObject {
         banner.spacing = 4
         migrationBanner = banner
 
-        let stack = NSStackView(views: [header, openRouterRow.rowView(), grokRow.rowView(), banner])
+        let stack = NSStackView(views: [header, openRouterRow.rowView(), banner])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -246,13 +233,12 @@ final class SettingsWindowController: NSObject {
     /// should show. Called on every window open, never at app launch.
     private func refreshAPIKeysUI() {
         openRouterRow.refresh()
-        grokRow.refresh()
         refreshMigrationBanner()
     }
 
     /// A Save (or Import) changes exactly the state refreshMigrationBanner
-    /// depends on (a Keychain item appearing or disappearing), so both
-    /// row's onSaved routes here rather than each re-deriving the banner
+    /// depends on (a Keychain item appearing or disappearing), so the row's
+    /// onSaved routes here rather than re-deriving the banner
     /// independently.
     private func keyRowSaved() {
         justImportedCount = nil
@@ -295,14 +281,10 @@ final class SettingsWindowController: NSObject {
         // Keychain already won that key — no banner. Neither present (the
         // common case: no legacy file on this machine at all) means nothing
         // to offer, and that must render as no banner, not an error.
-        let legacy = Config.legacyKeys()
-        var importable = 0
-        if legacy.openRouterKey != nil, keyStore.get(KeyAccount.openRouter) == nil { importable += 1 }
-        if legacy.xaiKey != nil, keyStore.get(KeyAccount.xai) == nil { importable += 1 }
-        guard importable > 0 else { return }
+        guard Config.legacyOpenRouterKey() != nil, keyStore.get(KeyAccount.openRouter) == nil else { return }
 
         let label = NSTextField(wrappingLabelWithString:
-            "Found \(importable) key\(importable == 1 ? "" : "s") in ~/.config/claude-usage/config.json")
+            "Found 1 key in ~/.config/claude-usage/config.json")
         label.font = .systemFont(ofSize: 11)
         label.textColor = .secondaryLabelColor
         label.preferredMaxLayoutWidth = 380
@@ -318,11 +300,10 @@ final class SettingsWindowController: NSObject {
         // where the Keychain item is still absent — if it appeared between
         // refreshAPIKeysUI() and this click, Keychain already wins and we
         // must not clobber a value the user may have just typed and saved.
-        let result = LegacyImport.run(legacy: Config.legacyKeys(), store: keyStore)
+        let result = LegacyImport.run(legacyOpenRouterKey: Config.legacyOpenRouterKey(), store: keyStore)
         justImportedCount = result.importedCount
         importError = result.errors.isEmpty ? nil : result.errors.joined(separator: "; ")
         openRouterRow.refresh()
-        grokRow.refresh()
         refreshMigrationBanner()
     }
 
@@ -381,10 +362,11 @@ final class SettingsWindowController: NSObject {
 // MARK: - APIKeyRow
 
 /// One key's live row: a secure field, Test/Save buttons, and a status line
-/// — plus the logic behind them. One instance per key (OpenRouter, Grok);
-/// SettingsWindowController builds both once and calls refresh() every time
-/// the window opens, since the env-var override and Keychain/legacy state
-/// can all change between opens without an app restart.
+/// — plus the logic behind them. One instance per key, so it stays generic
+/// even though OpenRouter is currently the only one; SettingsWindowController
+/// builds it once and calls refresh() every time the window opens, since the
+/// env-var override and Keychain/legacy state can all change between opens
+/// without an app restart.
 @MainActor
 private final class APIKeyRow: NSObject, NSTextFieldDelegate {
     let providerLabel: String

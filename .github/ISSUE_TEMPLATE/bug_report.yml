@@ -23,9 +23,7 @@ body:
       options:
         - Claude
         - Codex
-        - Antigravity
         - OpenRouter
-        - Grok (xAI)
         - Sessions
         - Menu bar title / app itself
         - Not provider-specific

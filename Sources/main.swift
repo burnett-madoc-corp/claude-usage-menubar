@@ -929,7 +929,7 @@ enum Providers {
 
     /// `includeHidden` is the `--once` escape hatch: headless output is a
     /// diagnostic, not a display, so it deliberately ignores Prefs
-    /// visibility and always reports all five providers. The live menu bar
+    /// visibility and always reports every provider. The live menu bar
     /// (refresh(), applicationDidFinishLaunching) always calls the default,
     /// filtered form — a provider hidden from BOTH the dropdown and the
     /// title is not polled at all; one shown in either place is.
@@ -938,9 +938,7 @@ enum Providers {
         let providers: [Provider] = [
             ClaudeProvider(),
             CodexProvider(),
-            AntigravityProvider(),
             OpenRouterProvider(key: config.openRouterKey),
-            XAIProvider(key: config.xaiKey),
         ]
         if includeHidden { return providers }
         return providers.filter { shouldPoll(id: ProviderID(displayName: $0.name)) }
@@ -1115,16 +1113,16 @@ private func testKeychainCommand() {
     precondition(find.contains(service) && find.contains(KeyAccount.openRouter))
     precondition(find.contains("-w"), "without -w, security prints attributes and never the key")
 
-    let add = KeychainCommand.add(service: service, account: KeyAccount.xai, value: "xai-secret")
+    let add = KeychainCommand.add(service: service, account: KeyAccount.openRouter, value: "or-secret")
     precondition(add.first == "add-generic-password")
-    precondition(add.contains(service) && add.contains(KeyAccount.xai))
-    precondition(add.contains("xai-secret"))
+    precondition(add.contains(service) && add.contains(KeyAccount.openRouter))
+    precondition(add.contains("or-secret"))
     // The regression this guards: -U updates an existing item in place, which
     // needs decrypt authorization on it and so puts the approval dialog back
     // on screen for anything written by an older build. set deletes first.
     precondition(!add.contains("-U"), "add must not update in place")
 
-    let remove = KeychainCommand.delete(service: service, account: KeyAccount.xai)
+    let remove = KeychainCommand.delete(service: service, account: KeyAccount.openRouter)
     precondition(remove.first == "delete-generic-password")
     precondition(!remove.contains("-w"), "delete takes no value")
 
@@ -1144,10 +1142,10 @@ private func testKeychainCommand() {
 
 /// A read left parked behind an approval dialog must not be re-issued every
 /// poll — that is the difference between one dialog and an endless stream of
-/// them. Uses a scratch account so it cannot touch either real key.
+/// them. Uses a scratch account so it cannot touch the real key.
 private func testBlockedAccounts() {
     let scratch = "selftest_blocked_account"
-    precondition(scratch != KeyAccount.openRouter && scratch != KeyAccount.xai)
+    precondition(scratch != KeyAccount.openRouter)
     let blocked = BlockedAccounts.shared
     blocked.remove(scratch)
     precondition(!blocked.contains(scratch))
@@ -1332,13 +1330,9 @@ private func runSelfTests() {
     precondition(ProviderID(displayName: "Nonexistent") == nil)
     precondition(ProviderID.claude.displayName == "Claude")
     precondition(ProviderID.codex.displayName == "Codex")
-    precondition(ProviderID.antigravity.displayName == "Antigravity")
     precondition(ProviderID.openrouter.displayName == "OpenRouter")
-    precondition(ProviderID.grok.displayName == "Grok (xAI)")
     precondition(ProviderID.claude.supportsTitle && ProviderID.codex.supportsTitle)
-    precondition(!ProviderID.antigravity.supportsTitle
-                 && !ProviderID.openrouter.supportsTitle
-                 && !ProviderID.grok.supportsTitle)
+    precondition(!ProviderID.openrouter.supportsTitle)
 
     // Prefs — run against an isolated UserDefaults suite, never
     // UserDefaults.standard, so --self-test can't clobber the user's real
@@ -1360,8 +1354,8 @@ private func runSelfTests() {
         precondition(Prefs.showInDropdown(id) == true)
         precondition(Prefs.showInTitle(id) == true)
     }
-    Prefs.setShowInDropdown(.grok, false)
-    precondition(Prefs.showInDropdown(.grok) == false)
+    Prefs.setShowInDropdown(.openrouter, false)
+    precondition(Prefs.showInDropdown(.openrouter) == false)
     precondition(Prefs.showInDropdown(.claude) == true) // untouched keys stay default-true
     Prefs.setShowInTitle(.codex, false)
     precondition(Prefs.showInTitle(.codex) == false)
@@ -1383,8 +1377,8 @@ private func runSelfTests() {
     Prefs.setShowInDropdown(.claude, false); Prefs.setShowInTitle(.claude, false)
     precondition(!Providers.shouldPoll(id: .claude), "both hidden must not be polled")
 
-    Prefs.setShowInDropdown(.antigravity, false); Prefs.setShowInTitle(.antigravity, true) // no-op: doesn't support title
-    precondition(!Providers.shouldPoll(id: .antigravity),
+    Prefs.setShowInDropdown(.openrouter, false); Prefs.setShowInTitle(.openrouter, true) // no-op: doesn't support title
+    precondition(!Providers.shouldPoll(id: .openrouter),
                  "a non-title-capable provider's title flag must never matter")
     precondition(Providers.shouldPoll(id: nil), "an unrecognized provider id must default to polled")
 
@@ -1455,38 +1449,32 @@ private func runSelfTests() {
 
         // M4: env is tier 1 of the precedence being tested here, but unlike
         // Prefs.defaults/Config.legacyPath/the KeyStore it was never
-        // isolated — a real OPENROUTER_API_KEY/XAI_API_KEY in the runner's
-        // environment made "None present -> nil" false and crashed the run
-        // (SIGTRAP). Save and clear both up front, restore in the same
-        // defer that already restores legacyPath, so this block can never
-        // observe (or clobber) the user's real environment.
+        // isolated — a real OPENROUTER_API_KEY in the runner's environment
+        // made "None present -> nil" false and crashed the run (SIGTRAP).
+        // Save and clear it up front, restore in the same defer that already
+        // restores legacyPath, so this block can never observe (or clobber)
+        // the user's real environment.
         let savedOpenRouterEnv = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"]
-        let savedXaiEnv = ProcessInfo.processInfo.environment["XAI_API_KEY"]
         unsetenv("OPENROUTER_API_KEY")
-        unsetenv("XAI_API_KEY")
         defer {
             if let savedOpenRouterEnv { setenv("OPENROUTER_API_KEY", savedOpenRouterEnv, 1) } else { unsetenv("OPENROUTER_API_KEY") }
-            if let savedXaiEnv { setenv("XAI_API_KEY", savedXaiEnv, 1) } else { unsetenv("XAI_API_KEY") }
             Config.legacyPath = savedLegacyPath
             try? FileManager.default.removeItem(at: tempDir)
         }
 
         // None present -> nil.
         precondition(Config.load(store: fakeStore).openRouterKey == nil)
-        precondition(Config.load(store: fakeStore).xaiKey == nil)
 
-        // Legacy JSON alone (tier 3).
+        // Legacy JSON alone (tier 3). The now-unsupported "xai_key" is left
+        // in the fixture on purpose: a config.json written by an older build
+        // must still yield its OpenRouter key, not trip over the stale field.
         let legacyJSON = #"{"openrouter_key": "legacy-or", "xai_key": "legacy-xai"}"#
         try? legacyJSON.write(to: tempConfigPath, atomically: true, encoding: .utf8)
         precondition(Config.load(store: fakeStore).openRouterKey == "legacy-or")
-        precondition(Config.load(store: fakeStore).xaiKey == "legacy-xai")
 
-        // Keychain beats legacy JSON (tier 2 over tier 3) — only the key
-        // that's actually set in the fake is overridden; the untouched one
-        // still falls through to legacy.
+        // Keychain beats legacy JSON (tier 2 over tier 3).
         try? fakeStore.set(KeyAccount.openRouter, value: "keychain-or")
         precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or")
-        precondition(Config.load(store: fakeStore).xaiKey == "legacy-xai")
 
         // Env beats Keychain and legacy JSON (tier 1 over everything).
         setenv("OPENROUTER_API_KEY", "env-or", 1)
@@ -1508,7 +1496,6 @@ private func runSelfTests() {
         // machine per the plan: "no file" must not be an error).
         try? FileManager.default.removeItem(at: tempConfigPath)
         precondition(Config.load(store: fakeStore).openRouterKey == "keychain-or")
-        precondition(Config.load(store: fakeStore).xaiKey == nil) // never set in Keychain, legacy now gone too
     }
 
     // Empty-string-means-delete semantics (the Save button's contract,
@@ -1536,22 +1523,20 @@ private func runSelfTests() {
     // from "0 keys found to import").
     do {
         let store = FakeKeyStore()
-        let clean = LegacyImport.run(legacy: (openRouterKey: "or-1", xaiKey: "xai-1"), store: store)
-        precondition(clean.importedCount == 2 && clean.errors.isEmpty)
+        let clean = LegacyImport.run(legacyOpenRouterKey: "or-1", store: store)
+        precondition(clean.importedCount == 1 && clean.errors.isEmpty)
         precondition(store.get(KeyAccount.openRouter) == "or-1")
-        precondition(store.get(KeyAccount.xai) == "xai-1")
 
         // Already-present Keychain values are left untouched, not re-imported.
-        let noop = LegacyImport.run(legacy: (openRouterKey: "or-2", xaiKey: "xai-2"), store: store)
+        let noop = LegacyImport.run(legacyOpenRouterKey: "or-2", store: store)
         precondition(noop.importedCount == 0 && noop.errors.isEmpty)
         precondition(store.get(KeyAccount.openRouter) == "or-1", "an existing Keychain value must win, never be overwritten by import")
 
         let failingStore = FailingKeyStore()
-        let failed = LegacyImport.run(legacy: (openRouterKey: "or-3", xaiKey: "xai-3"), store: failingStore)
+        let failed = LegacyImport.run(legacyOpenRouterKey: "or-3", store: failingStore)
         precondition(failed.importedCount == 0, "a store failure must not be counted as a successful import")
-        precondition(failed.errors.count == 2, "both key failures must be reported, not just the first")
+        precondition(failed.errors.count == 1, "the key failure must be reported, not swallowed")
         precondition(failed.errors.contains { $0.contains("OpenRouter") })
-        precondition(failed.errors.contains { $0.contains("Grok") })
     }
 
     // KeychainStore must degrade, never crash, on a lookup miss — the same
@@ -1569,7 +1554,7 @@ private func runSelfTests() {
     do {
         let realStore = KeychainStore()
         let selfTestAccount = "selftest_key"
-        precondition(selfTestAccount != KeyAccount.openRouter && selfTestAccount != KeyAccount.xai)
+        precondition(selfTestAccount != KeyAccount.openRouter)
 
         try? realStore.delete(selfTestAccount) // clean slate if a prior run crashed mid-test
 
@@ -1625,8 +1610,8 @@ if CommandLine.arguments.contains("--once") {
     Task {
         // --once ignores visibility on purpose (Providers.all's doc
         // comment): headless output is a diagnostic, not a display, so it
-        // always reports all five providers regardless of what's hidden
-        // from the live dropdown/title.
+        // always reports every provider regardless of what's hidden from
+        // the live dropdown/title.
         for card in await Providers.loadAll(includeHidden: true) {
             print(card.provider)
             if let error = card.error { print("  \(error)") }
