@@ -112,19 +112,67 @@ enum KeychainCommand {
 /// Keychain item this app reads, and the code-identity gate it replaces was
 /// not buying confidentiality — an ad-hoc app cannot hold one — it was only
 /// buying a dialog.
+/// Accounts whose read parked behind an approval dialog, for the life of this
+/// process.
+///
+/// An item written by a build from before this app moved to `security` is
+/// pinned to that build's cdhash, so macOS will not hand it over without the
+/// login password — and it asks again on the next poll, and the one after
+/// that. Asking again after somebody has already left the dialog unanswered is
+/// nagging, not diligence.
+///
+/// Process-wide rather than per-instance because the polling path and the
+/// settings window hold separate `KeychainStore` values and must not each get
+/// their own turn to ask. Deliberately *not* persisted: a flag that outlives
+/// the process would silently ignore a perfectly good key after one bad
+/// moment, e.g. a login keychain that happened to be locked.
+final class BlockedAccounts: @unchecked Sendable {
+    static let shared = BlockedAccounts()
+    private let lock = NSLock()
+    private var accounts: Set<String> = []
+
+    func contains(_ account: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return accounts.contains(account)
+    }
+
+    func insert(_ account: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        accounts.insert(account)
+    }
+
+    func remove(_ account: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        accounts.remove(account)
+    }
+}
+
 struct KeychainStore: KeyStore {
 
     static let service = "local.claude-usage-menubar"
 
     func get(_ account: String) -> String? {
+        // A read nobody answered stays unanswered until something writes the
+        // account — writing repairs the item in passing, so the next read
+        // after a Save is worth making.
+        if BlockedAccounts.shared.contains(account) { return nil }
+
         switch KeychainCLI.read(KeychainCommand.find(service: Self.service, account: account)) {
         case .success(let data):
             return KeychainCommand.parse(data)
+        case .failure(.blocked):
+            BlockedAccounts.shared.insert(account)
+            return nil
         case .failure:
-            // Item absent, a locked login keychain (a headless --once over
-            // SSH), a Keychain that never answered — all degrade to "no key"
-            // rather than throwing, so Config.load falls through to the
-            // legacy JSON/no-key tiers instead of crashing.
+            // Item absent, or a locked login keychain (a headless --once over
+            // SSH) — both degrade to "no key" rather than throwing, so
+            // Config.load falls through to the legacy JSON/no-key tiers
+            // instead of crashing. Not recorded as blocked: these come back
+            // immediately and put nothing on screen, so retrying next poll
+            // costs nobody anything.
             return nil
         }
     }
@@ -144,6 +192,11 @@ struct KeychainStore: KeyStore {
             throw KeyStoreError.commandFailed(action: "save", code: code)
         }
 
+        // The item is this app's again, written through security like every
+        // other one, so whatever made it unreadable is gone. Cleared before
+        // the read-back below, which would otherwise short-circuit on it.
+        BlockedAccounts.shared.remove(account)
+
         // Read back before reporting success. `security` exits 0 having
         // stored an empty password if the value never reached it — measured,
         // not hypothetical — and a Settings window that says "Saved" over a
@@ -152,6 +205,7 @@ struct KeychainStore: KeyStore {
     }
 
     func delete(_ account: String) throws {
+        BlockedAccounts.shared.remove(account)
         switch KeychainCLI.read(KeychainCommand.delete(service: Self.service, account: account)) {
         case .success:
             return

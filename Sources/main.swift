@@ -1142,6 +1142,35 @@ private func testKeychainCommand() {
     precondition(KeychainCommand.duplicateItem == 45)
 }
 
+/// A read left parked behind an approval dialog must not be re-issued every
+/// poll — that is the difference between one dialog and an endless stream of
+/// them. Uses a scratch account so it cannot touch either real key.
+private func testBlockedAccounts() {
+    let scratch = "selftest_blocked_account"
+    precondition(scratch != KeyAccount.openRouter && scratch != KeyAccount.xai)
+    let blocked = BlockedAccounts.shared
+    blocked.remove(scratch)
+    precondition(!blocked.contains(scratch))
+
+    blocked.insert(scratch)
+    precondition(blocked.contains(scratch))
+    // Short-circuits before spawning security at all: a blocked account reads
+    // as "no key" without going near the Keychain.
+    let started = Date()
+    precondition(KeychainStore().get(scratch) == nil)
+    precondition(Date().timeIntervalSince(started) < 0.05,
+                 "a blocked account must not reach security(1) again")
+
+    // Writing the account repairs the item, so the block must lift with it —
+    // otherwise a user who re-saves their key still gets no key.
+    if (try? KeychainStore().set(scratch, value: "repaired")) != nil {
+        precondition(!blocked.contains(scratch), "a successful save must clear the block")
+        precondition(KeychainStore().get(scratch) == "repaired")
+        try? KeychainStore().delete(scratch)
+    }
+    blocked.remove(scratch)
+}
+
 private func testKeychainBounds() {
     // A command that never exits must come back as .blocked within the
     // timeout, not hang — this is the actual regression being prevented.
@@ -1581,6 +1610,7 @@ private func runSelfTests() {
     PollPolicySelfTests.run()
     testKeychainBounds()
     testKeychainCommand()
+    testBlockedAccounts()
 
     print("Self-tests passed")
 }

@@ -479,6 +479,13 @@ private final class APIKeyRow: NSObject, NSTextFieldDelegate {
         } else if hasKeychainValue {
             field.placeholderString = "•••••••• (saved)"
             statusLabel.stringValue = "Keychain: key stored"
+        } else if BlockedAccounts.shared.contains(account) {
+            // There *is* an item, it just cannot be read without an approval
+            // dialog nobody answered — almost always one written by a build
+            // from before this app used security. Saying "no key set" here
+            // would be a lie the user could not act on; saving repairs it.
+            field.placeholderString = ""
+            statusLabel.stringValue = "stored key unreadable — paste it again and Save to repair"
         } else if legacyValue() != nil {
             field.placeholderString = "•••••••• (from config.json)"
             statusLabel.stringValue = "using legacy config.json — import below to move it to the Keychain"
