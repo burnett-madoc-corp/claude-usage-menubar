@@ -142,7 +142,8 @@ Providers without a key simply show "no API key" — nothing else breaks.
 Every request is stateless: the client re-sends the **entire transcript** —
 system prompt, tool definitions, every earlier message, every tool result — as
 input, and gets a comparatively tiny output back. So a long session gets
-quadratically expensive in total and individually heavier per turn, which is
+disproportionately expensive in total — roughly 3× the input for 2× the turns —
+and individually heavier per turn, which is
 the whole reason the [Sessions](#sessions) section exists.
 
 ![Input composition by turn](docs/charts/07-input-composition-by-turn.svg)
