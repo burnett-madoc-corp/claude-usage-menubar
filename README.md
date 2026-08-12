@@ -9,23 +9,10 @@ menu bar title. Reset times, every other provider, and live agent sessions all
 live one click away — alongside a Settings window (⌘,) for provider
 visibility, refresh interval, and API keys.
 
-```
-[Claude] 5h 17%  wk 85%   [Codex] wk 42%  ← menu bar title (RAG coloured)
 
-Claude
-  5-hour   ██░░░░░░░░   17%   resets in 3h 23m
-  Weekly   █████████░   85%   resets in 1d 15h
-  Fable    ████░░░░░░   37%   resets in 1d 15h
-Codex
-  Weekly   ██████████  100%   resets in 59m
-  (plan: plus · as of 6d ago)
-Antigravity
-  gemini-2.5-pro        ░░░░░░░░░░   0%   resets in 23h 59m
-  gemini-3.1-flash-lite ░░░░░░░░░░   0%   resets in 23h 59m
-OpenRouter
-  Used     ██░░░░░░░░   18%   $1.80 of $10.00
-  Remaining                   $8.20
-```
+<img width="1310" height="1152" alt="image" src="https://github.com/user-attachments/assets/ea748222-95cd-4473-ac65-5bf9ab3b65a3" />
+
+
 
 ## Provider support
 
