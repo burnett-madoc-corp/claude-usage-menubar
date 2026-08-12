@@ -1,41 +1,128 @@
 import AppKit
 
+// MARK: - Sessions table geometry
+//
+// One fixed grid shared by the column-header line and every row, so the two
+// can never drift apart. Columns are pinned from the right edge inwards —
+// the numeric cells have fixed widths and the name/model cell absorbs
+// whatever is left, which is what keeps the numbers in a straight line while
+// project names vary wildly in length.
+enum SessionGrid {
+    static let dotColumn: CGFloat = 14
+    static let contextWidth: CGFloat = 76
+    static let multipleWidth: CGFloat = 44
+    static let turnsWidth: CGFloat = 34
+    static let inOutWidth: CGFloat = 72
+
+    static let rowHeight: CGFloat = 24
+    static let headerHeight: CGFloat = 16
+    static let barHeight: CGFloat = 5
+    static let dotDiameter: CGFloat = 8
+    static let expandedLineHeight: CGFloat = 13
+
+    struct Columns {
+        var dot: NSRect
+        var name: NSRect
+        var context: NSRect
+        var multiple: NSRect
+        var turns: NSRect
+        var inOut: NSRect
+
+        /// The no-usage state is the one cell content that cannot fit its own
+        /// column: "starting — no usage yet" is wider than the 76pt context
+        /// cell at any legible size. It is also the one state where the
+        /// neighbouring ×start cell is guaranteed empty — `xFloorMultiple` is
+        /// nil until there are deduped turns to divide — so those two cells
+        /// merge for that state only, rather than truncating the sentence to
+        /// "starting — n…" or inventing a shorter wording the rest of the app
+        /// doesn't use.
+        var contextSpanningMultiple: NSRect {
+            NSRect(x: context.minX, y: context.minY,
+                   width: multiple.maxX - context.minX, height: context.height)
+        }
+
+        /// Column headers are wider than the numbers they sit above — "TURNS"
+        /// does not fit the 34pt turns column and truncates to "TUR…". The
+        /// data cells keep their exact widths; only the header line is allowed
+        /// to reach back across the inter-column gap into the slack its
+        /// left-hand neighbour always has.
+        func headerCell(_ cell: NSRect) -> NSRect {
+            NSRect(x: cell.minX - Panel.columnGap, y: cell.minY,
+                   width: cell.width + Panel.columnGap, height: cell.height)
+        }
+    }
+
+    static func columns(width: CGFloat, y: CGFloat, height: CGFloat) -> Columns {
+        let right = width - Panel.inset
+        let inOutX = right - inOutWidth
+        let turnsX = inOutX - Panel.columnGap - turnsWidth
+        let multipleX = turnsX - Panel.columnGap - multipleWidth
+        let contextX = multipleX - Panel.columnGap - contextWidth
+        let nameX = Panel.inset + dotColumn
+        return Columns(
+            dot: NSRect(x: Panel.inset, y: y, width: dotColumn, height: height),
+            name: NSRect(x: nameX, y: y, width: max(0, contextX - Panel.columnGap - nameX), height: height),
+            context: NSRect(x: contextX, y: y, width: contextWidth, height: height),
+            multiple: NSRect(x: multipleX, y: y, width: multipleWidth, height: height),
+            turns: NSRect(x: turnsX, y: y, width: turnsWidth, height: height),
+            inOut: NSRect(x: inOutX, y: y, width: inOutWidth, height: height)
+        )
+    }
+}
+
 // MARK: - Detailed session row: pure composition helpers
 //
 // Fixture-tested the same way `UsageMenuBar.compactLine` is (see
-// `testCompactSessionRendering` in main.swift) — busy/idle, the ⌁N hint
-// absent at count 0, nil xFloor -> "—", unknown window, no-usage, and
-// pending reclaim. These are the ONLY parts of Detailed mode that get
-// self-tests: the view itself is a thin draw-time layer over these
-// strings and its own AgentSession, and drawing is not unit-tested (see
-// SessionRowView below, and the phase brief's note on that).
+// `testCompactSessionRendering` in main.swift) — busy/idle, nil xFloor -> "—",
+// unknown window, no-usage, and pending reclaim. These are the ONLY parts of
+// Detailed mode that get self-tests: the view itself is a thin draw-time layer
+// over these strings and its own AgentSession, and drawing is not unit-tested.
+//
+// Detailed no longer shares `sessionMultiple`/`sessionGauge` with Compact.
+// Those two still render the ASCII `3.2x` and a text `████░░ 42%` gauge, which
+// Compact mode and the `--once` printer both depend on verbatim; the table
+// below uses the `×` glyph and draws its context as a bar with no percentage
+// at all, so the two now compose their strings separately on purpose.
 enum DetailedSessionRow {
-    /// Line 1: busy dot (the *view* animates it; this plain-text form
-    /// always renders the static glyph), session name, xFloor multiple,
-    /// and the `⌁N` compaction hint (absent at count 0 — never "⌁0").
-    nonisolated static func line1(for session: AgentSession) -> String {
-        let dot = session.busy ? "●" : "○"
-        let multiple = UsageMenuBar.sessionMultiple(for: session)
-        let hint = UsageMenuBar.sessionCompactHint(for: session)
-        return "\(dot) \(session.label)   \(multiple)\(hint)"
+    /// The session's own identity cell: project label, then the shortened
+    /// model. Kept as one string for the accessibility text and self-tests;
+    /// the view draws the two halves in different fonts and colours.
+    nonisolated static func nameAndModel(for session: AgentSession) -> String {
+        guard let model = session.model else { return session.label }
+        return "\(session.label)  \(Display.shortModel(model))"
     }
 
-    /// Line 2: model, context bar + %, turns, raw in/out totals. Turns and
-    /// totals are omitted entirely while `hasUsage` is false — the gauge's
-    /// own "starting — no usage yet" text already carries that state.
-    nonisolated static func line2(for session: AgentSession) -> String {
-        let model = session.model ?? "unknown model"
-        let gauge = UsageMenuBar.sessionGauge(for: session)
-        guard session.hasUsage else { return "\(model)   \(gauge)" }
-        let totals = "\(Format.tokens(session.inputTokens)) in / \(Format.tokens(session.outputTokens)) out"
-        return "\(model)   \(gauge)   \(session.turns) turns   \(totals)"
+    /// The ×start multiple, with the `×` glyph. `nil` still reads "—", never
+    /// a fabricated 1.0.
+    nonisolated static func multiple(for session: AgentSession) -> String {
+        Display.multiple(session.xFloorMultiple)
     }
 
-    /// Click-to-expand detail: cwd, last-compaction reclaim (pre -> post,
-    /// %; "reclaim —" while pending, never 0 or 100%), and subagent burn
-    /// when present. Zero compactions renders no compaction line at all —
-    /// absence of the marker is the display, matching the Compact tooltip's
-    /// rule (`UsageMenuBar.sessionTooltip`).
+    /// What the context cell says when it cannot draw a bar. `nil` means the
+    /// cell draws a bar instead — a 0% bar must never stand in for any of
+    /// these, which would read as an empty context, the opposite of the truth.
+    nonisolated static func contextFallback(for session: AgentSession) -> String? {
+        if !session.hasUsage { return "starting — no usage yet" }
+        if session.contextPercent != nil { return nil }
+        if session.contextTokens != nil { return "window unknown" }
+        return "context —"
+    }
+
+    /// Turns and in/out are omitted entirely while `hasUsage` is false — the
+    /// context cell's own "starting — no usage yet" already carries that state,
+    /// and "0" in a graded column would read as a real measurement.
+    nonisolated static func turnsText(for session: AgentSession) -> String {
+        session.hasUsage ? "\(session.turns)" : ""
+    }
+
+    nonisolated static func inOutText(for session: AgentSession) -> String {
+        session.hasUsage ? Display.inOut(input: session.inputTokens, output: session.outputTokens) : ""
+    }
+
+    /// Click-to-expand detail: cwd, last-compaction reclaim (pre -> post, %;
+    /// "reclaim —" while pending, never 0 or 100%), and subagent burn when
+    /// present. Zero compactions renders no compaction line at all — absence
+    /// of the marker is the display, matching the Compact tooltip's rule.
     nonisolated static func expandedText(for session: AgentSession) -> String {
         var lines: [String] = [session.cwd]
         if session.compactionCount > 0 {
@@ -59,35 +146,74 @@ enum DetailedSessionRow {
         return lines.joined(separator: "\n")
     }
 
-    /// Full-content accessibility label — name, model, context %, multiple,
-    /// turns — the same idea as `button.setAccessibilityLabel` already
-    /// carries for the menu-bar title (main.swift's renderTitle).
+    /// Full-content accessibility label. The context percentage is no longer
+    /// drawn anywhere on the row — the cell is a bare bar — so this is now the
+    /// only place that value is stated, and it is stated as what it is: the
+    /// bar's value.
     nonisolated static func accessibilityLabel(for session: AgentSession) -> String {
         var parts: [String] = [session.busy ? "busy" : "idle", session.label]
-        if let model = session.model { parts.append(model) }
+        if let model = session.model { parts.append(Display.shortModel(model)) }
         if let percent = session.contextPercent {
-            parts.append("\(percent) percent context")
-        } else if !session.hasUsage {
-            parts.append("no usage yet")
+            parts.append("context bar \(percent) percent")
+        } else if let fallback = contextFallback(for: session) {
+            parts.append(fallback)
         }
-        parts.append("multiple " + UsageMenuBar.sessionMultiple(for: session))
-        if session.hasUsage { parts.append("\(session.turns) turns") }
+        parts.append("multiple " + multiple(for: session))
+        if session.hasUsage {
+            parts.append("\(session.turns) turns")
+            parts.append(inOutText(for: session) + " in and out")
+        }
         if session.compactionCount > 0 { parts.append("\(session.compactionCount) compactions") }
         return parts.joined(separator: ", ")
     }
+
+    /// The tiny uppercase column-header line above the table. Exposed as text
+    /// so the header view and the accessibility label agree on the wording.
+    nonisolated static let columnHeaders =
+        (name: "SESSION · MODEL", context: "CONTEXT", multiple: "×START", turns: "TURNS", inOut: "IN/OUT")
 }
 
-// MARK: - Detailed session row view (Phase 4c)
+// MARK: - Column-header line
+
+@MainActor
+final class SessionHeaderView: NSView {
+    init(width: CGFloat) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: SessionGrid.headerHeight))
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("SessionHeaderView does not support NSCoding")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let columns = SessionGrid.columns(width: bounds.width, y: 0, height: bounds.height)
+        let font = PanelFont.text(10, .medium)
+        let color = NSColor.tertiaryLabelColor
+        let headers = DetailedSessionRow.columnHeaders
+        Draw.text(headers.name, font: font, color: color, in: columns.name)
+        Draw.text(headers.context, font: font, color: color, in: columns.context)
+        Draw.text(headers.multiple, font: font, color: color,
+                  in: columns.headerCell(columns.multiple), alignment: .right)
+        Draw.text(headers.turns, font: font, color: color,
+                  in: columns.headerCell(columns.turns), alignment: .right)
+        Draw.text(headers.inOut, font: font, color: color,
+                  in: columns.headerCell(columns.inOut), alignment: .right)
+    }
+}
+
+// MARK: - Detailed session row view
 //
-// The first custom-view NSMenuItem surface in this app. Everything
-// attributedTitle rows get for free — highlight, sizing, dark-mode colour
-// resolution, accessibility, and the fact that a click just works — has to
-// be hand-rolled here. Each subsection below is one of the plan's five
-// numbered Detailed-mode obligations.
+// A custom NSMenuItem.view. Everything attributedTitle rows get for free —
+// highlight, sizing, dark-mode colour resolution, accessibility, and the fact
+// that a click just works — has to be hand-rolled here. Each subsection below
+// is one of the plan's five numbered Detailed-mode obligations; the redesign
+// changed what is drawn inside draw(_:), not any of those five mechanisms.
 @MainActor
 final class SessionRowView: NSView {
-    private static let collapsedHeight: CGFloat = 34
-    private static let expandedLineHeight: CGFloat = 13
+    private static let expandedPadding: CGFloat = 8
 
     private(set) var session: AgentSession
     private(set) var isExpanded: Bool
@@ -97,17 +223,18 @@ final class SessionRowView: NSView {
 
     /// Lets the owner (UsageMenuBar) persist expanded state per session key
     /// across a full menu rebuild, not just an in-place update — a session
-    /// reordering (new usage landing while the menu is open) forces a
-    /// rebuild that recreates this view from scratch, and the obligation is
-    /// that expansion survives that too, not only the common in-place path.
+    /// reordering (severity changing while the menu is open) forces a rebuild
+    /// that recreates this view from scratch, and the obligation is that
+    /// expansion survives that too, not only the common in-place path.
     var onToggleExpanded: ((Bool) -> Void)?
 
     init(session: AgentSession, width: CGFloat, expanded: Bool, animate: Bool) {
         self.session = session
         self.rowWidth = width
         self.isExpanded = expanded
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: Self.collapsedHeight))
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: SessionGrid.rowHeight))
         updateAccessibilityLabel()
+        toolTip = UsageMenuBar.sessionTooltip(for: session)
         applySize()
         if animate { startAnimatingIfNeeded() }
     }
@@ -116,22 +243,22 @@ final class SessionRowView: NSView {
         fatalError("SessionRowView does not support NSCoding")
     }
 
-    /// Top-left origin: line layout below reads far more naturally top-down
-    /// than in AppKit's default bottom-left coordinate system.
+    /// Top-left origin: the grid above reads far more naturally top-down than
+    /// in AppKit's default bottom-left coordinate system.
     override var isFlipped: Bool { true }
 
     // MARK: - Update in place
     //
-    // main.swift's applySessionUpdates() calls this on the SAME view
-    // instance instead of recreating it, for exactly the reason addRow's
-    // Compact patch-in-place already exists: rebuilding a visible menu
-    // destroys the item under the cursor. Detailed raises the stakes — a
-    // rebuild would also collapse an expanded row and restart the dot
-    // animation — so both isExpanded and dotTimer are left untouched here
-    // except where the new data itself demands a change (busy -> idle).
+    // main.swift's applySessionUpdates() calls this on the SAME view instance
+    // instead of recreating it: rebuilding a visible menu destroys the item
+    // under the cursor, which would also collapse an expanded row, drop its
+    // tooltip and restart the dot animation. So both isExpanded and dotTimer
+    // are left untouched here except where the new data itself demands a
+    // change (busy -> idle).
     func update(session: AgentSession, animate: Bool) {
         self.session = session
         updateAccessibilityLabel()
+        toolTip = UsageMenuBar.sessionTooltip(for: session)
         if session.busy, animate {
             startAnimatingIfNeeded()
         } else {
@@ -141,15 +268,6 @@ final class SessionRowView: NSView {
         needsDisplay = true
     }
 
-    /// Obligation 2 (explicit sizing) also covers width: it is computed
-    /// once per rebuild by the owner (see UsageMenuBar.computeDetailedRowWidth)
-    /// and pushed down here, never recomputed per frame.
-    func setWidth(_ width: CGFloat) {
-        guard width != rowWidth else { return }
-        rowWidth = width
-        applySize()
-    }
-
     private func updateAccessibilityLabel() {
         setAccessibilityElement(true)
         setAccessibilityLabel(DetailedSessionRow.accessibilityLabel(for: session))
@@ -157,16 +275,16 @@ final class SessionRowView: NSView {
 
     // MARK: - Obligation 2: explicit sizing
     //
-    // NSMenu auto-measures attributed-title rows but does nothing of the
-    // kind for a custom view — the frame set here IS the row's size as far
-    // as NSMenu is concerned. Recomputed only when content that affects it
+    // NSMenu auto-measures attributed-title rows but does nothing of the kind
+    // for a custom view — the frame set here IS the row's size as far as
+    // NSMenu is concerned. Recomputed only when content that affects it
     // actually changes (construction, an update, or a click), never inside
     // draw(_:).
     private func applySize() {
-        var height = Self.collapsedHeight
+        var height = SessionGrid.rowHeight
         if isExpanded {
             let lineCount = max(1, DetailedSessionRow.expandedText(for: session).split(separator: "\n").count)
-            height += CGFloat(lineCount) * Self.expandedLineHeight + 10
+            height += CGFloat(lineCount) * SessionGrid.expandedLineHeight + Self.expandedPadding
         }
         if frame.width != rowWidth || frame.height != height {
             setFrameSize(NSSize(width: rowWidth, height: height))
@@ -175,15 +293,15 @@ final class SessionRowView: NSView {
 
     // MARK: - Obligation 3: the pulsing-dot run-loop trap
     //
-    // NSMenu runs a modal event-tracking loop while open, so a timer added
-    // on the default run-loop mode would freeze the instant the dot is
-    // visible. `.common` mode is the fix, mirroring the exact precedent
-    // already in this file's sibling (main.swift's refresh timer and
-    // sessions tick both do the same, for the same reason).
+    // NSMenu runs a modal event-tracking loop while open, so a timer added on
+    // the default run-loop mode would freeze the instant the dot is visible.
+    // `.common` mode is the fix, mirroring the precedent already in this
+    // file's sibling (main.swift's refresh timer and sessions tick both do the
+    // same, for the same reason).
     //
     // Idempotent by design (guarded on dotTimer == nil): a tick's repeated
-    // calls into update() must never restart the animation or reset its
-    // phase, only keep it running.
+    // calls into update() must never restart the animation or reset its phase,
+    // only keep it running.
     func startAnimatingIfNeeded() {
         guard dotTimer == nil else { return }
         let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -197,10 +315,10 @@ final class SessionRowView: NSView {
         dotTimer = t
     }
 
-    /// Called from main.swift's menuDidClose for every live detailed row —
-    /// an animation timer running while the menu is shut is pure waste.
-    /// Also called from update() the moment a session stops being busy,
-    /// even while the menu stays open.
+    /// Called from main.swift's menuDidClose for every live detailed row — an
+    /// animation timer running while the menu is shut is pure waste. Also
+    /// called from update() the moment a session stops being busy, even while
+    /// the menu stays open.
     func stopAnimating() {
         dotTimer?.invalidate()
         dotTimer = nil
@@ -208,14 +326,13 @@ final class SessionRowView: NSView {
 
     // MARK: - Obligation 1: hand-drawn highlight/selection
     //
-    // A custom view inherits no hover/selection rendering at all. NSMenu
-    // still tracks NSMenuItem.isHighlighted for a view-based item as the
-    // mouse moves over it, but it never redraws the view on its own — a
-    // tracking area's only job here is to trigger needsDisplay at the right
-    // moments. The highlight state actually drawn always comes straight
-    // from enclosingMenuItem?.isHighlighted at draw time (see draw(_:)
-    // below), never a locally tracked flag, so it can never drift from
-    // what NSMenu itself believes is highlighted.
+    // A custom view inherits no hover/selection rendering at all. NSMenu still
+    // tracks NSMenuItem.isHighlighted for a view-based item as the mouse
+    // moves, but never redraws the view on its own — a tracking area's only
+    // job here is to trigger needsDisplay at the right moments. The highlight
+    // state actually drawn always comes straight from
+    // enclosingMenuItem?.isHighlighted at draw time, never a locally tracked
+    // flag, so it can never drift from what NSMenu believes is highlighted.
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         for area in trackingAreas { removeTrackingArea(area) }
@@ -232,11 +349,10 @@ final class SessionRowView: NSView {
     // MARK: - Obligation 5: click-to-expand without dismissing the menu
     //
     // The NSMenuItem this view backs is built with action == nil (see
-    // UsageMenuBar.addDetailedSessionRow), so NSMenu never treats a click
-    // here as a selection that should close the menu. mouseDown is
-    // consumed (not forwarded to super) purely so nothing above this view
-    // mistakes the press for anything else; the actual toggle happens on
-    // mouseUp.
+    // UsageMenuBar.addDetailedSessionRow), so NSMenu never treats a click here
+    // as a selection that should close the menu. mouseDown is consumed (not
+    // forwarded to super) purely so nothing above this view mistakes the press
+    // for anything else; the actual toggle happens on mouseUp.
     override func mouseDown(with event: NSEvent) {
         // Intentionally consumed, no-op — see comment above.
     }
@@ -253,9 +369,9 @@ final class SessionRowView: NSView {
     /// NSMenu has no public "resize this item in place" API. Removing and
     /// immediately reinserting the same NSMenuItem at its own index is the
     /// standard workaround: it forces NSMenu to recompute geometry for the
-    /// still-open menu without closing it. The item and this view are the
-    /// same objects throughout, so session data, isExpanded, and the
-    /// animation timer all survive untouched.
+    /// still-open menu without closing it. The item and this view are the same
+    /// objects throughout, so session data, isExpanded, and the animation
+    /// timer all survive untouched.
     private func requestMenuRelayout() {
         guard let item = enclosingMenuItem, let menu = item.menu else { return }
         let index = menu.index(of: item)
@@ -267,112 +383,158 @@ final class SessionRowView: NSView {
     // MARK: - Obligation 4: dark mode and accessibility by hand
     //
     // Every colour below is resolved right here, at draw time, from the
-    // dynamic system colours — never baked into a stored value — so a live
-    // light/dark switch, or an accessibility contrast change, is picked up
-    // on the very next redraw with no extra plumbing. The accessibility
-    // label itself is kept current by updateAccessibilityLabel(), called
-    // from both init and update(session:).
+    // dynamic system colours and the dynamic accents in Theme.swift — never
+    // baked into a stored value — so a live light/dark switch, or an
+    // accessibility contrast change, is picked up on the very next redraw with
+    // no extra plumbing. The accessibility label itself is kept current by
+    // updateAccessibilityLabel(), called from both init and update(session:).
     override func draw(_ dirtyRect: NSRect) {
         let highlighted = enclosingMenuItem?.isHighlighted ?? false
-
         (highlighted ? NSColor.selectedContentBackgroundColor : NSColor.clear).setFill()
         bounds.fill()
 
-        let labelColor: NSColor = highlighted ? .selectedMenuItemTextColor : .labelColor
-        let secondaryColor: NSColor = highlighted ? .selectedMenuItemTextColor : .secondaryLabelColor
-        let severityColor: NSColor = highlighted ? .selectedMenuItemTextColor : session.severity.color
-        let monoFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let smallFont = NSFont.systemFont(ofSize: 10)
+        let columns = SessionGrid.columns(width: rowWidth, y: 0, height: SessionGrid.rowHeight)
+        // Under highlight the whole row collapses to the selected-text colour:
+        // the accent and grading hues are tuned against the menu background,
+        // not against a saturated selection fill.
+        let accent = highlighted ? NSColor.selectedMenuItemTextColor : ProviderAccent.forSession(session.kind).color
+        let label = highlighted ? NSColor.selectedMenuItemTextColor : NSColor.labelColor
+        let secondary = highlighted ? NSColor.selectedMenuItemTextColor : NSColor.secondaryLabelColor
+        let severity = highlighted ? NSColor.selectedMenuItemTextColor : session.severity.color
 
-        drawLine1(labelColor: labelColor, severityColor: severityColor, secondaryColor: secondaryColor, font: monoFont, y: 6)
-        drawLine2(secondaryColor: secondaryColor, severityColor: severityColor, font: monoFont,
-                  y: 6 + Self.expandedLineHeight + 4)
+        drawDot(in: columns.dot, accent: accent)
+        drawName(in: columns.name, label: label, accent: accent)
+        drawContext(columns: columns, severity: severity, secondary: secondary)
+        drawMultiple(in: columns.multiple, severity: severity)
+        drawTurns(in: columns.turns, highlighted: highlighted)
+        drawInOut(in: columns.inOut, highlighted: highlighted, secondary: secondary)
 
-        if isExpanded {
-            let text = DetailedSessionRow.expandedText(for: session)
-            let rect = NSRect(x: 18, y: Self.collapsedHeight,
-                               width: max(0, rowWidth - 26), height: max(0, frame.height - Self.collapsedHeight))
-            (text as NSString).draw(in: rect, withAttributes: [.font: smallFont, .foregroundColor: secondaryColor])
-        }
+        guard isExpanded else { return }
+        let text = DetailedSessionRow.expandedText(for: session)
+        let x = columns.name.minX
+        let rect = NSRect(x: x, y: SessionGrid.rowHeight,
+                          width: max(0, rowWidth - Panel.inset - x),
+                          height: max(0, frame.height - SessionGrid.rowHeight))
+        (text as NSString).draw(in: rect, withAttributes: [
+            .font: PanelFont.text(10), .foregroundColor: secondary,
+        ])
     }
 
-    private func drawLine1(labelColor: NSColor, severityColor: NSColor, secondaryColor: NSColor, font: NSFont, y: CGFloat) {
-        let line = NSMutableAttributedString()
-        func append(_ text: String, _ color: NSColor) {
-            line.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
-        }
-        // The dot is the one piece of Detailed line 1 the pure DetailedSessionRow.line1(for:)
-        // helper cannot express: it animates (dotPhaseOn) here, but always
-        // renders statically when idle, matching the plan's "static ○ otherwise".
-        append(session.busy ? (dotPhaseOn ? "●" : "○") : "○", labelColor)
-        append("  \(session.label)", labelColor)
-        append("   " + UsageMenuBar.sessionMultiple(for: session), severityColor)
-        let hint = UsageMenuBar.sessionCompactHint(for: session)
-        if !hint.isEmpty { append(" " + hint.trimmingCharacters(in: .whitespaces), secondaryColor) }
-        line.draw(at: NSPoint(x: 10, y: y))
+    /// The provider dot replaces the old white ●/○ glyph pair: colour now
+    /// carries which provider the session belongs to, and fill carries busy.
+    /// The pulse modulates the filled dot's alpha rather than swapping it for
+    /// the hollow one, so "filled means busy" holds at every phase.
+    private func drawDot(in rect: NSRect, accent: NSColor) {
+        let pulsing = session.busy && dotTimer != nil && !dotPhaseOn
+        Draw.dot(centeredIn: rect, diameter: SessionGrid.dotDiameter,
+                 color: pulsing ? accent.withAlphaComponent(0.45) : accent,
+                 filled: session.busy)
     }
 
-    private func drawLine2(secondaryColor: NSColor, severityColor: NSColor, font: NSFont, y: CGFloat) {
-        let line = NSMutableAttributedString()
-        func append(_ text: String, _ color: NSColor) {
-            line.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
+    private func drawName(in rect: NSRect, label: NSColor, accent: NSColor) {
+        var runs: [(String, NSFont, NSColor)] = [(session.label, PanelFont.text(13, .semibold), label)]
+        if !session.matched {
+            runs.append(("(?)", PanelFont.text(10), label))
         }
-        append(session.model ?? "unknown model", secondaryColor)
-        append("  " + UsageMenuBar.sessionGauge(for: session), session.contextPercent != nil ? severityColor : secondaryColor)
-        if session.hasUsage {
-            append("  \(session.turns)t", secondaryColor)
-            append("  \(Format.tokens(session.inputTokens))in/\(Format.tokens(session.outputTokens))out", secondaryColor)
+        if let model = session.model {
+            runs.append(("  " + Display.shortModel(model), PanelFont.text(10), accent))
         }
-        line.draw(at: NSPoint(x: 10, y: y))
+        Draw.runs(runs, in: rect)
+    }
+
+    private func drawContext(columns: SessionGrid.Columns, severity: NSColor, secondary: NSColor) {
+        guard let fallback = DetailedSessionRow.contextFallback(for: session) else {
+            let percent = session.contextPercent ?? 0
+            let rect = columns.context
+            Draw.track(in: NSRect(x: rect.minX, y: rect.midY - SessionGrid.barHeight / 2,
+                                  width: rect.width, height: SessionGrid.barHeight),
+                       fraction: Double(percent) / 100, fill: severity)
+            return
+        }
+        let cell = session.hasUsage ? columns.context : columns.contextSpanningMultiple
+        Draw.text(fallback, font: PanelFont.text(10), color: secondary, in: cell)
+    }
+
+    private func drawMultiple(in rect: NSRect, severity: NSColor) {
+        // Suppressed only where the no-usage text has already borrowed this
+        // cell — everywhere else a nil multiple still draws its own "—".
+        guard session.hasUsage else { return }
+        Draw.text(DetailedSessionRow.multiple(for: session),
+                  font: PanelFont.number(11, .bold), color: severity, in: rect, alignment: .right)
+    }
+
+    private func drawTurns(in rect: NSRect, highlighted: Bool) {
+        let text = DetailedSessionRow.turnsText(for: session)
+        guard !text.isEmpty else { return }
+        let color = highlighted ? NSColor.selectedMenuItemTextColor : Grade.turnsColor(session.turns)
+        Draw.text(text, font: PanelFont.number(11), color: color, in: rect, alignment: .right)
+    }
+
+    private func drawInOut(in rect: NSRect, highlighted: Bool, secondary: NSColor) {
+        guard session.hasUsage else { return }
+        let font = PanelFont.number(10)
+        let inputColor = highlighted ? NSColor.selectedMenuItemTextColor : Grade.inputColor(session.inputTokens)
+        let outputColor = highlighted ? NSColor.selectedMenuItemTextColor : Grade.outputColor(session.outputTokens)
+        Draw.runs([
+            (Format.tokens(session.inputTokens), font, inputColor),
+            (Display.inOutSeparator, font, secondary),
+            (Format.tokens(session.outputTokens), font, outputColor),
+        ], in: rect, alignment: .right)
     }
 }
 
 // MARK: - Self-tests
 //
 // Data-side only, per the phase brief ("do not attempt to unit-test
-// drawing"): every pure composition helper in DetailedSessionRow gets
-// fixture coverage mirroring testCompactSessionRendering's fixtures
-// (busy/idle, ⌁N absent at 0, nil xFloor -> "—", unknown window, no-usage,
-// pending reclaim), using the same makeSession(...) fixture builder
-// main.swift's Compact self-tests already define.
+// drawing"): every pure composition helper in DetailedSessionRow gets fixture
+// coverage mirroring testCompactSessionRendering's fixtures, using the same
+// makeSession(...) builder main.swift's Compact self-tests already define.
 
 enum DetailedSessionRowSelfTests {
     static func run() {
-        testLine1()
-        testLine2()
+        testNameAndModel()
+        testCells()
         testExpandedText()
         testAccessibilityLabel()
+        testGrid()
     }
 
-    private static func testLine1() {
-        precondition(DetailedSessionRow.line1(for: makeSession(busy: true)).hasPrefix("●"))
-        precondition(DetailedSessionRow.line1(for: makeSession(busy: false)).hasPrefix("○"))
-
-        precondition(!DetailedSessionRow.line1(for: makeSession(compactionCount: 0)).contains("⌁"),
-                     "⌁0 must never render — absence of compactions is the display")
-        precondition(DetailedSessionRow.line1(for: makeSession(compactionCount: 2)).contains("⌁2"))
-
-        precondition(DetailedSessionRow.line1(for: makeSession(xFloorMultiple: nil)).contains("—"),
-                     "nil xFloor must render as — never a fabricated 1.0x")
-        precondition(DetailedSessionRow.line1(for: makeSession(xFloorMultiple: 4.5)).contains("4.5x"))
+    private static func testNameAndModel() {
+        let named = DetailedSessionRow.nameAndModel(for: makeSession(label: "sqlmesh-be"))
+        precondition(named.contains("sqlmesh-be"))
+        precondition(named.contains("opus-5"), "the model is shortened for the row")
+        precondition(!named.contains("claude-opus-5"), "the vendor prefix is dropped")
     }
 
-    private static func testLine2() {
-        let unknownWindow = makeSession(contextTokens: 488_000, contextWindow: nil)
-        let unknownLine = DetailedSessionRow.line2(for: unknownWindow)
-        precondition(unknownLine.contains("window unknown"))
-        precondition(!unknownLine.contains("█") && !unknownLine.contains("░"),
-                     "no bar beats a fabricated denominator")
+    private static func testCells() {
+        // The multiple uses the × glyph now, and nil is still never 1.0.
+        precondition(DetailedSessionRow.multiple(for: makeSession(xFloorMultiple: 4.5)) == "4.5×")
+        precondition(DetailedSessionRow.multiple(for: makeSession(xFloorMultiple: nil)) == "—")
+        precondition(!DetailedSessionRow.multiple(for: makeSession(xFloorMultiple: 4.5)).contains("x"))
 
-        let noUsage = makeSession(turns: 0, contextTokens: nil, contextWindow: nil, hasUsage: false)
-        let noUsageLine = DetailedSessionRow.line2(for: noUsage)
-        precondition(noUsageLine.contains("starting — no usage yet"))
-        precondition(!noUsageLine.contains("turns"), "turns must not render for a session with no usage yet")
-
+        // A known window draws a bar and nothing else — the percentage is no
+        // longer composed into any string on the row.
         let normal = makeSession(contextTokens: 84_000, contextWindow: 200_000)
-        let normalLine = DetailedSessionRow.line2(for: normal)
-        precondition(normalLine.contains("42%"))
-        precondition(normalLine.contains("in / "))
+        precondition(DetailedSessionRow.contextFallback(for: normal) == nil,
+                     "a known context window draws a bar, not text")
+        precondition(!DetailedSessionRow.nameAndModel(for: normal).contains("%"))
+        precondition(!DetailedSessionRow.turnsText(for: normal).contains("%"))
+        precondition(!DetailedSessionRow.inOutText(for: normal).contains("%"),
+                     "no cell on the row carries a context percentage any more")
+
+        // Unknown window: text, never a 0% bar standing in for unknown.
+        let unknownWindow = makeSession(contextTokens: 488_000, contextWindow: nil)
+        precondition(DetailedSessionRow.contextFallback(for: unknownWindow) == "window unknown")
+
+        // No usage yet: the state text, and no turns or totals at all.
+        let noUsage = makeSession(turns: 0, contextTokens: nil, contextWindow: nil, hasUsage: false)
+        precondition(DetailedSessionRow.contextFallback(for: noUsage) == "starting — no usage yet")
+        precondition(DetailedSessionRow.turnsText(for: noUsage).isEmpty,
+                     "turns must not render for a session with no usage yet")
+        precondition(DetailedSessionRow.inOutText(for: noUsage).isEmpty)
+
+        precondition(DetailedSessionRow.turnsText(for: makeSession(turns: 137)) == "137")
+        precondition(DetailedSessionRow.inOutText(for: normal).contains(" / "))
     }
 
     private static func testExpandedText() {
@@ -412,9 +574,50 @@ enum DetailedSessionRowSelfTests {
         let idleLabel = DetailedSessionRow.accessibilityLabel(for: makeSession(busy: false))
         precondition(idleLabel.contains("idle"))
 
+        // The percentage is gone from the drawn row, so the accessibility text
+        // is now the only place it is stated — and it states it as the bar's value.
+        let normal = DetailedSessionRow.accessibilityLabel(
+            for: makeSession(contextTokens: 84_000, contextWindow: 200_000)
+        )
+        precondition(normal.contains("context bar 42 percent"))
+
         let noUsageLabel = DetailedSessionRow.accessibilityLabel(
             for: makeSession(turns: 0, contextTokens: nil, contextWindow: nil, hasUsage: false)
         )
         precondition(noUsageLabel.contains("no usage yet"))
+    }
+
+    private static func testGrid() {
+        let columns = SessionGrid.columns(width: Panel.width, y: 0, height: SessionGrid.rowHeight)
+        // Columns march left to right without overlapping, and the last one
+        // ends exactly on the panel's right margin.
+        precondition(columns.dot.maxX <= columns.name.minX)
+        precondition(columns.name.maxX <= columns.context.minX)
+        precondition(columns.context.maxX <= columns.multiple.minX)
+        precondition(columns.multiple.maxX <= columns.turns.minX)
+        precondition(columns.turns.maxX <= columns.inOut.minX)
+        precondition(columns.inOut.maxX == Panel.width - Panel.inset)
+        precondition(columns.name.width > 0, "the flexible name column must survive the fixed ones")
+
+        // The merged no-usage cell covers both columns it borrows, and only those.
+        let merged = columns.contextSpanningMultiple
+        precondition(merged.minX == columns.context.minX)
+        precondition(merged.maxX == columns.multiple.maxX)
+        precondition(merged.width > columns.context.width)
+
+        // Header cells reach back into the gap so "TURNS" fits above a 34pt
+        // column, without moving the data cell's own right edge.
+        let headerFont = PanelFont.text(10, .medium)
+        for (title, cell) in [
+            (DetailedSessionRow.columnHeaders.multiple, columns.multiple),
+            (DetailedSessionRow.columnHeaders.turns, columns.turns),
+            (DetailedSessionRow.columnHeaders.inOut, columns.inOut),
+        ] {
+            let header = columns.headerCell(cell)
+            precondition(header.maxX == cell.maxX, "the header must stay aligned to its column's right edge")
+            precondition(header.width > cell.width)
+            precondition((title as NSString).size(withAttributes: [.font: headerFont]).width <= header.width,
+                         "column header \(title) must fit without truncating")
+        }
     }
 }
