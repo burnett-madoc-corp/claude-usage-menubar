@@ -164,7 +164,9 @@ final class SettingsWindowController: NSObject {
         row.spacing = 8
 
         let caption = NSTextField(
-            wrappingLabelWithString: "minimum 1 min — the Claude usage API rate-limits aggressively"
+            wrappingLabelWithString: "while a session is active. With nothing running it eases to "
+                + "10 min, then hourly once the numbers stop moving — the Claude usage API "
+                + "rate-limits aggressively. Minimum 1 min."
         )
         caption.font = .systemFont(ofSize: 11)
         caption.textColor = .secondaryLabelColor

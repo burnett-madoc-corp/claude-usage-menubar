@@ -20,7 +20,7 @@ swiftc -O \
   -o "$BIN" \
   Sources/Providers.swift Sources/KeyStore.swift Sources/Prefs.swift \
   Sources/Sessions.swift Sources/CodexSessions.swift Sources/SettingsWindow.swift \
-  Sources/Theme.swift Sources/QuotaBlockView.swift \
+  Sources/Theme.swift Sources/PollPolicy.swift Sources/QuotaBlockView.swift \
   Sources/SessionRowView.swift Sources/main.swift
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'

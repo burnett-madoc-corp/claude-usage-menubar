@@ -177,7 +177,7 @@ struct ClaudeProvider: Provider {
             Self.headline.value = nil
             return Card(provider: name, rows: [], error: ClaudeError.tokenExpired.localizedDescription)
         } catch let error as NSError where error.domain == "http" && error.code == 429 {
-            return Card(provider: name, rows: [], error: "rate limited by usage API")
+            return Card(provider: name, rows: [], error: "rate limited by usage API", rateLimited: true)
         } catch {
             return Card(provider: name, rows: [], error: error.localizedDescription)
         }
@@ -225,7 +225,20 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private var detailedRowWidth: CGFloat { Panel.width }
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
-    private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
+    /// The user's setting is the *active* rate; PollPolicy scales the idle
+    /// tiers off it. Nothing polls faster than this.
+    private var baseInterval: TimeInterval { Prefs.refreshInterval() }
+    /// Poll-cadence state. `lastUsageFingerprint` starts nil so the very first
+    /// poll cannot be mistaken for movement.
+    private var scheduledInterval: TimeInterval?
+    private var lastUsageFingerprint: String?
+    /// Whether the most recent poll's numbers differed from the one before.
+    /// Held as state rather than recomputed inside retune(), because retune()
+    /// also runs when only the session set changed — recomputing there would
+    /// compare the fingerprint against itself, always yield "unchanged", and
+    /// silently undo the drifting tier a moment after a poll chose it.
+    private var usageMoved = false
+    private var consecutiveRateLimits = 0
 
     /// The settings window's text fields would not accept ⌘V.
     ///
@@ -294,6 +307,12 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             // would dismiss the tooltip the user is reading. Closed, a
             // rebuild is free and keeps the code path simple.
             if self.sessionsTick != nil { self.applySessionUpdates() } else { self.rebuildMenu() }
+            // Sessions load asynchronously and separately from the provider
+            // poll, so the first retune() after launch would otherwise decide
+            // the cadence while `sessions` was still empty — parking an
+            // actively-working machine in the hourly tier until the next poll,
+            // an hour away. Re-pick whenever the session set lands.
+            self.retune()
         }
     }
 
@@ -301,13 +320,33 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// mutable interval, and this keeps .common run-loop mode registration
     /// (needed so the timer keeps firing while a menu's modal tracking loop
     /// is open) in exactly one place.
-    private func scheduleTimer() {
+    private func scheduleTimer(interval: TimeInterval? = nil) {
+        let target = interval ?? baseInterval
+        // Rescheduling restarts the countdown, so only do it when the cadence
+        // actually changed — otherwise a quiet-tier poll would keep pushing its
+        // own next fire another hour out on every retune.
+        guard scheduledInterval != target || timer == nil else { return }
+        scheduledInterval = target
         timer?.invalidate()
-        let t = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let t = Timer.scheduledTimer(withTimeInterval: target, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    /// Re-picks the cadence from what the last poll revealed, after every poll,
+    /// so a session starting or the quota moving takes effect on the next
+    /// interval rather than at some fixed re-evaluation point.
+    private func retune() {
+        let tier = PollPolicy.tier(
+            sessionsActive: PollPolicy.isActive(sessions, now: Date()),
+            usageChanged: usageMoved
+        )
+        scheduleTimer(interval: PollPolicy.backedOff(
+            PollPolicy.interval(base: baseInterval, tier: tier),
+            consecutiveRateLimits: consecutiveRateLimits
+        ))
     }
 
     /// Fires for any settings change (visibility or interval).
@@ -324,6 +363,9 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// 429s. One poll, shortly after the user stops clicking, is what's
     /// actually wanted.
     private func handlePrefsChanged() {
+        // The base moved, so every tier derived from it did too — drop the memo
+        // so the next scheduleTimer call is not skipped as a no-op.
+        scheduledInterval = nil
         scheduleTimer()
         renderTitle()
         prefsRefreshDebounce?.invalidate()
@@ -336,10 +378,18 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     @objc func refresh() {
         Task { @MainActor in
-            cards = Self.merge(new: await Providers.loadAll(), previous: cards)
+            let fresh = await Providers.loadAll()
+            // Read the rate-limit signal before merge(), which swaps a failed
+            // card for the previous good rows and takes the flag with it.
+            consecutiveRateLimits = fresh.contains(where: \.rateLimited) ? consecutiveRateLimits + 1 : 0
+            cards = Self.merge(new: fresh, previous: cards)
+            let fingerprint = PollPolicy.usageFingerprint(cards)
+            usageMoved = lastUsageFingerprint.map { $0 != fingerprint } ?? false
+            lastUsageFingerprint = fingerprint
             lastUpdated = Date()
             renderTitle()
             rebuildMenu()
+            retune()
         }
         refreshSessions()
     }
@@ -827,7 +877,12 @@ extension UsageMenuBar: NSMenuDelegate {
         // rather than waiting for the next tick.
         isMenuOpen = true
         rebuildMenu()
-        if let updated = lastUpdated, Date().timeIntervalSince(updated) > refreshInterval / 2 { refresh() }
+        if let updated = lastUpdated,
+           PollPolicy.shouldRefreshOnOpen(age: Date().timeIntervalSince(updated),
+                                          base: baseInterval,
+                                          consecutiveRateLimits: consecutiveRateLimits) {
+            refresh()
+        }
         refreshSessions()
 
         // Session transcript files change on the order of seconds while a
@@ -1445,6 +1500,7 @@ private func runSelfTests() {
     QuotaBlockSelfTests.run()
     testSeverityOrdering()
     testEditMenu()
+    PollPolicySelfTests.run()
 
     print("Self-tests passed")
 }
