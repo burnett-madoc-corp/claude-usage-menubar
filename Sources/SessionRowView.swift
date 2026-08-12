@@ -20,6 +20,25 @@ enum SessionGrid {
     static let dotDiameter: CGFloat = 8
     static let expandedLineHeight: CGFloat = 13
 
+    /// The context cell's no-bar states are drawn a point smaller than the
+    /// rest of the row: "window unknown" does not fit 76pt at 10pt and
+    /// truncates to "window unkno…", which reads as a different, broken state
+    /// rather than a known one. `testContextFallbacksFit` pins this.
+    static let fallbackFont = PanelFont.text(9)
+
+    /// Floor for the project label once the model+window has taken its share
+    /// of the name cell. At 470pt the cell is ~166pt and a long pair such as
+    /// "worktree-ee  gpt-5.2-codex (200k)" cannot fit whole — something must
+    /// truncate. The model wins: a clipped window suffix destroys the value
+    /// outright, whereas a clipped project name still identifies its row, and
+    /// the full label rides the row's tooltip and accessibility text anyway.
+    /// 54pt: the name cell is 166pt and the widest model+window the app can
+    /// produce ("  gpt-5.2-codex (200k)") measures 110.8pt, so this is the
+    /// largest floor that still lets that pair render whole. A longer model id
+    /// than today's degrades gracefully — it truncates itself rather than
+    /// eating further into the label. `testNameCellBudget` pins the arithmetic.
+    static let minLabelWidth: CGFloat = 54
+
     struct Columns {
         var dot: NSRect
         var name: NSRect
@@ -89,7 +108,7 @@ enum DetailedSessionRow {
     /// the view draws the two halves in different fonts and colours.
     nonisolated static func nameAndModel(for session: AgentSession) -> String {
         guard let model = session.model else { return session.label }
-        return "\(session.label)  \(Display.shortModel(model))"
+        return "\(session.label)  \(Display.modelWithWindow(model, window: session.contextWindow))"
     }
 
     /// The ×start multiple, with the `×` glyph. `nil` still reads "—", never
@@ -152,7 +171,9 @@ enum DetailedSessionRow {
     /// bar's value.
     nonisolated static func accessibilityLabel(for session: AgentSession) -> String {
         var parts: [String] = [session.busy ? "busy" : "idle", session.label]
-        if let model = session.model { parts.append(Display.shortModel(model)) }
+        if let model = session.model {
+            parts.append(Display.modelWithWindow(model, window: session.contextWindow))
+        }
         if let percent = session.contextPercent {
             parts.append("context bar \(percent) percent")
         } else if let fallback = contextFallback(for: session) {
@@ -431,15 +452,37 @@ final class SessionRowView: NSView {
                  filled: session.busy)
     }
 
+    /// The project label is the variable-length half of this cell and the
+    /// model+window is the fixed, identity-carrying half — so the model gets
+    /// its width reserved first and the label truncates into what remains.
+    /// Drawing both as one run let a long project name push "(200k)" off the
+    /// end, which is precisely the part that cannot be inferred from anything
+    /// else on the row.
     private func drawName(in rect: NSRect, label: NSColor, accent: NSColor) {
-        var runs: [(String, NSFont, NSColor)] = [(session.label, PanelFont.text(13, .semibold), label)]
-        if !session.matched {
-            runs.append(("(?)", PanelFont.text(10), label))
-        }
+        let labelFont = PanelFont.text(13, .semibold)
+        let smallFont = PanelFont.text(10)
+        var trailing: [(String, NSFont, NSColor)] = []
+        if !session.matched { trailing.append(("(?)", smallFont, label)) }
         if let model = session.model {
-            runs.append(("  " + Display.shortModel(model), PanelFont.text(10), accent))
+            trailing.append(("  " + Display.modelWithWindow(model, window: session.contextWindow),
+                             smallFont, accent))
         }
-        Draw.runs(runs, in: rect)
+
+        let trailingWidth = trailing.reduce(CGFloat(0)) {
+            $0 + ($1.0 as NSString).size(withAttributes: [.font: $1.1]).width
+        }
+        // A pathologically long model id must still leave the project name
+        // legible — the reservation is capped rather than unbounded.
+        let reserved = min(trailingWidth, max(0, rect.width - SessionGrid.minLabelWidth))
+        let labelBox = NSRect(x: rect.minX, y: rect.minY,
+                              width: max(0, rect.width - reserved), height: rect.height)
+        Draw.text(session.label, font: labelFont, color: label, in: labelBox)
+
+        guard !trailing.isEmpty else { return }
+        let drawn = min((session.label as NSString).size(withAttributes: [.font: labelFont]).width,
+                        labelBox.width)
+        Draw.runs(trailing, in: NSRect(x: rect.minX + drawn, y: rect.minY,
+                                       width: max(0, rect.maxX - rect.minX - drawn), height: rect.height))
     }
 
     private func drawContext(columns: SessionGrid.Columns, severity: NSColor, secondary: NSColor) {
@@ -452,7 +495,7 @@ final class SessionRowView: NSView {
             return
         }
         let cell = session.hasUsage ? columns.context : columns.contextSpanningMultiple
-        Draw.text(fallback, font: PanelFont.text(10), color: secondary, in: cell)
+        Draw.text(fallback, font: SessionGrid.fallbackFont, color: secondary, in: cell)
     }
 
     private func drawMultiple(in rect: NSRect, severity: NSColor) {
@@ -494,6 +537,8 @@ enum DetailedSessionRowSelfTests {
     static func run() {
         testNameAndModel()
         testCells()
+        testContextFallbacksFit()
+        testNameCellBudget()
         testExpandedText()
         testAccessibilityLabel()
         testGrid()
@@ -504,6 +549,16 @@ enum DetailedSessionRowSelfTests {
         precondition(named.contains("sqlmesh-be"))
         precondition(named.contains("opus-5"), "the model is shortened for the row")
         precondition(!named.contains("claude-opus-5"), "the vendor prefix is dropped")
+        precondition(named.contains("(200k)"), "the model carries its context window")
+
+        var wide = makeSession(label: "wide")
+        wide.contextWindow = 1_000_000
+        precondition(DetailedSessionRow.nameAndModel(for: wide).contains("(1m)"))
+
+        var unknownWindow = makeSession(label: "unknown")
+        unknownWindow.contextWindow = nil
+        precondition(DetailedSessionRow.nameAndModel(for: unknownWindow).hasSuffix("opus-5"),
+                     "an unknown window adds no suffix at all")
     }
 
     private static func testCells() {
@@ -535,6 +590,43 @@ enum DetailedSessionRowSelfTests {
 
         precondition(DetailedSessionRow.turnsText(for: makeSession(turns: 137)) == "137")
         precondition(DetailedSessionRow.inOutText(for: normal).contains(" / "))
+    }
+
+    /// Guards the one thing the fixed grid cannot express in code: that the
+    /// strings actually fit the cells they are drawn into.
+    private static func testContextFallbacksFit() {
+        func width(_ text: String) -> CGFloat {
+            (text as NSString).size(withAttributes: [.font: SessionGrid.fallbackFont]).width
+        }
+        let columns = SessionGrid.columns(width: Panel.width, y: 0, height: SessionGrid.rowHeight)
+
+        // States that stay inside the context cell.
+        for session in [makeSession(contextTokens: 488_000, contextWindow: nil),
+                        makeSession(contextTokens: nil, contextWindow: nil)] {
+            guard let fallback = DetailedSessionRow.contextFallback(for: session) else { continue }
+            precondition(width(fallback) <= columns.context.width,
+                         "context fallback '\(fallback)' must fit its own cell without truncating")
+        }
+
+        // The no-usage state is the one that borrows the ×start cell.
+        let noUsage = makeSession(turns: 0, contextTokens: nil, contextWindow: nil, hasUsage: false)
+        let spanning = DetailedSessionRow.contextFallback(for: noUsage)!
+        precondition(width(spanning) > columns.context.width,
+                     "if this ever fits alone, drop the cell merge instead of keeping it")
+        precondition(width(spanning) <= columns.contextSpanningMultiple.width)
+    }
+
+    /// The name cell splits between a variable label and a bounded
+    /// model+window; this pins which one survives when they cannot both fit.
+    private static func testNameCellBudget() {
+        let columns = SessionGrid.columns(width: Panel.width, y: 0, height: SessionGrid.rowHeight)
+        let font = PanelFont.text(10)
+        // The widest model+window pair the app can actually produce today.
+        let widest = "  " + Display.modelWithWindow("gpt-5.2-codex", window: 200_000)
+        let width = (widest as NSString).size(withAttributes: [.font: font]).width
+        precondition(width <= columns.name.width - SessionGrid.minLabelWidth,
+                     "the model+window must always fit beside a minimum-width label")
+        precondition(SessionGrid.minLabelWidth > 0 && SessionGrid.minLabelWidth < columns.name.width)
     }
 
     private static func testExpandedText() {
