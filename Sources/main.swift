@@ -108,7 +108,7 @@ enum Keychain {
         switch KeychainCLI.read(["find-generic-password", "-s", "Claude Code-credentials", "-w"]) {
         case .success(let payload): data = payload
         case .failure(.blocked): throw ClaudeError.keychainBlocked
-        case .failure(.failed): throw ClaudeError.noCredentials
+        case .failure(.failed): throw ClaudeError.noCredentials // any exit status: no usable token
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -980,8 +980,12 @@ private final class FakeKeyStore: KeyStore, @unchecked Sendable {
 /// path without needing a real Keychain in a failed state.
 private final class FailingKeyStore: KeyStore, @unchecked Sendable {
     func get(_ account: String) -> String? { nil }
-    func set(_ account: String, value: String) throws { throw KeyStoreError.osStatus(errSecIO) }
-    func delete(_ account: String) throws { throw KeyStoreError.osStatus(errSecIO) }
+    func set(_ account: String, value: String) throws {
+        throw KeyStoreError.commandFailed(action: "save", code: 1)
+    }
+    func delete(_ account: String) throws {
+        throw KeyStoreError.commandFailed(action: "delete", code: 1)
+    }
 }
 
 // MARK: - Compact session-row self-tests
@@ -1100,46 +1104,42 @@ private func testCompactSessionRendering() {
 // and a blocked one never returns. So the bound itself is asserted, not just
 // the parsing around it.
 
-/// A store that never returns, standing in for a Keychain read parked behind
-/// an unanswered approval dialog.
-private final class BlockingKeyStore: KeyStore, @unchecked Sendable {
-    let entered = DispatchSemaphore(value: 0)
-    func get(_ account: String) -> String? {
-        entered.signal()
-        Thread.sleep(forTimeInterval: 30)
-        return "never"
-    }
-    func set(_ account: String, value: String) throws {}
-    func delete(_ account: String) throws {}
-}
+/// The argument vectors handed to security(1). These are asserted because
+/// getting one wrong is invisible: the build succeeds, the Settings window
+/// still says "Saved", and the key lands under the wrong service or not at
+/// all.
+private func testKeychainCommand() {
+    let service = KeychainStore.service
+    let find = KeychainCommand.find(service: service, account: KeyAccount.openRouter)
+    precondition(find.first == "find-generic-password")
+    precondition(find.contains(service) && find.contains(KeyAccount.openRouter))
+    precondition(find.contains("-w"), "without -w, security prints attributes and never the key")
 
-private func testBoundedKeyStore() {
-    let blocking = BlockingKeyStore()
-    let bounded = BoundedKeyStore(blocking, timeout: 0.2)
+    let add = KeychainCommand.add(service: service, account: KeyAccount.xai, value: "xai-secret")
+    precondition(add.first == "add-generic-password")
+    precondition(add.contains(service) && add.contains(KeyAccount.xai))
+    precondition(add.contains("xai-secret"))
+    // The regression this guards: -U updates an existing item in place, which
+    // needs decrypt authorization on it and so puts the approval dialog back
+    // on screen for anything written by an older build. set deletes first.
+    precondition(!add.contains("-U"), "add must not update in place")
 
-    // The whole point: a read that never returns must not stall the caller.
-    let started = Date()
-    precondition(bounded.get(KeyAccount.openRouter) == nil, "a blocked read yields no key, not a hang")
-    let elapsed = Date().timeIntervalSince(started)
-    precondition(elapsed < 5, "the bounded read took \(elapsed)s — it is not bounded")
+    let remove = KeychainCommand.delete(service: service, account: KeyAccount.xai)
+    precondition(remove.first == "delete-generic-password")
+    precondition(!remove.contains("-w"), "delete takes no value")
 
-    // The blocked thread is still in there; a second call must not start
-    // another one, or every poll leaks a thread while the dialog sits unanswered.
-    precondition(blocking.entered.wait(timeout: .now() + 2) == .success)
-    let secondStart = Date()
-    precondition(bounded.get(KeyAccount.openRouter) == nil)
-    precondition(Date().timeIntervalSince(secondStart) < 0.15,
-                 "a call made while a read is in flight must return at once from cache")
+    // security -w terminates the password with exactly one newline.
+    precondition(KeychainCommand.parse(Data("sk-or-v1-abc\n".utf8)) == "sk-or-v1-abc")
+    precondition(KeychainCommand.parse(Data("sk-or-v1-abc".utf8)) == "sk-or-v1-abc")
+    precondition(KeychainCommand.parse(Data()) == nil)
+    precondition(KeychainCommand.parse(Data("\n".utf8)) == nil, "an empty stored password is not a key")
+    // Only the delimiter comes off. Anything else the user typed was already
+    // trimmed by APIKeySave.normalize, so surviving whitespace is the key.
+    precondition(KeychainCommand.parse(Data("a b\n".utf8)) == "a b")
+    precondition(KeychainCommand.parse(Data("tail \n".utf8)) == "tail ")
 
-    // A store that answers promptly still works, and its value is cached.
-    let fast = FakeKeyStore()
-    try? fast.set(KeyAccount.xai, value: "xai-abc")
-    let quick = BoundedKeyStore(fast, timeout: 5)
-    precondition(quick.get(KeyAccount.xai) == "xai-abc")
-    try? quick.set(KeyAccount.xai, value: "xai-def")
-    precondition(quick.get(KeyAccount.xai) == "xai-def", "set must not leave a stale cache entry")
-    try? quick.delete(KeyAccount.xai)
-    precondition(quick.get(KeyAccount.xai) == nil, "delete must not leave a stale cache entry")
+    precondition(KeychainCommand.itemNotFound == 44, "security reports a missing item as 44")
+    precondition(KeychainCommand.duplicateItem == 45)
 }
 
 private func testKeychainBounds() {
@@ -1525,10 +1525,10 @@ private func runSelfTests() {
         precondition(failed.errors.contains { $0.contains("Grok") })
     }
 
-    // KeychainStore must degrade, never crash, on a lookup miss — this is
-    // the same code path errSecInteractionNotAllowed (a locked login
-    // keychain, e.g. a headless --once over SSH) falls through, so Config
-    // can fall back to the legacy JSON/no-key tiers instead of throwing.
+    // KeychainStore must degrade, never crash, on a lookup miss — the same
+    // code path a locked login keychain takes, e.g. a headless --once over
+    // SSH, so Config can fall back to the legacy JSON/no-key tiers instead
+    // of throwing.
     precondition(KeychainStore().get("selftest_definitely_absent_key_should_not_exist") == nil)
 
     // Gated real-Keychain round-trip: a throwaway account under this app's
@@ -1580,7 +1580,7 @@ private func runSelfTests() {
     testEditMenu()
     PollPolicySelfTests.run()
     testKeychainBounds()
-    testBoundedKeyStore()
+    testKeychainCommand()
 
     print("Self-tests passed")
 }

@@ -69,10 +69,13 @@ struct Config: Sendable {
     static var legacyPath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/claude-usage/config.json")
 
-    /// One shared bounded store for the polling path, so its cache and its
-    /// in-flight guard persist across refreshes rather than being rebuilt
-    /// (and re-blocked) every two minutes.
-    static let pollingStore: KeyStore = BoundedKeyStore()
+    /// The polling path reads straight through to the Keychain on every
+    /// refresh. There is no cache and no timeout wrapper in front of it any
+    /// more: those existed to survive an approval dialog that this app's own
+    /// items no longer raise (see KeychainStore), and a cache that outlives
+    /// the dialog it was built for is just a way to serve a stale key after
+    /// the user changes one.
+    static let pollingStore: KeyStore = KeychainStore()
 
     static func load(store: KeyStore = Config.pollingStore) -> Config {
         let legacy = legacyKeys()
@@ -106,20 +109,26 @@ struct Config: Sendable {
 
 /// Bounded wrapper around `security(1)`.
 ///
-/// A Keychain read can block indefinitely, and does so routinely here: the app
-/// is ad-hoc signed, so every install is a new code identity and macOS puts an
-/// access-approval dialog on screen. `security` then waits for that dialog —
-/// forever, if nobody clicks it.
+/// A Keychain read can block indefinitely: if macOS decides the caller needs
+/// approval it puts a dialog on screen and `security` waits for it — forever,
+/// if nobody clicks it. Unbounded, one such dialog blanked the entire usage
+/// section, because `loadAll` awaits every provider and one that never returns
+/// takes down the others with it, including those that touch no Keychain at
+/// all.
 ///
-/// Unbounded, that single dialog blanked the entire usage section. `loadAll`
-/// awaits every provider, so one that never returns takes down the others with
-/// it, including Codex and OpenRouter which never touch the Keychain at all.
+/// This app's own keys no longer trigger that dialog (see KeychainStore), but
+/// the items it reads from *other* apps — Claude Code's OAuth token,
+/// Antigravity's go-keyring blob — are written by those apps under their own
+/// access rules, so the timeout stays.
 enum KeychainCLI {
     /// Long enough that a genuinely slow read succeeds, short enough that the
     /// menu is not held hostage to a dialog nobody is looking at.
     static let timeout: TimeInterval = 8
 
-    enum Failure: Error { case blocked, failed }
+    /// `failed` carries security(1)'s exit status so callers can tell the
+    /// routine outcomes apart from the real ones — 44 is "no such item",
+    /// which for a key that was never configured is not an error at all.
+    enum Failure: Error { case blocked, failed(Int32) }
 
     static func read(_ arguments: [String], timeout: TimeInterval = timeout) -> Result<Data, Failure> {
         let task = Process()
@@ -131,7 +140,7 @@ enum KeychainCLI {
 
         let finished = DispatchSemaphore(value: 0)
         task.terminationHandler = { _ in finished.signal() }
-        guard (try? task.run()) != nil else { return .failure(.failed) }
+        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
 
         if finished.wait(timeout: .now() + timeout) == .timedOut {
             // Leaves the approval dialog up — answering it makes the next poll
@@ -143,7 +152,7 @@ enum KeychainCLI {
         // a larger one could fill the pipe buffer and stall the child, which
         // the timeout above would then catch as .blocked rather than hang.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return task.terminationStatus == 0 ? .success(data) : .failure(.failed)
+        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
     }
 }
 
