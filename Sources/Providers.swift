@@ -28,6 +28,11 @@ struct Card {
     /// failed", which read identically as an error string but call for
     /// completely different rows — a setup hint versus a diagnostic.
     var missingKey: Bool = false
+    /// Set on an HTTP 429. Drives the poll backoff, so it has to survive as a
+    /// flag rather than as prose in `error` — `merge` replaces a failed card
+    /// with the previous good rows, and the reason for the failure would be
+    /// lost with it exactly when the scheduler needs to know.
+    var rateLimited: Bool = false
 }
 
 struct HeadlineValue {
