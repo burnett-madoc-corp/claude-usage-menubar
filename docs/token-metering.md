@@ -33,12 +33,12 @@ The floor is ~40k input tokens/turn (system prompt + tools + a short history).
 A useful health metric for any session is how much heavier its average turn is
 than that cheapest possible turn.
 
-The app's `xFloor` column answers the same question with a different baseline:
+The app's `BLOAT` column answers the same question with a different baseline:
 it compares the current turn against *that session's own* first few turns
 (or since its last compaction) rather than against an absolute 40k. That makes
 it robust to a session whose floor is genuinely higher — a big system prompt,
 many MCP tools — at the cost of being uncomparable between sessions. The bands
-above are the cross-session view; `xFloor` is the within-session one.
+above are the cross-session view; `BLOAT` is the within-session one.
 
 ## Prompt caching softens the blow — conditionally
 
