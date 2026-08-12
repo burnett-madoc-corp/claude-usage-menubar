@@ -16,7 +16,7 @@ enum SessionGrid {
     /// the app can produce ("gpt-5.2-codex (200k)", 110.8pt).
     static let modelWidth: CGFloat = 124
     static let contextWidth: CGFloat = 76
-    static let multipleWidth: CGFloat = 44
+    static let bloatWidth: CGFloat = 44
     static let turnsWidth: CGFloat = 34
     static let inOutWidth: CGFloat = 72
 
@@ -37,7 +37,7 @@ enum SessionGrid {
         var name: NSRect
         var model: NSRect
         var context: NSRect
-        var multiple: NSRect
+        var bloat: NSRect
         var turns: NSRect
         var inOut: NSRect
 
@@ -49,9 +49,9 @@ enum SessionGrid {
         /// merge for that state only, rather than truncating the sentence to
         /// "starting — n…" or inventing a shorter wording the rest of the app
         /// doesn't use.
-        var contextSpanningMultiple: NSRect {
+        var contextSpanningBloat: NSRect {
             NSRect(x: context.minX, y: context.minY,
-                   width: multiple.maxX - context.minX, height: context.height)
+                   width: bloat.maxX - context.minX, height: context.height)
         }
 
         /// Column headers are wider than the numbers they sit above — "TURNS"
@@ -69,8 +69,8 @@ enum SessionGrid {
         let right = width - Panel.inset
         let inOutX = right - inOutWidth
         let turnsX = inOutX - Panel.columnGap - turnsWidth
-        let multipleX = turnsX - Panel.columnGap - multipleWidth
-        let contextX = multipleX - Panel.columnGap - contextWidth
+        let bloatX = turnsX - Panel.columnGap - bloatWidth
+        let contextX = bloatX - Panel.columnGap - contextWidth
         let nameX = Panel.inset + dotColumn
         let modelX = contextX - Panel.columnGap - modelWidth
         return Columns(
@@ -78,7 +78,7 @@ enum SessionGrid {
             name: NSRect(x: nameX, y: y, width: max(0, modelX - Panel.columnGap - nameX), height: height),
             model: NSRect(x: modelX, y: y, width: modelWidth, height: height),
             context: NSRect(x: contextX, y: y, width: contextWidth, height: height),
-            multiple: NSRect(x: multipleX, y: y, width: multipleWidth, height: height),
+            bloat: NSRect(x: bloatX, y: y, width: bloatWidth, height: height),
             turns: NSRect(x: turnsX, y: y, width: turnsWidth, height: height),
             inOut: NSRect(x: inOutX, y: y, width: inOutWidth, height: height)
         )
@@ -117,10 +117,10 @@ enum DetailedSessionRow {
         return "\(name)  \(Display.modelWithWindow(model, window: session.contextWindow))"
     }
 
-    /// The ×start multiple, with the `×` glyph. `nil` still reads "—", never
-    /// a fabricated 1.0.
-    nonisolated static func multiple(for session: AgentSession) -> String {
-        Display.multiple(session.xFloorMultiple)
+    /// Context bloat — the multiple over the session's starting context, with
+    /// the `×` glyph. `nil` still reads "—", never a fabricated 1.0.
+    nonisolated static func bloat(for session: AgentSession) -> String {
+        Display.bloat(session.xFloorMultiple)
     }
 
     /// What the context cell says when it cannot draw a bar. `nil` means the
@@ -185,7 +185,7 @@ enum DetailedSessionRow {
         } else if let fallback = contextFallback(for: session) {
             parts.append(fallback)
         }
-        parts.append("multiple " + multiple(for: session))
+        parts.append("bloat " + bloat(for: session))
         if session.hasUsage {
             parts.append("\(session.turns) turns")
             parts.append(inOutText(for: session) + " in and out")
@@ -198,7 +198,7 @@ enum DetailedSessionRow {
     /// so the header view and the accessibility label agree on the wording.
     nonisolated static let columnHeaders =
         (name: "SESSION", model: "MODEL", context: "CONTEXT",
-         multiple: "×START", turns: "TURNS", inOut: "IN/OUT")
+         bloat: "BLOAT", turns: "TURNS", inOut: "IN/OUT")
 }
 
 // MARK: - Column-header line
@@ -224,8 +224,8 @@ final class SessionHeaderView: NSView {
         Draw.text(headers.name, font: font, color: color, in: columns.name)
         Draw.text(headers.model, font: font, color: color, in: columns.model)
         Draw.text(headers.context, font: font, color: color, in: columns.context)
-        Draw.text(headers.multiple, font: font, color: color,
-                  in: columns.headerCell(columns.multiple), alignment: .right)
+        Draw.text(headers.bloat, font: font, color: color,
+                  in: columns.headerCell(columns.bloat), alignment: .right)
         Draw.text(headers.turns, font: font, color: color,
                   in: columns.headerCell(columns.turns), alignment: .right)
         Draw.text(headers.inOut, font: font, color: color,
@@ -434,7 +434,7 @@ final class SessionRowView: NSView {
         drawDot(in: columns.dot, accent: accent)
         drawName(in: columns.name, modelRect: columns.model, label: label, accent: accent)
         drawContext(columns: columns, severity: severity, secondary: secondary)
-        drawMultiple(in: columns.multiple, severity: severity)
+        drawBloat(in: columns.bloat, severity: severity)
         drawTurns(in: columns.turns, highlighted: highlighted)
         drawInOut(in: columns.inOut, highlighted: highlighted, secondary: secondary)
 
@@ -485,15 +485,15 @@ final class SessionRowView: NSView {
                        fraction: Double(percent) / 100, fill: severity)
             return
         }
-        let cell = session.hasUsage ? columns.context : columns.contextSpanningMultiple
+        let cell = session.hasUsage ? columns.context : columns.contextSpanningBloat
         Draw.text(fallback, font: SessionGrid.fallbackFont, color: secondary, in: cell)
     }
 
-    private func drawMultiple(in rect: NSRect, severity: NSColor) {
+    private func drawBloat(in rect: NSRect, severity: NSColor) {
         // Suppressed only where the no-usage text has already borrowed this
-        // cell — everywhere else a nil multiple still draws its own "—".
+        // cell — everywhere else a nil bloat still draws its own "—".
         guard session.hasUsage else { return }
-        Draw.text(DetailedSessionRow.multiple(for: session),
+        Draw.text(DetailedSessionRow.bloat(for: session),
                   font: PanelFont.number(11, .bold), color: severity, in: rect, alignment: .right)
     }
 
@@ -574,10 +574,10 @@ enum DetailedSessionRowSelfTests {
     }
 
     private static func testCells() {
-        // The multiple uses the × glyph now, and nil is still never 1.0.
-        precondition(DetailedSessionRow.multiple(for: makeSession(xFloorMultiple: 4.5)) == "4.5×")
-        precondition(DetailedSessionRow.multiple(for: makeSession(xFloorMultiple: nil)) == "—")
-        precondition(!DetailedSessionRow.multiple(for: makeSession(xFloorMultiple: 4.5)).contains("x"))
+        // Bloat uses the × glyph now, and nil is still never 1.0.
+        precondition(DetailedSessionRow.bloat(for: makeSession(xFloorMultiple: 4.5)) == "4.5×")
+        precondition(DetailedSessionRow.bloat(for: makeSession(xFloorMultiple: nil)) == "—")
+        precondition(!DetailedSessionRow.bloat(for: makeSession(xFloorMultiple: 4.5)).contains("x"))
 
         // A known window draws a bar and nothing else — the percentage is no
         // longer composed into any string on the row.
@@ -625,7 +625,7 @@ enum DetailedSessionRowSelfTests {
         let spanning = DetailedSessionRow.contextFallback(for: noUsage)!
         precondition(width(spanning) > columns.context.width,
                      "if this ever fits alone, drop the cell merge instead of keeping it")
-        precondition(width(spanning) <= columns.contextSpanningMultiple.width)
+        precondition(width(spanning) <= columns.contextSpanningBloat.width)
     }
 
     /// The model column is fixed, so the one thing that can silently break is
@@ -638,8 +638,24 @@ enum DetailedSessionRowSelfTests {
                      "the widest model+window must fit its own column without truncating")
         precondition((DetailedSessionRow.columnHeaders.model as NSString)
                      .size(withAttributes: [.font: PanelFont.text(10, .medium)]).width <= columns.model.width)
-        // The name column still has to be worth reading after the split.
-        precondition(columns.name.width > 150, "a task title needs room to say what the task is")
+        // The name column is whatever the panel width leaves once every fixed
+        // column has taken its share, so it is the one that silently drifts
+        // when any other constant moves. Pin the character budget directly by
+        // measuring how much of a real title actually fits — a width-per-char
+        // estimate is not stable enough, since proportional glyph widths vary
+        // by roughly a third between a narrow name and a wide one.
+        let nameFont = PanelFont.text(13, .semibold)
+        let title = "Redesign dropdown menu layout and provider color coding"
+        var fitted = 0
+        for end in 1...title.count {
+            let candidate = String(title.prefix(end))
+            if (candidate as NSString).size(withAttributes: [.font: nameFont]).width > columns.name.width {
+                break
+            }
+            fitted = end
+        }
+        precondition((16...22).contains(fitted),
+                     "the name column should afford ~19 characters of a task title, fits \(fitted)")
     }
 
     private static func testExpandedText() {
@@ -674,7 +690,7 @@ enum DetailedSessionRowSelfTests {
         let busyLabel = DetailedSessionRow.accessibilityLabel(for: makeSession(label: "sqlmesh-be", busy: true))
         precondition(busyLabel.contains("busy"))
         precondition(busyLabel.contains("sqlmesh-be"))
-        precondition(busyLabel.contains("multiple"))
+        precondition(busyLabel.contains("bloat"))
 
         let idleLabel = DetailedSessionRow.accessibilityLabel(for: makeSession(busy: false))
         precondition(idleLabel.contains("idle"))
@@ -699,23 +715,23 @@ enum DetailedSessionRowSelfTests {
         precondition(columns.dot.maxX <= columns.name.minX)
         precondition(columns.name.maxX <= columns.model.minX)
         precondition(columns.model.maxX <= columns.context.minX)
-        precondition(columns.context.maxX <= columns.multiple.minX)
-        precondition(columns.multiple.maxX <= columns.turns.minX)
+        precondition(columns.context.maxX <= columns.bloat.minX)
+        precondition(columns.bloat.maxX <= columns.turns.minX)
         precondition(columns.turns.maxX <= columns.inOut.minX)
         precondition(columns.inOut.maxX == Panel.width - Panel.inset)
         precondition(columns.name.width > 0, "the flexible name column must survive the fixed ones")
 
         // The merged no-usage cell covers both columns it borrows, and only those.
-        let merged = columns.contextSpanningMultiple
+        let merged = columns.contextSpanningBloat
         precondition(merged.minX == columns.context.minX)
-        precondition(merged.maxX == columns.multiple.maxX)
+        precondition(merged.maxX == columns.bloat.maxX)
         precondition(merged.width > columns.context.width)
 
         // Header cells reach back into the gap so "TURNS" fits above a 34pt
         // column, without moving the data cell's own right edge.
         let headerFont = PanelFont.text(10, .medium)
         for (title, cell) in [
-            (DetailedSessionRow.columnHeaders.multiple, columns.multiple),
+            (DetailedSessionRow.columnHeaders.bloat, columns.bloat),
             (DetailedSessionRow.columnHeaders.turns, columns.turns),
             (DetailedSessionRow.columnHeaders.inOut, columns.inOut),
         ] {
