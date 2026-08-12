@@ -12,9 +12,15 @@ mid-session pays off.
 
 ![Input composition by turn](charts/07-input-composition-by-turn.svg)
 
-## Input grows with the square of session length
+## Input grows faster than session length
 
 ![Cumulative input](charts/02-cumulative-input.svg)
+
+Per-turn input rises roughly linearly, so the cumulative total rises faster
+than the turn count — about **3× the input for 2× the turns** over the range
+plotted. It tends toward a true square only once history dwarfs the fixed
+floor; measured across 25→400 turns the exponent is ~1.6, not 2.0. Quoting
+"quadratic" overstates it at the session lengths anyone actually runs.
 
 ## The context window fills — it never grows
 
