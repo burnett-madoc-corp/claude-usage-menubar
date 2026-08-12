@@ -8,11 +8,11 @@ import AppKit
 // to have auto-sized the rows above it — that older approach made the panel
 // visibly breathe in and out as provider labels changed length.
 enum Panel {
-    /// Widened from 470pt so a session's task title has room to read. At 470
-    /// the name cell was ~166pt, and once the model+window took its share a
-    /// title had ~7 characters — enough to show that a title exists and not
-    /// enough to say what it is.
-    static let width: CGFloat = 640
+    /// Sized so the session-name column lands at ~19 characters — enough for a
+    /// task title to say what the task is, without the panel sprawling. Every
+    /// other column is fixed, so the name column is exactly what this width
+    /// gives it; `testNameColumnBudget` pins the resulting band.
+    static let width: CGFloat = 572
     /// Left/right text margin. Intra-quota dividers are inset by this much on
     /// each side; the dividers before Sessions and before the footer are
     /// NSMenu's own full-width separators.
@@ -52,7 +52,7 @@ enum Palette {
 // MARK: - Provider identity accent
 //
 // Identity only, never severity. A row's accent says *which* provider it
-// belongs to; green/orange/red on the bars and the xStart multiple say how
+// belongs to; green/orange/red on the bars and the bloat multiple say how
 // close to a limit it is. Keeping the two channels separate is why a healthy
 // Claude row is coral rather than green.
 enum ProviderAccent: Sendable {
@@ -177,9 +177,11 @@ enum PanelFont {
 // `UsageMenuBar.sessionMultiple` / `sessionGauge`, which Compact mode and the
 // `--once` printer still use verbatim and which this redesign leaves alone.
 enum Display {
-    /// "5.6×" — the multiple over the session's starting context. `nil` reads
-    /// as "—", never a fabricated 1.0×, matching Sessions.swift's contract.
-    nonisolated static func multiple(_ value: Double?) -> String {
+    /// "5.6×" — context bloat: how far the session has grown over the context
+    /// it started from. `nil` reads as "—", never a fabricated 1.0×, matching
+    /// Sessions.swift's contract. The underlying datum is still
+    /// `AgentSession.xFloorMultiple`; only what the panel calls it changed.
+    nonisolated static func bloat(_ value: Double?) -> String {
         value.map { String(format: "%.1f×", $0) } ?? "—"
     }
 
@@ -379,10 +381,10 @@ enum ThemeSelfTests {
     }
 
     private static func testDisplayComposition() {
-        // The multiple uses the × glyph, and nil is still never a fabricated 1.0.
-        precondition(Display.multiple(5.6) == "5.6×")
-        precondition(Display.multiple(nil) == "—")
-        precondition(!Display.multiple(3.2).contains("x"), "the ASCII x must not survive the redesign")
+        // Bloat uses the × glyph, and nil is still never a fabricated 1.0.
+        precondition(Display.bloat(5.6) == "5.6×")
+        precondition(Display.bloat(nil) == "—")
+        precondition(!Display.bloat(3.2).contains("x"), "the ASCII x must not survive the redesign")
 
         precondition(Display.inOut(input: 78_500_000, output: 244_000) == "78.5M / 244k")
 
