@@ -127,6 +127,14 @@ Keychain item this app reads, and the code-identity gate it replaces bought no
 confidentiality — an ad-hoc app cannot hold one — only a dialog. Developer ID
 signing would restore a real gate; out of scope here.
 
+An item written *before* this change is still pinned to the build that wrote
+it, and by design cannot be read without one approval dialog. If that dialog
+goes unanswered, the account is treated as having no key **for the rest of that
+run** rather than being asked for again on the next poll — one dialog, not an
+endless stream — and Settings says `stored key unreadable` instead of
+pretending no key is set. Pasting the key in and saving repairs the item with
+no dialog at all.
+
 Providers without a key simply show "no API key" — nothing else breaks.
 
 ## Sessions
