@@ -1,37 +1,33 @@
 #!/usr/bin/env python3
-"""Linux-runnable structural/static checks for this Swift/macOS app.
+"""Structural/hygiene checks that a Swift compile does not cover.
 
 WHY THIS EXISTS
 ----------------
-This repo has no Package.swift; build.sh invokes `swiftc` directly with
-`-framework AppKit`. AppKit only exists on macOS, and hosted macOS runners
-are currently unavailable to this org (see the CI workflow comments), so a
-real Swift compile cannot happen in this CI job. Rather than fake a pass
-(the previous `swiftc -typecheck ... || echo "..."` always exited 0, so it
-never actually gated anything), this script does the checks that genuinely
-CAN run on a plain Linux box, using only the standard library.
+CI builds the app with `swiftc` and runs `--self-test` on a hosted macOS
+runner, so compilation and behaviour are genuinely verified there. This
+script covers the things a compiler has no opinion about: file encoding,
+leftover debug instrumentation, and whether build.sh's hand-maintained
+file list still matches the tree.
 
-WHAT THIS DOES NOT VERIFY
---------------------------
-- That the Swift source is syntactically or semantically valid Swift.
-- That it type-checks or compiles.
-- That the app builds, runs, or behaves correctly on macOS.
-A true build/typecheck still requires macOS runner capacity.
+This repo has no Package.swift -- build.sh names every source file
+explicitly on its `swiftc` line -- which makes that last check load
+bearing. It runs in a second on any machine with Python 3 and no
+third-party packages, so it is also worth running locally before pushing.
 
-WHAT THIS DOES VERIFY
------------------------
+WHAT THIS VERIFIES
+-------------------
 1. Every git-tracked text file is valid UTF-8 with no BOM and no CRLF
    line endings.
 2. No unresolved git merge-conflict markers anywhere in the tree.
 3. No obvious debugger/debug-logging leftovers in the Swift sources
    (NSLog, debugPrint, ad-hoc "DEBUG" prints, SIGTRAP breakpoints).
-4. Each Swift source file has balanced (), [], {} — a heuristic (it does
-   not understand string literals or comments), but a genuine, cheap
-   trip-wire for truncated files or files that would obviously fail to
-   parse.
-5. build.sh's own references are internally consistent: every Sources/
+4. build.sh's own references are internally consistent: every Sources/
    file and Resources/*-template.svg it compiles/copies actually exists,
    and the Info.plist it generates is well-formed XML.
+5. Resources/*.svg are well-formed XML.
+
+Note that it only inspects git-tracked files, so `git add` a new source
+before relying on a green run here.
 """
 from __future__ import annotations
 
@@ -100,22 +96,10 @@ def check_no_debug_leftovers(swift_files: list[Path]) -> None:
                     fail(f"{f.relative_to(REPO_ROOT)}:{lineno}: debug leftover matches {pat.pattern!r}")
 
 
-def check_balanced_delimiters(swift_files: list[Path]) -> None:
-    pairs = [("(", ")"), ("[", "]"), ("{", "}")]
+def check_not_empty(swift_files: list[Path]) -> None:
     for f in swift_files:
-        text = f.read_text(encoding="utf-8")
-        if not text.strip():
+        if not f.read_text(encoding="utf-8").strip():
             fail(f"{f.relative_to(REPO_ROOT)}: file is empty")
-            continue
-        for open_c, close_c in pairs:
-            opens, closes = text.count(open_c), text.count(close_c)
-            if opens != closes:
-                fail(
-                    f"{f.relative_to(REPO_ROOT)}: unbalanced {open_c!r}/{close_c!r} "
-                    f"({opens} vs {closes}) -- heuristic only, does not understand "
-                    f"strings/comments, but a real mismatch here means the file is "
-                    f"almost certainly broken or truncated"
-                )
 
 
 def check_build_sh_manifest(build_sh: Path) -> None:
@@ -159,7 +143,7 @@ def main() -> int:
     check_encoding_and_line_endings(files)
     check_no_conflict_markers(files)
     check_no_debug_leftovers(swift_files)
-    check_balanced_delimiters(swift_files)
+    check_not_empty(swift_files)
     if build_sh.is_file():
         check_build_sh_manifest(build_sh)
     check_svg_well_formed(svg_files)

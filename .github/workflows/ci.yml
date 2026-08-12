@@ -3,6 +3,8 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,20 +22,20 @@ jobs:
   merge-gate:
     if: ${{ (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.draft == false }}
     name: merge-gate
-    # GitHub-hosted runners (ubuntu-latest, macos-latest) are blocked
-    # org-wide (August Actions-minutes quota exhausted), so this has to run
-    # on skynet, which is Linux-only. This app links AppKit, a macOS-only
-    # framework, so a real `swiftc` compile/typecheck is NOT possible here
-    # -- see .github/scripts/static_checks.py's module docstring for
-    # exactly what this job does and does not verify. A true build awaits
-    # hosted macOS runner capacity; until then this job intentionally does
-    # NOT pretend to compile the app. The previous version of this job ran
-    # `swiftc -typecheck ... || echo "..."`, which always exited 0 -- i.e.
-    # it reported green without checking anything. Do not reintroduce a
-    # `|| echo` / `|| true` pattern here.
-    runs-on: ${{ (vars.USE_GITHUB_HOSTED_RUNNERS == 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","skynet"]') }}
-    timeout-minutes: 15
+    # This app links AppKit, so it can only be built on macOS. Hosted macOS
+    # runners are free for public repositories, which is what makes a real
+    # compile possible here at all -- an earlier version of this job ran on a
+    # self-hosted Linux box and could only do structural checks.
+    runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Static checks (structural/hygiene only -- not a Swift compile)
+
+      - name: Static checks (encoding, conflict markers, build.sh manifest)
         run: python3 .github/scripts/static_checks.py
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Self tests
+        run: build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --self-test

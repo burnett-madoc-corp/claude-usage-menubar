@@ -295,3 +295,34 @@ Sessions carries its own, smaller set:
 
 macOS 13+, Xcode command line tools (for `swiftc`), and a logged-in Claude Code
 install. No third-party dependencies.
+
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
+for the build/test loop and the PR conventions, and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for how discussion is expected to go.
+
+The short version:
+
+```bash
+./build.sh && build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --self-test
+```
+
+CI runs exactly that on a hosted macOS runner, plus
+`.github/scripts/static_checks.py`. CodeQL analyses the Swift sources on every
+push to `main` and weekly.
+
+## Security
+
+The app only ever **reads** credentials that other tools own, and never redeems
+a refresh token — doing so would invalidate the token Claude Code itself holds.
+The API keys you enter for OpenRouter and xAI are stored in your login Keychain.
+There is no telemetry and no network egress beyond the five provider endpoints
+listed above.
+
+[SECURITY.md](SECURITY.md) documents that boundary in full and explains how to
+report a vulnerability privately.
+
+## Licence
+
+[MIT](LICENSE) © 2026 Alexander Burnett.
