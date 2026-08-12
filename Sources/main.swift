@@ -227,7 +227,49 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
     private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
 
+    /// The settings window's text fields would not accept ⌘V.
+    ///
+    /// AppKit dispatches ⌘X/⌘C/⌘V/⌘A by walking `NSApp.mainMenu` for a matching
+    /// key equivalent and sending its action down the responder chain. This app
+    /// is LSUIElement/.accessory and never built a main menu, so there was
+    /// nothing to match: the keystroke was swallowed before the field editor
+    /// ever saw it, and a paste silently did nothing. Right-clicking a field
+    /// still offered Paste, which is why this looked like the field rejecting
+    /// the text rather than the shortcut never arriving.
+    ///
+    /// An .accessory app never displays a menu bar, so this menu is invisible.
+    /// It exists purely so those key equivalents have somewhere to resolve.
+    /// Every item is left target-less on purpose — that is what sends the
+    /// action to the first responder, i.e. whichever field editor is focused.
+    nonisolated static func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        // undo:/redo: are responder-chain conventions with no Swift-visible
+        // method to point #selector at, unlike the four editing actions below.
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        return main
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = Self.makeMainMenu()
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         statusItem.menu = menu
         menu.delegate = self
@@ -996,6 +1038,43 @@ private func testCompactSessionRendering() {
     precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
 }
 
+// MARK: - Edit-menu self-tests
+//
+// The paste bug was invisible to every existing test because nothing ever
+// asserted the app had a main menu at all. These pin the mechanism: the key
+// equivalents exist, and their actions are target-less so they reach the
+// focused field editor rather than a fixed object.
+
+private func testEditMenu() {
+    let main = UsageMenuBar.makeMainMenu()
+    let edit = main.items.compactMap(\.submenu).first { $0.title == "Edit" }
+    precondition(edit != nil, "an Edit menu must exist or ⌘V has nowhere to resolve")
+
+    let expected: [(String, String, Selector)] = [
+        ("Cut", "x", #selector(NSText.cut(_:))),
+        ("Copy", "c", #selector(NSText.copy(_:))),
+        ("Paste", "v", #selector(NSText.paste(_:))),
+        ("Select All", "a", #selector(NSText.selectAll(_:))),
+    ]
+    for (title, key, action) in expected {
+        guard let item = edit?.items.first(where: { $0.title == title }) else {
+            preconditionFailure("Edit menu is missing \(title)")
+        }
+        precondition(item.keyEquivalent == key)
+        precondition(item.keyEquivalentModifierMask == .command)
+        precondition(item.action == action)
+        precondition(item.target == nil,
+                     "\(title) must stay target-less so it reaches the first responder")
+    }
+
+    // Redo shares ⌘Z with Undo and is distinguished only by the shift modifier.
+    let undo = edit?.items.first { $0.title == "Undo" }
+    let redo = edit?.items.first { $0.title == "Redo" }
+    precondition(undo?.keyEquivalent == "z" && undo?.keyEquivalentModifierMask == .command)
+    precondition(redo?.keyEquivalent == "z")
+    precondition(redo?.keyEquivalentModifierMask == [.command, .shift])
+}
+
 // MARK: - Detailed-table ordering self-tests
 //
 // Detailed rows are ordered worst-first; Compact and the `--once` printer keep
@@ -1365,6 +1444,7 @@ private func runSelfTests() {
     ThemeSelfTests.run()
     QuotaBlockSelfTests.run()
     testSeverityOrdering()
+    testEditMenu()
 
     print("Self-tests passed")
 }
