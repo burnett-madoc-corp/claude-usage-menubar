@@ -137,6 +137,22 @@ no dialog at all.
 
 Providers without a key simply show "no API key" — nothing else breaks.
 
+## Why monitor tokens at all
+
+Every request is stateless: the client re-sends the **entire transcript** —
+system prompt, tool definitions, every earlier message, every tool result — as
+input, and gets a comparatively tiny output back. So a long session gets
+quadratically expensive in total and individually heavier per turn, which is
+the whole reason the [Sessions](#sessions) section exists.
+
+![Input composition by turn](docs/charts/07-input-composition-by-turn.svg)
+
+![Total input, cumulative](docs/charts/02-cumulative-input.svg)
+
+[docs/token-metering.md](docs/token-metering.md) has the rest: the anatomy of
+one turn, the context window filling, per-turn cost by session length, when
+caching helps, and why output is a rounding error.
+
 ## Sessions
 
 A read-only view of your **live** Claude Code and Codex processes, answering
