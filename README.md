@@ -111,6 +111,11 @@ turns — and individually heavier per turn, which is the whole reason the
 
 ![Total input, cumulative](docs/charts/02-cumulative-input.svg)
 
+![Input composition per turn]<img width="1292" height="1096" alt="image" src="https://github.com/user-attachments/assets/e4c3d655-2c2e-4c58-9b1d-f8e330eb2908" />
+
+![Input increases per turn]<img width="1292" height="1096" alt="image" src="https://github.com/user-attachments/assets/68fd6732-87b9-4864-bcad-daed96dcd118" />
+
+
 [docs/token-metering.md](docs/token-metering.md) has the rest: the anatomy of
 one turn, the context window filling, per-turn cost by session length, when
 caching helps, and why output is a rounding error. Every chart is generated
