@@ -11,6 +11,9 @@ interval and API keys.
 ![The menu bar title and its dropdown: Claude, Codex and OpenRouter quota
 bars above the live Sessions panel](docs/menu-bar.png)
 
+<img width="1350" height="1140" alt="image" src="https://github.com/user-attachments/assets/d452213d-8d44-4e95-8256-f7e0483f0446" />
+
+
 ## Providers
 
 | Provider | Source | Needs a key? |
