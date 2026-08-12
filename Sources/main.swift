@@ -934,11 +934,17 @@ enum Providers {
     /// filtered form — a provider hidden from BOTH the dropdown and the
     /// title is not polled at all; one shown in either place is.
     static func all(includeHidden: Bool = false) -> [Provider] {
-        let config = Config.load()
+        // Config.load() shells out to `security` (see KeychainCLI.read) —
+        // real cost, paid on every refresh. A user who hides OpenRouter from
+        // both the dropdown and the title still had that subprocess run for
+        // them on every poll, for a key nothing was ever going to display.
+        // Skip the read entirely when OpenRouter will not be shown.
+        let openRouterVisible = includeHidden || shouldPoll(id: .openrouter)
+        let openRouterKey = openRouterVisible ? Config.load().openRouterKey : nil
         let providers: [Provider] = [
             ClaudeProvider(),
             CodexProvider(),
-            OpenRouterProvider(key: config.openRouterKey),
+            OpenRouterProvider(key: openRouterKey),
         ]
         if includeHidden { return providers }
         return providers.filter { shouldPoll(id: ProviderID(displayName: $0.name)) }
@@ -1012,7 +1018,7 @@ func makeSession(
 ) -> AgentSession {
     AgentSession(
         kind: .claude, pid: 1, label: label, taskTitle: taskTitle,
-        cwd: "/Users/alex/\(label)", model: "claude-opus-5",
+        cwd: "/Users/dev/\(label)", model: "claude-opus-5",
         busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, subagentTokens: nil,
         contextTokens: contextTokens, contextWindow: contextWindow, xFloorMultiple: xFloorMultiple,
         compactionCount: compactionCount, lastCompactionAt: nil, lastCompactionPreCtx: nil,
@@ -1113,14 +1119,24 @@ private func testKeychainCommand() {
     precondition(find.contains(service) && find.contains(KeyAccount.openRouter))
     precondition(find.contains("-w"), "without -w, security prints attributes and never the key")
 
-    let add = KeychainCommand.add(service: service, account: KeyAccount.openRouter, value: "or-secret")
-    precondition(add.first == "add-generic-password")
-    precondition(add.contains(service) && add.contains(KeyAccount.openRouter))
-    precondition(add.contains("or-secret"))
+    // The value must never appear as a bare, unquoted argv-shaped token —
+    // it goes to security(1) on stdin (see addLine), specifically so it
+    // never becomes a `ps`-visible argument in the first place.
+    let addLine = KeychainCommand.addLine(service: service, account: KeyAccount.openRouter, value: "or-secret")
+    precondition(addLine.hasPrefix("add-generic-password "))
+    precondition(addLine.contains(service) && addLine.contains(KeyAccount.openRouter))
+    precondition(addLine.contains("-w \"or-secret\""), "the value must be quoted, not a bare argv-shaped token")
     // The regression this guards: -U updates an existing item in place, which
     // needs decrypt authorization on it and so puts the approval dialog back
     // on screen for anything written by an older build. set deletes first.
-    precondition(!add.contains("-U"), "add must not update in place")
+    precondition(!addLine.contains("-U"), "add must not update in place")
+
+    // Quoting must round-trip a value carrying both characters the stdin
+    // parser treats specially — backslash and the closing quote itself —
+    // or a pasted key containing either would truncate mid-line and either
+    // store garbage or hand the rest to the parser as a second command.
+    let tricky = KeychainCommand.quoteForStdin("a\"b\\c")
+    precondition(tricky == "\"a\\\"b\\\\c\"", "backslash and double-quote must both be escaped")
 
     let remove = KeychainCommand.delete(service: service, account: KeyAccount.openRouter)
     precondition(remove.first == "delete-generic-password")

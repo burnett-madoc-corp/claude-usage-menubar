@@ -663,7 +663,7 @@ enum DetailedSessionRowSelfTests {
         let noCompactionText = DetailedSessionRow.expandedText(for: noCompaction)
         precondition(!noCompactionText.contains("compaction"),
                      "zero compactions must render no compaction line at all")
-        precondition(noCompactionText.hasPrefix("/Users/alex/"), "cwd is always the first expanded line")
+        precondition(noCompactionText.hasPrefix("/Users/dev/"), "cwd is always the first expanded line")
 
         var pending = makeSession(compactionCount: 1)
         pending.lastCompactionPreCtx = 140_000

@@ -22,4 +22,4 @@ Validate: python3 .github/scripts/validate_pr_title.py "<title>"
 - [ ] New `Sources/*.swift` files are added to `build.sh`'s `swiftc` line
 - [ ] New pure logic is covered by a `precondition` in `runSelfTests()`
 - [ ] No credential is written, redeemed, or transmitted that this app did not
-      create itself (see [SECURITY.md](../SECURITY.md))
+      create itself (see [SECURITY.md](https://github.com/burnett-madoc-corp/claude-usage-menubar/blob/main/SECURITY.md))

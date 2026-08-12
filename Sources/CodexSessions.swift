@@ -184,7 +184,28 @@ enum CodexProcessScanner {
         return result
     }
 
-    static func isCodexCommand(_ command: String) -> Bool { command.contains("codex") }
+    /// Matches "codex" as the *executable*, not merely present anywhere in
+    /// argv — a bare substring check treats `vim ~/notes/codex.md` as a
+    /// Codex process and can render a phantom session for it. Checks the
+    /// first token (the direct-exec shape, including the real binary under
+    /// `codex-darwin-arm64/…/bin/codex`) and the last token (the `node
+    /// <script>` wrapper shape, where the interpreter is first and the
+    /// actual codex script path is last) against the executable's own last
+    /// path component: exactly "codex", or a "codex-" prefix for the
+    /// vendor per-arch binary names. A file merely named `codex.md` fails
+    /// both — its last path component is "codex.md", not "codex" and not
+    /// "codex-"-prefixed.
+    static func isCodexCommand(_ command: String) -> Bool {
+        let tokens = command.split(whereSeparator: \.isWhitespace)
+        guard let first = tokens.first, let last = tokens.last else { return false }
+        return isCodexExecutableToken(first) || isCodexExecutableToken(last)
+    }
+
+    private static func isCodexExecutableToken(_ token: Substring) -> Bool {
+        let name = (String(token) as NSString).lastPathComponent
+        return name == "codex" || name.hasPrefix("codex-")
+    }
+
     static func isRealBinary(_ command: String) -> Bool { command.contains("codex-darwin-arm64") }
 
     /// A live codex is two processes sharing the same start second and cwd
@@ -360,8 +381,16 @@ actor CodexRolloutReader {
             CodexRolloutParsing.fold(line: String(decoding: lineData, as: UTF8.self), into: &acc)
             searchStart = combined.index(after: nlIndex)
         }
+        // byteOffset tracks raw bytes actually read off disk, mirroring
+        // TranscriptReader's M3 fix (Sessions.swift): `size` is a stat taken
+        // *before* the read, so if the writer appends between the stat and
+        // `readToEnd()`, the handle reads past `size` to the real EOF and
+        // `newBytes.count` exceeds `size - acc.byteOffset`. Advancing by the
+        // actual byte count read (not the stale `size`) keeps this correct in
+        // that race and is a no-op in the (overwhelmingly common)
+        // non-racing case, where the two are equal.
         acc.partialTail = Data(combined[searchStart...])
-        acc.byteOffset = size
+        acc.byteOffset += UInt64(newBytes.count)
 
         accumulators[key] = acc
         return acc
@@ -563,7 +592,7 @@ enum CodexSessionSelfTests {
         sqlite3_exec(db, "CREATE TABLE threads (\(columns))", nil, nil, nil)
 
         var insertCols = "id, rollout_path, cwd, model, created_at_ms, updated_at_ms, archived, has_user_event, tokens_used"
-        var values = "'t1','/tmp/r1.jsonl','/Users/alex/proj','gpt-5.6-sol',1786476383923,1786477701299,0,1,500"
+        var values = "'t1','/tmp/r1.jsonl','/Users/dev/proj','gpt-5.6-sol',1786476383923,1786477701299,0,1,500"
         if withAgentNicknameColumn {
             insertCols += ", agent_nickname"
             values += ",'Nash'"
@@ -582,7 +611,7 @@ enum CodexSessionSelfTests {
         precondition(threads != nil, "correct schema must parse")
         precondition(threads!.count == 1)
         precondition(threads![0].id == "t1")
-        precondition(threads![0].cwd == "/Users/alex/proj")
+        precondition(threads![0].cwd == "/Users/dev/proj")
         precondition(threads![0].model == "gpt-5.6-sol")
         precondition(threads![0].agentNickname == "Nash")
         precondition(threads![0].hasUserEvent == true)
@@ -608,7 +637,7 @@ enum CodexSessionSelfTests {
 
     // MARK: rollout fixture lines
 
-    private static func sessionMetaLine(cwd: String = "/Users/alex", nicknameTopLevel: String? = nil,
+    private static func sessionMetaLine(cwd: String = "/Users/dev", nicknameTopLevel: String? = nil,
                                          nicknameNestedOnly: String? = nil) -> String {
         var payload: [String: Any] = ["session_id": "s1", "id": "s1", "cwd": cwd, "originator": "codex-tui",
                                        "cli_version": "0.147.0", "thread_source": "user",
@@ -715,20 +744,26 @@ enum CodexSessionSelfTests {
 
     private static func testProcessScannerParsing() {
         let sample = "12345 Tue Aug 11 20:26:22 2026     /opt/homebrew/Cellar/node/23/bin/node /opt/homebrew/bin/codex\n"
-                   + "12346 Tue Aug 11 20:26:22 2026     /Users/alex/.codex/bin/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex\n"
-                   + "  999 Tue Aug 11 07:00:00 2026     /usr/bin/unrelated-process"
+                   + "12346 Tue Aug 11 20:26:22 2026     /Users/dev/.codex/bin/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex\n"
+                   + "  999 Tue Aug 11 07:00:00 2026     /usr/bin/unrelated-process\n"
+                   + "  998 Tue Aug 11 07:00:00 2026     /usr/bin/vim /Users/dev/notes/codex.md"
         let parsed = CodexProcessScanner.parse(psOutput: sample)
-        precondition(parsed.count == 3)
+        precondition(parsed.count == 4)
         precondition(CodexProcessScanner.isCodexCommand(parsed[0].command))
         precondition(!CodexProcessScanner.isRealBinary(parsed[0].command), "the node wrapper is not the real binary")
         precondition(CodexProcessScanner.isCodexCommand(parsed[1].command))
         precondition(CodexProcessScanner.isRealBinary(parsed[1].command))
         precondition(!CodexProcessScanner.isCodexCommand(parsed[2].command), "an unrelated process must not match")
+        // Regression: a bare substring check matched this too — the file
+        // being edited merely contains "codex" in its name, and vim is not
+        // Codex.
+        precondition(!CodexProcessScanner.isCodexCommand(parsed[3].command),
+                     "editing a file named codex.md must not be mistaken for a codex process")
     }
 
     private static func testCwdLookupParsing() {
-        let sample = "p12345\nfcwd\na \ntVDIR\nn/Users/alex/scratch/cumb-sessions\n"
-        precondition(CwdLookup.parse(lsofOutput: sample) == "/Users/alex/scratch/cumb-sessions")
+        let sample = "p12345\nfcwd\na \ntVDIR\nn/Users/dev/scratch/cumb-sessions\n"
+        precondition(CwdLookup.parse(lsofOutput: sample) == "/Users/dev/scratch/cumb-sessions")
         precondition(CwdLookup.parse(lsofOutput: "") == nil, "no lsof output must yield nil, not crash")
     }
 
@@ -736,15 +771,15 @@ enum CodexSessionSelfTests {
 
     private static func testDedupeNodeWrapperVsRealBinary() {
         let started = Date()
-        let wrapper = CodexProcess(pid: 100, startedLocal: started, cwd: "/Users/alex", isRealBinary: false)
-        let real = CodexProcess(pid: 101, startedLocal: started, cwd: "/Users/alex", isRealBinary: true)
+        let wrapper = CodexProcess(pid: 100, startedLocal: started, cwd: "/Users/dev", isRealBinary: false)
+        let real = CodexProcess(pid: 101, startedLocal: started, cwd: "/Users/dev", isRealBinary: true)
         let deduped = CodexProcessScanner.dedupe([wrapper, real])
         precondition(deduped.count == 1, "same start time + cwd must dedupe to one process")
         precondition(deduped[0].pid == 101, "the real binary must be preferred over the node wrapper")
 
         // Distinct cwd or start time must NOT collapse into one — two
         // genuinely separate live codex instances.
-        let other = CodexProcess(pid: 200, startedLocal: started.addingTimeInterval(120), cwd: "/Users/alex", isRealBinary: true)
+        let other = CodexProcess(pid: 200, startedLocal: started.addingTimeInterval(120), cwd: "/Users/dev", isRealBinary: true)
         precondition(CodexProcessScanner.dedupe([wrapper, real, other]).count == 2)
     }
 
@@ -760,10 +795,10 @@ enum CodexSessionSelfTests {
 
     private static func testMatchWithinTolerance() {
         let started = Date()
-        let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/alex", isRealBinary: true)
+        let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/dev", isRealBinary: true)
 
         // Just inside ±5s.
-        let inTol = thread(id: "in-tol", cwd: "/Users/alex", createdAt: started.addingTimeInterval(4.9))
+        let inTol = thread(id: "in-tol", cwd: "/Users/dev", createdAt: started.addingTimeInterval(4.9))
         let matches = CodexMatcher.match(processes: [proc], threads: [inTol])
         precondition(matches.count == 1 && matches[0].thread?.id == "in-tol" && !matches[0].ambiguous && !matches[0].viaFallback,
                      "a thread 4.9s from process start, same cwd, must match confidently")
@@ -771,11 +806,11 @@ enum CodexSessionSelfTests {
 
     private static func testMatchOutOfToleranceFallback() {
         let started = Date()
-        let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/alex", isRealBinary: true)
+        let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/dev", isRealBinary: true)
 
         // 5.1s out of tolerance — a resumed session — but the cwd matches,
         // so it must fall back to a labelled best guess, not pending.
-        let resumed = thread(id: "resumed", cwd: "/Users/alex", createdAt: started.addingTimeInterval(-3600),
+        let resumed = thread(id: "resumed", cwd: "/Users/dev", createdAt: started.addingTimeInterval(-3600),
                               updatedAt: started.addingTimeInterval(-10))
         let matches = CodexMatcher.match(processes: [proc], threads: [resumed])
         precondition(matches.count == 1)
@@ -786,11 +821,11 @@ enum CodexSessionSelfTests {
 
     private static func testMatchAmbiguousTieBreak() {
         let started = Date()
-        let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/alex", isRealBinary: true)
+        let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/dev", isRealBinary: true)
 
         // Two threads, same second, same cwd — genuinely ambiguous.
-        let a = thread(id: "a", cwd: "/Users/alex", createdAt: started.addingTimeInterval(1), updatedAt: started.addingTimeInterval(100))
-        let b = thread(id: "b", cwd: "/Users/alex", createdAt: started.addingTimeInterval(-1), updatedAt: started.addingTimeInterval(50))
+        let a = thread(id: "a", cwd: "/Users/dev", createdAt: started.addingTimeInterval(1), updatedAt: started.addingTimeInterval(100))
+        let b = thread(id: "b", cwd: "/Users/dev", createdAt: started.addingTimeInterval(-1), updatedAt: started.addingTimeInterval(50))
         let matches = CodexMatcher.match(processes: [proc], threads: [a, b])
         precondition(matches.count == 2, "both ambiguous candidates must be rendered, not silently collapsed to one")
         precondition(matches.allSatisfy(\.ambiguous), "both must be flagged ambiguous, not just one")
@@ -798,7 +833,7 @@ enum CodexSessionSelfTests {
     }
 
     private static func testMatchPendingNoThreadsRow() {
-        let proc = CodexProcess(pid: 1, startedLocal: Date(), cwd: "/Users/alex/fresh-project", isRealBinary: true)
+        let proc = CodexProcess(pid: 1, startedLocal: Date(), cwd: "/Users/dev/fresh-project", isRealBinary: true)
         // No thread anywhere shares this cwd — lazy row creation, pre-first-turn.
         let unrelated = thread(id: "x", cwd: "/Users/somewhere/else", createdAt: Date())
         let matches = CodexMatcher.match(processes: [proc], threads: [unrelated])
@@ -807,7 +842,7 @@ enum CodexSessionSelfTests {
         precondition(!matches[0].ambiguous && !matches[0].viaFallback)
 
         // Archived threads must never be offered as matches even if cwd+time line up.
-        let archived = thread(id: "arch", cwd: "/Users/alex/fresh-project", createdAt: proc.startedLocal, archived: true)
+        let archived = thread(id: "arch", cwd: "/Users/dev/fresh-project", createdAt: proc.startedLocal, archived: true)
         let matchesArchived = CodexMatcher.match(processes: [proc], threads: [archived])
         precondition(matchesArchived[0].thread == nil, "an archived thread must not be matched")
     }
@@ -860,7 +895,7 @@ enum CodexSessionSelfTests {
     private static func testLiveSessionsEndToEndPending() {
         let sem = DispatchSemaphore(value: 0)
         Task {
-            let proc = CodexProcess(pid: 4242, startedLocal: Date(), cwd: "/Users/alex/new-project", isRealBinary: true)
+            let proc = CodexProcess(pid: 4242, startedLocal: Date(), cwd: "/Users/dev/new-project", isRealBinary: true)
             let sessions = await CodexSessionScanner.liveSessions(processes: [proc], threads: [], reader: CodexRolloutReader())
             precondition(sessions.count == 1, "a live codex PID with no threads row must still render")
             precondition(sessions[0].hasUsage == false)

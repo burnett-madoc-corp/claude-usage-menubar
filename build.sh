@@ -12,16 +12,35 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Resources/*-template.svg "$APP/Contents/Resources/"
 
-echo "Compiling…"
+# One binary that runs on both CPU families. Building each slice with its own
+# swiftc invocation (rather than `-target x86_64-apple-macosx13.0 arm64-…`,
+# which swiftc does not accept) and stitching them together with lipo is the
+# same approach Xcode itself uses under the hood for a multi-arch product.
+echo "Compiling (arm64)…"
 swiftc -O \
   -target arm64-apple-macosx13.0 \
   -framework AppKit \
   -framework Security \
-  -o "$BIN" \
+  -o "$BIN-arm64" \
   Sources/Providers.swift Sources/KeyStore.swift Sources/Prefs.swift \
   Sources/Sessions.swift Sources/CodexSessions.swift Sources/SettingsWindow.swift \
   Sources/Theme.swift Sources/PollPolicy.swift Sources/QuotaBlockView.swift \
   Sources/SessionRowView.swift Sources/main.swift
+
+echo "Compiling (x86_64)…"
+swiftc -O \
+  -target x86_64-apple-macosx13.0 \
+  -framework AppKit \
+  -framework Security \
+  -o "$BIN-x86_64" \
+  Sources/Providers.swift Sources/KeyStore.swift Sources/Prefs.swift \
+  Sources/Sessions.swift Sources/CodexSessions.swift Sources/SettingsWindow.swift \
+  Sources/Theme.swift Sources/PollPolicy.swift Sources/QuotaBlockView.swift \
+  Sources/SessionRowView.swift Sources/main.swift
+
+echo "Combining into a universal binary…"
+lipo -create -output "$BIN" "$BIN-arm64" "$BIN-x86_64"
+rm -f "$BIN-arm64" "$BIN-x86_64"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
