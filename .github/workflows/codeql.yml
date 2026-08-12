@@ -1,0 +1,59 @@
+name: CodeQL
+
+# Static vulnerability analysis of the Swift sources. CodeQL's Swift support
+# needs a real compile, and this app links AppKit, so this only runs on macOS.
+# Hosted macOS minutes are free for public repositories, which is the only
+# footing on which this can run at all -- see the job's `if` below. Weekly
+# rather than nightly because the Swift analysis costs a full build each time.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays, 04:17 UTC. Off the hour so it does not pile into the top-of-hour
+    # scheduling queue, which is when GitHub delays cron runs the longest.
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (swift)
+    # Hosted macOS runners are refused while this repo is private (the org's
+    # Actions quota is exhausted), so the job would fail in ~3s having analysed
+    # nothing. Skip it until the repo is public, at which point the minutes are
+    # free and it starts running on its own. This check is not required to
+    # merge, so skipping it does not gate anything.
+    if: ${{ github.event.repository.visibility == 'public' }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      # Required for the action to read workflow run status on private repos.
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        with:
+          languages: swift
+          # `autobuild` does not understand a bare `swiftc` invocation with no
+          # Package.swift or xcodeproj, so the build is driven explicitly.
+          build-mode: manual
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3
+        with:
+          category: "/language:swift"

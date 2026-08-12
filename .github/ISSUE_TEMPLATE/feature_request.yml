@@ -1,0 +1,30 @@
+name: Feature request
+description: A new provider, signal, or behaviour
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to see that you cannot see now
+      description: The signal you want in the menu bar or dropdown, and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: source
+    attributes:
+      label: Where would the data come from
+      description: |
+        For a new provider this is the important part. Is there a pollable
+        endpoint, or a local file the tool already writes? The Gemini CLI is
+        deliberately unsupported because it exposes neither — see the README.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Credential boundary
+      options:
+        - label: This does not require writing, redeeming, or transmitting a credential owned by another tool.
+          required: true

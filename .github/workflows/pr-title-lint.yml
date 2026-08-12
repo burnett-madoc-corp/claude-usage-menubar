@@ -18,4 +18,19 @@ concurrency:
 
 jobs:
   pr-title-lint:
-    uses: burnett-madoc-corp/Claude-skills/.github/workflows/pr-title-lint-reusable.yml@main
+    name: pr-title-lint
+    # Hosted runners are refused while this repo is private (the org's Actions
+    # quota is exhausted), so run on skynet until it is public. The validator is
+    # stdlib Python either way. Fork PRs go to a hosted runner regardless, since
+    # untrusted code must never reach the self-hosted box.
+    runs-on: ${{ (github.event.repository.visibility == 'public' || github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","skynet"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Validate title
+        env:
+          # Via the environment, never interpolated into the shell: a PR title
+          # is attacker-controlled text and `${{ }}` inside `run:` is a script
+          # injection sink.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 .github/scripts/validate_pr_title.py "$PR_TITLE"

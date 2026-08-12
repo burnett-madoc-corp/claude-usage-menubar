@@ -1,0 +1,61 @@
+name: Bug report
+description: Something the app shows is wrong, missing, or crashes
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report anything credential-related here — see
+        [SECURITY.md](../blob/main/SECURITY.md) for private reporting.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What the app showed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Which provider
+      options:
+        - Claude
+        - Codex
+        - Antigravity
+        - OpenRouter
+        - Grok (xAI)
+        - Sessions
+        - Menu bar title / app itself
+        - Not provider-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: once-output
+    attributes:
+      label: Output of `--once`
+      description: |
+        `build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --once` prints
+        everything the app would show, headlessly. Redact anything you would
+        rather not publish — working directory paths appear in session rows.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "14.5"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit built from
+      description: "`git rev-parse --short HEAD`"
+    validations:
+      required: false

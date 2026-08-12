@@ -1,0 +1,22 @@
+version: 2
+
+# The app itself has no third-party dependencies -- build.sh calls swiftc
+# directly and there is no Package.swift -- so GitHub Actions is the only
+# ecosystem with anything to update. Workflows pin actions by commit SHA, which
+# is what makes these updates worth automating: a pinned SHA never drifts to a
+# patched release on its own.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "[chore][ci]"
+    labels:
+      - dependencies
+    groups:
+      actions:
+        patterns:
+          - "*"
