@@ -203,6 +203,39 @@ enum Display {
         }
         return name.isEmpty ? raw : name
     }
+
+    /// The context window as a suffix on the model name — "opus-5 (1m)",
+    /// "gpt-5.2-codex (200k)". Two sessions on the same model can be running
+    /// against different windows, and the context bar alone cannot say which:
+    /// a half-full bar means something very different at 200k than at 1m.
+    ///
+    /// Lowercase m/k, and a bare integer where the value divides cleanly, so
+    /// the suffix reads as a size rather than a measurement. Deliberately not
+    /// `Format.tokens`, which renders "1.0M" for the same number — that is the
+    /// house style for *consumed* token counts, which this is not.
+    nonisolated static func windowSuffix(_ window: Int64?) -> String {
+        // Unknown stays silent rather than guessing a default window: the
+        // context cell already says "window unknown" for exactly this case,
+        // and a fabricated "(200k)" there would be a claim, not a placeholder.
+        guard let window, window > 0 else { return "" }
+        return " (\(compactSize(window)))"
+    }
+
+    nonisolated static func compactSize(_ value: Int64) -> String {
+        func trim(_ scaled: Double, _ unit: String) -> String {
+            let rounded = (scaled * 10).rounded() / 10
+            return rounded == rounded.rounded()
+                ? "\(Int(rounded))\(unit)"
+                : String(format: "%.1f%@", rounded, unit)
+        }
+        if value >= 1_000_000 { return trim(Double(value) / 1_000_000, "m") }
+        if value >= 1_000 { return trim(Double(value) / 1_000, "k") }
+        return "\(value)"
+    }
+
+    nonisolated static func modelWithWindow(_ raw: String, window: Int64?) -> String {
+        shortModel(raw) + windowSuffix(window)
+    }
 }
 
 // MARK: - Drawing primitives
@@ -354,6 +387,20 @@ enum ThemeSelfTests {
         precondition(Display.shortModel("claude-sonnet-5-20260115") == "sonnet-5")
         precondition(Display.shortModel("anthropic/claude-opus-5") == "opus-5")
         precondition(Display.shortModel("opus-5") == "opus-5")
+
+        // The context window rides the model name: two sessions on the same
+        // model can be running against different windows.
+        precondition(Display.modelWithWindow("claude-opus-5", window: 1_000_000) == "opus-5 (1m)")
+        precondition(Display.modelWithWindow("gpt-5.2-codex", window: 200_000) == "gpt-5.2-codex (200k)")
+        precondition(Display.compactSize(1_500_000) == "1.5m")
+        precondition(Display.compactSize(200_000) == "200k")
+        precondition(Display.compactSize(64_000) == "64k")
+        precondition(Display.compactSize(900) == "900")
+
+        // Unknown window stays silent — never a fabricated default.
+        precondition(Display.windowSuffix(nil).isEmpty)
+        precondition(Display.windowSuffix(0).isEmpty)
+        precondition(Display.modelWithWindow("claude-opus-5", window: nil) == "opus-5")
 
         // Identity, never severity: the accent depends only on which provider.
         precondition(ProviderAccent.forProvider("Claude") == .claude)
