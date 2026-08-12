@@ -99,6 +99,49 @@ struct Config: Sendable {
     }
 }
 
+/// Bounded wrapper around `security(1)`.
+///
+/// A Keychain read can block indefinitely, and does so routinely here: the app
+/// is ad-hoc signed, so every install is a new code identity and macOS puts an
+/// access-approval dialog on screen. `security` then waits for that dialog —
+/// forever, if nobody clicks it.
+///
+/// Unbounded, that single dialog blanked the entire usage section. `loadAll`
+/// awaits every provider, so one that never returns takes down the others with
+/// it, including Codex and OpenRouter which never touch the Keychain at all.
+enum KeychainCLI {
+    /// Long enough that a genuinely slow read succeeds, short enough that the
+    /// menu is not held hostage to a dialog nobody is looking at.
+    static let timeout: TimeInterval = 8
+
+    enum Failure: Error { case blocked, failed }
+
+    static func read(_ arguments: [String], timeout: TimeInterval = timeout) -> Result<Data, Failure> {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = arguments
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+
+        let finished = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in finished.signal() }
+        guard (try? task.run()) != nil else { return .failure(.failed) }
+
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            // Leaves the approval dialog up — answering it makes the next poll
+            // succeed. Only this read is abandoned, not the user's decision.
+            task.terminate()
+            return .failure(.blocked)
+        }
+        // Safe to read after exit only because these payloads are a few KB;
+        // a larger one could fill the pipe buffer and stall the child, which
+        // the timeout above would then catch as .blocked rather than hang.
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return task.terminationStatus == 0 ? .success(data) : .failure(.failed)
+    }
+}
+
 enum Net {
     static func getJSON(_ url: URL, bearer: String, extraHeaders: [String: String] = [:],
                         postBody: Data? = nil) async throws -> [String: Any] {
@@ -414,16 +457,9 @@ struct AntigravityProvider: Provider {
     private struct Token { let accessToken: String; let expiry: Date? }
 
     private func keychainToken() -> Token? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        guard (try? task.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return nil }
+        guard case let .success(data) = KeychainCLI.read(
+            ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"]
+        ) else { return nil }
 
         var raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if raw.hasPrefix("go-keyring-base64:") {
