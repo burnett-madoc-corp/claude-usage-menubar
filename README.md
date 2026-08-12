@@ -108,13 +108,58 @@ set, its field shows disabled instead of quietly being outranked — a saved
 Keychain key you can't tell is being ignored is exactly the kind of thing that
 costs someone an afternoon.
 
-One existing wart, not new: the app is ad-hoc signed (`build.sh`), so every
-rebuild is a different identity as far as macOS's Keychain ACLs are concerned
-— a rebuild can retrigger the "ClaudeUsage wants to access…" prompt even for a
-key this app itself created. Developer ID signing is the real fix; out of
-scope here.
+These keys are written and read through `/usr/bin/security` rather than
+Security.framework, which is the one non-obvious thing about this code. macOS
+gates a Keychain item on *code identity* — the item's ACL names trusted
+applications, and its partition list names permitted signing identities, both
+filled in from whoever created the item. This app is ad-hoc signed
+(`build.sh`), so it has no stable identity: an item written with `SecItemAdd`
+came out pinned to that exact binary, `Partitions: [cdhash:…]`, and the next
+build was a stranger to it. The result was a login-password dialog after every
+install, where "Always Allow" grants access to a binary about to be replaced.
+Going through `security` borrows an identity that does not change
+(`apple-tool:`), which is also why this app's reads of *other* apps' items
+never prompted.
+
+The trade-off is deliberate: any process running as you can also run
+`security` and read these keys back. That was already true of every other
+Keychain item this app reads, and the code-identity gate it replaces bought no
+confidentiality — an ad-hoc app cannot hold one — only a dialog. Developer ID
+signing would restore a real gate; out of scope here.
+
+An item written *before* this change is still pinned to the build that wrote
+it, and by design cannot be read without one approval dialog. If that dialog
+goes unanswered, the account is treated as having no key **for the rest of that
+run** rather than being asked for again on the next poll — one dialog, not an
+endless stream — and Settings says `stored key unreadable` instead of
+pretending no key is set. Pasting the key in and saving repairs the item with
+no dialog at all.
 
 Providers without a key simply show "no API key" — nothing else breaks.
+
+## Why monitor tokens at all
+
+Every request is stateless: the client re-sends the **entire transcript** —
+system prompt, tool definitions, every earlier message, every tool result — as
+input, and gets a comparatively tiny output back. So a long session gets
+disproportionately expensive in total — roughly 2.7× the input for 2× the
+turns — and individually heavier per turn, which is the whole reason the
+[Sessions](#sessions) section exists.
+
+![Where tokens come from](docs/charts/08-token-flow.svg)
+
+![Input composition by turn](docs/charts/07-input-composition-by-turn.svg)
+
+![Total input, cumulative](docs/charts/02-cumulative-input.svg)
+
+That is what the Sessions section puts in front of you, per live session:
+
+![Live sessions in the menu bar](docs/charts/09-sessions-panel.svg)
+
+[docs/token-metering.md](docs/token-metering.md) has the rest: the anatomy of
+one turn, the context window filling, per-turn cost by session length, when
+caching helps, and why output is a rounding error. Every chart is generated
+from measured sessions by [`tools/token_charts.py`](tools/token_charts.py).
 
 ## Sessions
 
@@ -129,13 +174,14 @@ Two complementary signals drive each row:
 - **contextPercent** — how full the context window is, against the model's
   window size. Absolute, but only as good as the window it's dividing by —
   see the limitation below.
-- **xFloor** — a *relative* cost multiple: what a turn costs right now versus
+- **BLOAT** — a *relative* cost multiple: what a turn costs right now versus
   the first few turns of the session (or since the last compaction). It needs
   no context-window constant at all, so it stays correct even in the cases
-  where contextPercent is working from a wrong denominator.
+  where contextPercent is working from a wrong denominator. (`xFloor` in the
+  source, which is where the `x` in `5.2x` comes from.)
 
 Row colour is the **worse of the two** severities — a session that opened
-with one huge turn pins xFloor near 1.0x forever while contextPercent quietly
+with one huge turn pins BLOAT near 1.0x forever while contextPercent quietly
 climbs toward full, and neither signal alone would catch that.
 
 Two row styles, chosen in Settings (default Detailed):
@@ -206,8 +252,10 @@ login. To just build and run without installing:
 ./build.sh && open build/ClaudeUsage.app
 ```
 
-On first launch macOS asks for Keychain access — choose **Always Allow** so it
-does not prompt again.
+The app's own API keys never raise a Keychain dialog (see above). Items
+created by *other* apps — Claude Code's OAuth token, Antigravity's — carry
+their own access rules, so macOS may ask about one of those once; choose
+**Always Allow**.
 
 ### Uninstall
 
@@ -275,7 +323,7 @@ Sessions carries its own, smaller set:
   at start time, then a spawned subagent's `resolvedModel` as corroboration,
   then an observed-usage upgrade to 1M once real usage exceeds 200k — but no
   transcript event records a mid-session `/model` switch, so contextPercent
-  can be stale until the observed-usage tier catches up. **xFloor is
+  can be stale until the observed-usage tier catches up. **BLOAT is
   unaffected** — it never touches a window size at all.
 - **Codex session matching is start-time proximity, not identity.** A live
   `codex` process is matched to its `state_*.sqlite` thread row by cwd plus

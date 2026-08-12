@@ -12,11 +12,27 @@ struct Row {
 }
 
 /// A provider's section in the menu: a title plus its rows, or an error.
+///
+/// `badge` is the small pill drawn beside the provider name. It is set
+/// structurally at the point the condition is known — staleness in
+/// `UsageMenuBar.merge`, snapshot age in `CodexProvider.card` — rather than
+/// recovered later by pattern-matching `note`, which the renderer would
+/// otherwise have to parse back out of a human-readable sentence.
 struct Card {
     var provider: String
     var rows: [Row]
     var note: String?
     var error: String?
+    var badge: Badge?
+    /// Distinguishes "you have not set this provider up yet" from "the fetch
+    /// failed", which read identically as an error string but call for
+    /// completely different rows — a setup hint versus a diagnostic.
+    var missingKey: Bool = false
+    /// Set on an HTTP 429. Drives the poll backoff, so it has to survive as a
+    /// flag rather than as prose in `error` — `merge` replaces a failed card
+    /// with the previous good rows, and the reason for the failure would be
+    /// lost with it exactly when the scheduler needs to know.
+    var rateLimited: Bool = false
 }
 
 struct HeadlineValue {
@@ -53,7 +69,15 @@ struct Config: Sendable {
     static var legacyPath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/claude-usage/config.json")
 
-    static func load(store: KeyStore = KeychainStore()) -> Config {
+    /// The polling path reads straight through to the Keychain on every
+    /// refresh. There is no cache and no timeout wrapper in front of it any
+    /// more: those existed to survive an approval dialog that this app's own
+    /// items no longer raise (see KeychainStore), and a cache that outlives
+    /// the dialog it was built for is just a way to serve a stale key after
+    /// the user changes one.
+    static let pollingStore: KeyStore = KeychainStore()
+
+    static func load(store: KeyStore = Config.pollingStore) -> Config {
         let legacy = legacyKeys()
         let env = ProcessInfo.processInfo.environment
 
@@ -80,6 +104,55 @@ struct Config: Sendable {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return (nil, nil) }
         return (json["openrouter_key"] as? String, json["xai_key"] as? String)
+    }
+}
+
+/// Bounded wrapper around `security(1)`.
+///
+/// A Keychain read can block indefinitely: if macOS decides the caller needs
+/// approval it puts a dialog on screen and `security` waits for it — forever,
+/// if nobody clicks it. Unbounded, one such dialog blanked the entire usage
+/// section, because `loadAll` awaits every provider and one that never returns
+/// takes down the others with it, including those that touch no Keychain at
+/// all.
+///
+/// This app's own keys no longer trigger that dialog (see KeychainStore), but
+/// the items it reads from *other* apps — Claude Code's OAuth token,
+/// Antigravity's go-keyring blob — are written by those apps under their own
+/// access rules, so the timeout stays.
+enum KeychainCLI {
+    /// Long enough that a genuinely slow read succeeds, short enough that the
+    /// menu is not held hostage to a dialog nobody is looking at.
+    static let timeout: TimeInterval = 8
+
+    /// `failed` carries security(1)'s exit status so callers can tell the
+    /// routine outcomes apart from the real ones — 44 is "no such item",
+    /// which for a key that was never configured is not an error at all.
+    enum Failure: Error { case blocked, failed(Int32) }
+
+    static func read(_ arguments: [String], timeout: TimeInterval = timeout) -> Result<Data, Failure> {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = arguments
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+
+        let finished = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in finished.signal() }
+        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
+
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            // Leaves the approval dialog up — answering it makes the next poll
+            // succeed. Only this read is abandoned, not the user's decision.
+            task.terminate()
+            return .failure(.blocked)
+        }
+        // Safe to read after exit only because these payloads are a few KB;
+        // a larger one could fill the pipe buffer and stall the child, which
+        // the timeout above would then catch as .blocked rather than hang.
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
     }
 }
 
@@ -210,12 +283,16 @@ struct CodexProvider: Provider {
 
         guard !rows.isEmpty else { return nil }
 
-        var note = (limits["plan_type"] as? String).map { "plan: \($0)" }
+        // Snapshot age and plan are two different things and now render in two
+        // different places — the age as the header badge, since "how old is
+        // this reading" qualifies every row in the block, and the plan as the
+        // block's own note. They used to be joined into one note string.
+        let note = (limits["plan_type"] as? String).map { "plan: \($0)" }
+        var badge: Badge?
         if let timestamp, let date = Format.iso.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) {
-            let age = Format.ago(date)
-            note = [note, "as of \(age)"].compactMap { $0 }.joined(separator: " · ")
+            badge = Badge(text: "as of \(Format.ago(date))", kind: .gray)
         }
-        return Card(provider: name, rows: rows, note: note)
+        return Card(provider: name, rows: rows, note: note, badge: badge)
     }
 
     /// 10080 minutes is the weekly window, 300 the 5-hour one.
@@ -264,7 +341,7 @@ struct OpenRouterProvider: Provider {
 
     func load() async -> Card {
         guard let key, !key.isEmpty else {
-            return Card(provider: name, rows: [], error: "no API key — see README")
+            return Card(provider: name, rows: [], error: "no API key — see README", missingKey: true)
         }
         do {
             let json = try await Net.getJSON(URL(string: "https://openrouter.ai/api/v1/credits")!, bearer: key)
@@ -318,7 +395,7 @@ struct XAIProvider: Provider {
 
     func load() async -> Card {
         guard let key, !key.isEmpty else {
-            return Card(provider: name, rows: [], error: "no API key — see README")
+            return Card(provider: name, rows: [], error: "no API key — see README", missingKey: true)
         }
         do {
             let json = try await Net.getJSON(URL(string: "https://api.x.ai/v1/api-key")!, bearer: key)
@@ -394,16 +471,9 @@ struct AntigravityProvider: Provider {
     private struct Token { let accessToken: String; let expiry: Date? }
 
     private func keychainToken() -> Token? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        guard (try? task.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return nil }
+        guard case let .success(data) = KeychainCLI.read(
+            ["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"]
+        ) else { return nil }
 
         var raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if raw.hasPrefix("go-keyring-base64:") {

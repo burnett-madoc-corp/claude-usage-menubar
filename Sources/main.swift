@@ -80,11 +80,15 @@ extension SessionScanner.Severity {
 // MARK: - Claude
 
 enum ClaudeError: LocalizedError {
-    case noCredentials, tokenExpired, http(Int)
+    case noCredentials, keychainBlocked, tokenExpired, http(Int)
 
     var errorDescription: String? {
         switch self {
         case .noCredentials: return "No Claude credentials in Keychain"
+        case .keychainBlocked:
+            // Names the fix, because the dialog is easy to miss behind other
+            // windows and the section stays empty until it is answered.
+            return "waiting for Keychain approval — click Always Allow"
         case .tokenExpired: return "Token expired — run `claude` to refresh"
         case .http(let code): return "Usage API returned HTTP \(code)"
         }
@@ -100,18 +104,14 @@ enum ClaudeError: LocalizedError {
 /// next poll, since the Keychain is re-read every time.
 enum Keychain {
     static func claudeToken() throws -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        try task.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
+        let data: Data
+        switch KeychainCLI.read(["find-generic-password", "-s", "Claude Code-credentials", "-w"]) {
+        case .success(let payload): data = payload
+        case .failure(.blocked): throw ClaudeError.keychainBlocked
+        case .failure(.failed): throw ClaudeError.noCredentials // any exit status: no usable token
+        }
 
-        guard task.terminationStatus == 0,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = json["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String
         else { throw ClaudeError.noCredentials }
@@ -177,7 +177,7 @@ struct ClaudeProvider: Provider {
             Self.headline.value = nil
             return Card(provider: name, rows: [], error: ClaudeError.tokenExpired.localizedDescription)
         } catch let error as NSError where error.domain == "http" && error.code == 429 {
-            return Card(provider: name, rows: [], error: "rate limited by usage API")
+            return Card(provider: name, rows: [], error: "rate limited by usage API", rateLimited: true)
         } catch {
             return Card(provider: name, rows: [], error: error.localizedDescription)
         }
@@ -218,12 +218,71 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private var detailedRowViews: [SessionRowView] = []
     private var expandedSessionKeys: Set<String> = []
     private var isMenuOpen = false
-    private var detailedRowWidth: CGFloat = 330
+    /// Every custom view in the panel is drawn to one fixed width. The old
+    /// "measure the widest attributedTitle row and clamp it" approach has no
+    /// input left now that the quota blocks are custom views too — and a fixed
+    /// width is what stops the panel breathing as labels change length.
+    private var detailedRowWidth: CGFloat { Panel.width }
     // The Anthropic usage endpoint rate-limits aggressively; Prefs enforces a
     // 60s floor (default 120s) for exactly that reason — see Prefs.swift.
-    private var refreshInterval: TimeInterval { Prefs.refreshInterval() }
+    /// The user's setting is the *active* rate; PollPolicy scales the idle
+    /// tiers off it. Nothing polls faster than this.
+    private var baseInterval: TimeInterval { Prefs.refreshInterval() }
+    /// Poll-cadence state. `lastUsageFingerprint` starts nil so the very first
+    /// poll cannot be mistaken for movement.
+    private var scheduledInterval: TimeInterval?
+    private var lastUsageFingerprint: String?
+    /// Whether the most recent poll's numbers differed from the one before.
+    /// Held as state rather than recomputed inside retune(), because retune()
+    /// also runs when only the session set changed — recomputing there would
+    /// compare the fingerprint against itself, always yield "unchanged", and
+    /// silently undo the drifting tier a moment after a poll chose it.
+    private var usageMoved = false
+    private var consecutiveRateLimits = 0
+
+    /// The settings window's text fields would not accept ⌘V.
+    ///
+    /// AppKit dispatches ⌘X/⌘C/⌘V/⌘A by walking `NSApp.mainMenu` for a matching
+    /// key equivalent and sending its action down the responder chain. This app
+    /// is LSUIElement/.accessory and never built a main menu, so there was
+    /// nothing to match: the keystroke was swallowed before the field editor
+    /// ever saw it, and a paste silently did nothing. Right-clicking a field
+    /// still offered Paste, which is why this looked like the field rejecting
+    /// the text rather than the shortcut never arriving.
+    ///
+    /// An .accessory app never displays a menu bar, so this menu is invisible.
+    /// It exists purely so those key equivalents have somewhere to resolve.
+    /// Every item is left target-less on purpose — that is what sends the
+    /// action to the first responder, i.e. whichever field editor is focused.
+    nonisolated static func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        // undo:/redo: are responder-chain conventions with no Swift-visible
+        // method to point #selector at, unlike the four editing actions below.
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        return main
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = Self.makeMainMenu()
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         statusItem.menu = menu
         menu.delegate = self
@@ -248,6 +307,12 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             // would dismiss the tooltip the user is reading. Closed, a
             // rebuild is free and keeps the code path simple.
             if self.sessionsTick != nil { self.applySessionUpdates() } else { self.rebuildMenu() }
+            // Sessions load asynchronously and separately from the provider
+            // poll, so the first retune() after launch would otherwise decide
+            // the cadence while `sessions` was still empty — parking an
+            // actively-working machine in the hourly tier until the next poll,
+            // an hour away. Re-pick whenever the session set lands.
+            self.retune()
         }
     }
 
@@ -255,13 +320,33 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// mutable interval, and this keeps .common run-loop mode registration
     /// (needed so the timer keeps firing while a menu's modal tracking loop
     /// is open) in exactly one place.
-    private func scheduleTimer() {
+    private func scheduleTimer(interval: TimeInterval? = nil) {
+        let target = interval ?? baseInterval
+        // Rescheduling restarts the countdown, so only do it when the cadence
+        // actually changed — otherwise a quiet-tier poll would keep pushing its
+        // own next fire another hour out on every retune.
+        guard scheduledInterval != target || timer == nil else { return }
+        scheduledInterval = target
         timer?.invalidate()
-        let t = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let t = Timer.scheduledTimer(withTimeInterval: target, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    /// Re-picks the cadence from what the last poll revealed, after every poll,
+    /// so a session starting or the quota moving takes effect on the next
+    /// interval rather than at some fixed re-evaluation point.
+    private func retune() {
+        let tier = PollPolicy.tier(
+            sessionsActive: PollPolicy.isActive(sessions, now: Date()),
+            usageChanged: usageMoved
+        )
+        scheduleTimer(interval: PollPolicy.backedOff(
+            PollPolicy.interval(base: baseInterval, tier: tier),
+            consecutiveRateLimits: consecutiveRateLimits
+        ))
     }
 
     /// Fires for any settings change (visibility or interval).
@@ -278,6 +363,9 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// 429s. One poll, shortly after the user stops clicking, is what's
     /// actually wanted.
     private func handlePrefsChanged() {
+        // The base moved, so every tier derived from it did too — drop the memo
+        // so the next scheduleTimer call is not skipped as a no-op.
+        scheduledInterval = nil
         scheduleTimer()
         renderTitle()
         prefsRefreshDebounce?.invalidate()
@@ -290,10 +378,18 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     @objc func refresh() {
         Task { @MainActor in
-            cards = Self.merge(new: await Providers.loadAll(), previous: cards)
+            let fresh = await Providers.loadAll()
+            // Read the rate-limit signal before merge(), which swaps a failed
+            // card for the previous good rows and takes the flag with it.
+            consecutiveRateLimits = fresh.contains(where: \.rateLimited) ? consecutiveRateLimits + 1 : 0
+            cards = Self.merge(new: fresh, previous: cards)
+            let fingerprint = PollPolicy.usageFingerprint(cards)
+            usageMoved = lastUsageFingerprint.map { $0 != fingerprint } ?? false
+            lastUsageFingerprint = fingerprint
             lastUpdated = Date()
             renderTitle()
             rebuildMenu()
+            retune()
         }
         refreshSessions()
     }
@@ -308,7 +404,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
                   let old = byName[card.provider], !old.rows.isEmpty
             else { return card }
             var stale = old
-            stale.note = "stale — \(error)"
+            // The staleness marker moved from the block's note line to its
+            // header badge: it qualifies every row underneath it, so it
+            // belongs beside the provider name rather than below the numbers.
+            stale.badge = Badge(text: "stale — \(error)", kind: .amber)
             return stale
         }
     }
@@ -442,20 +541,19 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         // Providers.shouldPoll) — those must not also render in the
         // dropdown, so this filters on Dropdown visibility specifically
         // rather than assuming "polled" implies "shown here".
-        for card in cards where Self.shouldShowInDropdown(card) {
-            addSectionHeader(card.provider)
-            if let error = card.error {
-                addLine("  \(error)", color: .systemRed, size: 11)
-            }
-            let labelWidth = card.rows.map(\.label.count).max() ?? 8
-            for row in card.rows { addRow(row, labelWidth: labelWidth) }
-            if let note = card.note {
-                addLine("  \(note)", color: .tertiaryLabelColor, size: 10)
-            }
-            menu.addItem(.separator())
+        // Quota blocks are joined by inset hairlines — they are one section,
+        // not five — while the breaks before Sessions and before the footer
+        // are NSMenu's own full-width separators.
+        let visibleCards = cards.filter(Self.shouldShowInDropdown)
+        for (index, card) in visibleCards.enumerated() {
+            if index > 0 { addInsetDivider() }
+            addQuotaBlock(card)
         }
+        if !visibleCards.isEmpty { menu.addItem(.separator()) }
 
         addSessionsSection()
+
+        if !(menu.items.last?.isSeparatorItem ?? true) { menu.addItem(.separator()) }
 
         if let updated = lastUpdated {
             addLine("Updated \(Self.clock.string(from: updated))", color: .tertiaryLabelColor, size: 10)
@@ -492,30 +590,34 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         addSectionHeader("Sessions")
         let visible = Self.visibleSessions(sessions)
         let detailed = !Prefs.rendersCompact(Prefs.sessionRowStyle())
-        // Obligation 2 (explicit sizing): measured once here, from the
-        // provider rows already built above in this same rebuild — not
-        // recomputed per frame, and not recomputed again by
-        // applySessionUpdates()'s in-place patch path.
-        if detailed { detailedRowWidth = Self.computeDetailedRowWidth(from: menu) }
-        for session in visible.rows {
+        // Detailed reads as a table, so it is ordered by what the table is
+        // for — worst first. Compact keeps the recency order it was designed
+        // around. Both draw the same cap/overflow selection, so switching
+        // styles never changes *which* sessions you can see, only their order.
+        let rows = detailed ? Self.severityOrdered(visible.rows) : visible.rows
+        if detailed {
+            let header = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            header.view = SessionHeaderView(width: detailedRowWidth)
+            menu.addItem(header)
+        }
+        for session in rows {
             if detailed { addDetailedSessionRow(session) } else { addSessionRow(session) }
         }
         sessionOverflow = visible.overflow
         if visible.overflow > 0 {
             addLine("  +\(visible.overflow) more", color: .tertiaryLabelColor, size: 10)
         }
-        menu.addItem(.separator())
     }
 
-    /// NSMenu auto-measures attributed-title rows (the provider cards and
-    /// Compact session rows above this section) but has no notion of what
-    /// width a custom view "should" be — so Detailed rows are given an
-    /// explicit width derived from what's already on screen, clamped into
-    /// the plan's 300–360pt range, so the menu doesn't visibly jump wider
-    /// or narrower than the rows above it.
-    private static func computeDetailedRowWidth(from menu: NSMenu) -> CGFloat {
-        let maxProviderWidth = menu.items.compactMap { $0.attributedTitle?.size().width }.max() ?? 0
-        return min(360, max(300, maxProviderWidth + 20))
+    /// Worst-first, with most-recent activity breaking ties. The tiebreak is
+    /// not cosmetic: `sorted(by:)` is not guaranteed stable, so without a
+    /// total order two equally-severe rows could swap places on any tick,
+    /// and every swap costs a full menu rebuild (see applySessionUpdates).
+    nonisolated static func severityOrdered(_ rows: [AgentSession]) -> [AgentSession] {
+        rows.sorted {
+            if $0.severity != $1.severity { return $0.severity > $1.severity }
+            return ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast)
+        }
     }
 
     /// Refreshing session rows while the menu is OPEN must not rebuild the
@@ -531,12 +633,18 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     private func applySessionUpdates() {
         guard Prefs.showSessions(), !sessions.isEmpty else { rebuildMenu(); return }
         let visible = Self.visibleSessions(sessions)
-        guard visible.rows.map(Self.sessionKey) == sessionRowKeys,
+        let compact = Prefs.rendersCompact(Prefs.sessionRowStyle())
+        // Must apply the SAME ordering the rows were built with, or the
+        // key comparison below reports a structural change on every tick
+        // (and, worse, a matching key list could pair a view with the wrong
+        // session's data).
+        let rows = compact ? visible.rows : Self.severityOrdered(visible.rows)
+        guard rows.map(Self.sessionKey) == sessionRowKeys,
               visible.overflow == sessionOverflow
         else { rebuildMenu(); return }
 
-        if Prefs.rendersCompact(Prefs.sessionRowStyle()) {
-            for (item, session) in zip(sessionRowItems, visible.rows) {
+        if compact {
+            for (item, session) in zip(sessionRowItems, rows) {
                 item.attributedTitle = Self.sessionRowText(for: session)
                 item.toolTip = Self.sessionTooltip(for: session)
             }
@@ -544,7 +652,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             // Patches the SAME SessionRowView instances in place — this is
             // what lets the pulsing dot and any expanded row survive a 2s
             // tick instead of being torn down and recreated.
-            for (view, session) in zip(detailedRowViews, visible.rows) {
+            for (view, session) in zip(detailedRowViews, rows) {
                 view.update(session: session, animate: isMenuOpen)
             }
         }
@@ -725,28 +833,21 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         return line
     }
 
-    private func addRow(_ row: Row, labelWidth: Int) {
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let line = NSMutableAttributedString()
-        let name = "  " + row.label.padding(toLength: max(labelWidth, row.label.count) + 1,
-                                            withPad: " ", startingAt: 0)
-        line.append(NSAttributedString(string: name, attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
-
-        if let percent = row.percent {
-            let color = Format.color(for: row.severity, percent: percent)
-            line.append(NSAttributedString(string: Format.bar(percent) + " ",
-                                          attributes: [.font: mono, .foregroundColor: color]))
-            line.append(NSAttributedString(string: String(percent).leftPadded(to: 3) + "%",
-                                          attributes: [.font: mono, .foregroundColor: color]))
-        }
-        if !row.detail.isEmpty {
-            let color: NSColor = row.severity == "critical" ? .systemRed : .secondaryLabelColor
-            line.append(NSAttributedString(string: (row.percent == nil ? "" : "   ") + row.detail,
-                                          attributes: [.font: mono, .foregroundColor: color]))
-        }
-
+    /// A provider's whole quota block — header, badge and window rows — as one
+    /// custom view. The four columns only line up if a single drawing pass
+    /// owns the block, which is why this replaced the per-row attributedTitle
+    /// items and their text `████░░` bars.
+    private func addQuotaBlock(_ card: Card) {
+        let view = QuotaBlockView(card: card, width: detailedRowWidth)
+        view.onOpenSettings = { [weak self] in self?.openSettings() }
         let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        item.attributedTitle = line
+        item.view = view
+        menu.addItem(item)
+    }
+
+    private func addInsetDivider() {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.view = InsetDividerView(width: detailedRowWidth)
         menu.addItem(item)
     }
 
@@ -776,7 +877,12 @@ extension UsageMenuBar: NSMenuDelegate {
         // rather than waiting for the next tick.
         isMenuOpen = true
         rebuildMenu()
-        if let updated = lastUpdated, Date().timeIntervalSince(updated) > refreshInterval / 2 { refresh() }
+        if let updated = lastUpdated,
+           PollPolicy.shouldRefreshOnOpen(age: Date().timeIntervalSince(updated),
+                                          base: baseInterval,
+                                          consecutiveRateLimits: consecutiveRateLimits) {
+            refresh()
+        }
         refreshSessions()
 
         // Session transcript files change on the order of seconds while a
@@ -874,8 +980,12 @@ private final class FakeKeyStore: KeyStore, @unchecked Sendable {
 /// path without needing a real Keychain in a failed state.
 private final class FailingKeyStore: KeyStore, @unchecked Sendable {
     func get(_ account: String) -> String? { nil }
-    func set(_ account: String, value: String) throws { throw KeyStoreError.osStatus(errSecIO) }
-    func delete(_ account: String) throws { throw KeyStoreError.osStatus(errSecIO) }
+    func set(_ account: String, value: String) throws {
+        throw KeyStoreError.commandFailed(action: "save", code: 1)
+    }
+    func delete(_ account: String) throws {
+        throw KeyStoreError.commandFailed(action: "delete", code: 1)
+    }
 }
 
 // MARK: - Compact session-row self-tests
@@ -891,6 +1001,7 @@ private final class FailingKeyStore: KeyStore, @unchecked Sendable {
 // silently diverge on what a given AgentSession fixture actually contains.
 func makeSession(
     label: String = "session",
+    taskTitle: String? = nil,
     busy: Bool = false,
     turns: Int = 12,
     contextTokens: Int64? = 100_000,
@@ -902,7 +1013,8 @@ func makeSession(
     lastActivityAt: Date? = nil
 ) -> AgentSession {
     AgentSession(
-        kind: .claude, pid: 1, label: label, cwd: "/Users/alex/\(label)", model: "claude-opus-5",
+        kind: .claude, pid: 1, label: label, taskTitle: taskTitle,
+        cwd: "/Users/alex/\(label)", model: "claude-opus-5",
         busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, subagentTokens: nil,
         contextTokens: contextTokens, contextWindow: contextWindow, xFloorMultiple: xFloorMultiple,
         compactionCount: compactionCount, lastCompactionAt: nil, lastCompactionPreCtx: nil,
@@ -983,6 +1095,191 @@ private func testCompactSessionRendering() {
                  makeSession(label: "unknown", lastActivityAt: nil)]
     let mixedSorted = UsageMenuBar.visibleSessions(mixed)
     precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
+}
+
+// MARK: - Keychain-timeout self-tests
+//
+// The failure this guards against is silent and total: an unanswered access
+// dialog blanks the whole usage section, because loadAll awaits every provider
+// and a blocked one never returns. So the bound itself is asserted, not just
+// the parsing around it.
+
+/// The argument vectors handed to security(1). These are asserted because
+/// getting one wrong is invisible: the build succeeds, the Settings window
+/// still says "Saved", and the key lands under the wrong service or not at
+/// all.
+private func testKeychainCommand() {
+    let service = KeychainStore.service
+    let find = KeychainCommand.find(service: service, account: KeyAccount.openRouter)
+    precondition(find.first == "find-generic-password")
+    precondition(find.contains(service) && find.contains(KeyAccount.openRouter))
+    precondition(find.contains("-w"), "without -w, security prints attributes and never the key")
+
+    let add = KeychainCommand.add(service: service, account: KeyAccount.xai, value: "xai-secret")
+    precondition(add.first == "add-generic-password")
+    precondition(add.contains(service) && add.contains(KeyAccount.xai))
+    precondition(add.contains("xai-secret"))
+    // The regression this guards: -U updates an existing item in place, which
+    // needs decrypt authorization on it and so puts the approval dialog back
+    // on screen for anything written by an older build. set deletes first.
+    precondition(!add.contains("-U"), "add must not update in place")
+
+    let remove = KeychainCommand.delete(service: service, account: KeyAccount.xai)
+    precondition(remove.first == "delete-generic-password")
+    precondition(!remove.contains("-w"), "delete takes no value")
+
+    // security -w terminates the password with exactly one newline.
+    precondition(KeychainCommand.parse(Data("sk-or-v1-abc\n".utf8)) == "sk-or-v1-abc")
+    precondition(KeychainCommand.parse(Data("sk-or-v1-abc".utf8)) == "sk-or-v1-abc")
+    precondition(KeychainCommand.parse(Data()) == nil)
+    precondition(KeychainCommand.parse(Data("\n".utf8)) == nil, "an empty stored password is not a key")
+    // Only the delimiter comes off. Anything else the user typed was already
+    // trimmed by APIKeySave.normalize, so surviving whitespace is the key.
+    precondition(KeychainCommand.parse(Data("a b\n".utf8)) == "a b")
+    precondition(KeychainCommand.parse(Data("tail \n".utf8)) == "tail ")
+
+    precondition(KeychainCommand.itemNotFound == 44, "security reports a missing item as 44")
+    precondition(KeychainCommand.duplicateItem == 45)
+}
+
+/// A read left parked behind an approval dialog must not be re-issued every
+/// poll — that is the difference between one dialog and an endless stream of
+/// them. Uses a scratch account so it cannot touch either real key.
+private func testBlockedAccounts() {
+    let scratch = "selftest_blocked_account"
+    precondition(scratch != KeyAccount.openRouter && scratch != KeyAccount.xai)
+    let blocked = BlockedAccounts.shared
+    blocked.remove(scratch)
+    precondition(!blocked.contains(scratch))
+
+    blocked.insert(scratch)
+    precondition(blocked.contains(scratch))
+    // Short-circuits before spawning security at all: a blocked account reads
+    // as "no key" without going near the Keychain.
+    let started = Date()
+    precondition(KeychainStore().get(scratch) == nil)
+    precondition(Date().timeIntervalSince(started) < 0.05,
+                 "a blocked account must not reach security(1) again")
+
+    // Writing the account repairs the item, so the block must lift with it —
+    // otherwise a user who re-saves their key still gets no key.
+    if (try? KeychainStore().set(scratch, value: "repaired")) != nil {
+        precondition(!blocked.contains(scratch), "a successful save must clear the block")
+        precondition(KeychainStore().get(scratch) == "repaired")
+        try? KeychainStore().delete(scratch)
+    }
+    blocked.remove(scratch)
+}
+
+private func testKeychainBounds() {
+    // A command that never exits must come back as .blocked within the
+    // timeout, not hang — this is the actual regression being prevented.
+    let started = Date()
+    let result = KeychainCLI.read(["-h"], timeout: 0.1)
+    if case .failure(.blocked) = result {
+        preconditionFailure("`security -h` exits immediately; it must not report as blocked")
+    }
+    precondition(Date().timeIntervalSince(started) < 5, "a fast command must not wait out the timeout")
+
+    // A nonexistent keychain item is a failure, never a block — the two drive
+    // different messages and only one of them tells the user to click Allow.
+    let missing = KeychainCLI.read(
+        ["find-generic-password", "-s", "local.claude-usage-menubar.definitely-absent", "-w"]
+    )
+    if case .success = missing {
+        preconditionFailure("a nonexistent item must not read as success")
+    }
+    if case .failure(.blocked) = missing {
+        preconditionFailure("a missing item is .failed, not .blocked")
+    }
+
+    // The blocked message has to name the fix; the dialog is easy to miss.
+    let blocked = ClaudeError.keychainBlocked.localizedDescription
+    precondition(blocked.contains("Keychain"))
+    precondition(blocked.contains("Allow"))
+    precondition(blocked != ClaudeError.noCredentials.localizedDescription)
+}
+
+// MARK: - Edit-menu self-tests
+//
+// The paste bug was invisible to every existing test because nothing ever
+// asserted the app had a main menu at all. These pin the mechanism: the key
+// equivalents exist, and their actions are target-less so they reach the
+// focused field editor rather than a fixed object.
+
+private func testEditMenu() {
+    let main = UsageMenuBar.makeMainMenu()
+    let edit = main.items.compactMap(\.submenu).first { $0.title == "Edit" }
+    precondition(edit != nil, "an Edit menu must exist or ⌘V has nowhere to resolve")
+
+    let expected: [(String, String, Selector)] = [
+        ("Cut", "x", #selector(NSText.cut(_:))),
+        ("Copy", "c", #selector(NSText.copy(_:))),
+        ("Paste", "v", #selector(NSText.paste(_:))),
+        ("Select All", "a", #selector(NSText.selectAll(_:))),
+    ]
+    for (title, key, action) in expected {
+        guard let item = edit?.items.first(where: { $0.title == title }) else {
+            preconditionFailure("Edit menu is missing \(title)")
+        }
+        precondition(item.keyEquivalent == key)
+        precondition(item.keyEquivalentModifierMask == .command)
+        precondition(item.action == action)
+        precondition(item.target == nil,
+                     "\(title) must stay target-less so it reaches the first responder")
+    }
+
+    // Redo shares ⌘Z with Undo and is distinguished only by the shift modifier.
+    let undo = edit?.items.first { $0.title == "Undo" }
+    let redo = edit?.items.first { $0.title == "Redo" }
+    precondition(undo?.keyEquivalent == "z" && undo?.keyEquivalentModifierMask == .command)
+    precondition(redo?.keyEquivalent == "z")
+    precondition(redo?.keyEquivalentModifierMask == [.command, .shift])
+}
+
+// MARK: - Detailed-table ordering self-tests
+//
+// Detailed rows are ordered worst-first; Compact and the `--once` printer keep
+// the recency order `visibleSessions` produces. Both facts are asserted here
+// so the redesign can't quietly re-order the two surfaces it left alone.
+
+private func testSeverityOrdering() {
+    let now = Date()
+    // xFloor thresholds (Sessions.swift): <1.5 green, <4.0 yellow, >=7.0 red.
+    let calm = makeSession(label: "calm", contextTokens: 20_000, xFloorMultiple: 1.0,
+                           lastActivityAt: now)
+    let warm = makeSession(label: "warm", contextTokens: 20_000, xFloorMultiple: 3.0,
+                           lastActivityAt: now.addingTimeInterval(-60))
+    let hot = makeSession(label: "hot", contextTokens: 20_000, xFloorMultiple: 8.0,
+                          lastActivityAt: now.addingTimeInterval(-120))
+
+    precondition(calm.severity < warm.severity && warm.severity < hot.severity,
+                 "fixtures must actually span three severities for this test to mean anything")
+
+    let ordered = UsageMenuBar.severityOrdered([calm, warm, hot])
+    precondition(ordered.map(\.label) == ["hot", "warm", "calm"], "worst first")
+
+    // Equal severity falls back to most-recent activity, giving a total order
+    // — without it, an unstable sort could swap rows on any tick and force a
+    // full menu rebuild every time.
+    let older = makeSession(label: "older", contextTokens: 20_000, xFloorMultiple: 1.0,
+                            lastActivityAt: now.addingTimeInterval(-600))
+    let newer = makeSession(label: "newer", contextTokens: 20_000, xFloorMultiple: 1.0,
+                            lastActivityAt: now)
+    precondition(UsageMenuBar.severityOrdered([older, newer]).map(\.label) == ["newer", "older"])
+    precondition(UsageMenuBar.severityOrdered([newer, older]).map(\.label) == ["newer", "older"],
+                 "the tiebreak must not depend on input order")
+
+    // A session with no activity timestamp still sorts, and still isn't dropped.
+    let unknown = makeSession(label: "unknown", contextTokens: 20_000, xFloorMultiple: 1.0,
+                              lastActivityAt: nil)
+    precondition(UsageMenuBar.severityOrdered([unknown, newer]).map(\.label) == ["newer", "unknown"])
+
+    // Re-ordering is Detailed-only: the shared selection helper that Compact
+    // and --once use is untouched and still recency-ordered.
+    precondition(UsageMenuBar.visibleSessions([calm, warm, hot]).rows.map(\.label)
+                 == ["calm", "warm", "hot"],
+                 "visibleSessions must stay recency-ordered for Compact and --once")
 }
 
 // MARK: - Entry point
@@ -1257,10 +1554,10 @@ private func runSelfTests() {
         precondition(failed.errors.contains { $0.contains("Grok") })
     }
 
-    // KeychainStore must degrade, never crash, on a lookup miss — this is
-    // the same code path errSecInteractionNotAllowed (a locked login
-    // keychain, e.g. a headless --once over SSH) falls through, so Config
-    // can fall back to the legacy JSON/no-key tiers instead of throwing.
+    // KeychainStore must degrade, never crash, on a lookup miss — the same
+    // code path a locked login keychain takes, e.g. a headless --once over
+    // SSH, so Config can fall back to the legacy JSON/no-key tiers instead
+    // of throwing.
     precondition(KeychainStore().get("selftest_definitely_absent_key_should_not_exist") == nil)
 
     // Gated real-Keychain round-trip: a throwaway account under this app's
@@ -1306,6 +1603,14 @@ private func runSelfTests() {
     SessionSelfTests.run()
     testCompactSessionRendering()
     DetailedSessionRowSelfTests.run()
+    ThemeSelfTests.run()
+    QuotaBlockSelfTests.run()
+    testSeverityOrdering()
+    testEditMenu()
+    PollPolicySelfTests.run()
+    testKeychainBounds()
+    testKeychainCommand()
+    testBlockedAccounts()
 
     print("Self-tests passed")
 }
@@ -1333,7 +1638,11 @@ if CommandLine.arguments.contains("--once") {
                 let gauge = row.percent.map { "\(Format.bar($0)) \(String($0).leftPadded(to: 3))%  " } ?? ""
                 print("  \(name) \(gauge)\(row.detail)")
             }
-            if let note = card.note { print("  (\(note))") }
+            // Note and badge used to be one joined `note` string; the panel
+            // now draws them in two different places, so this rejoins them to
+            // keep the headless diagnostic's output exactly as it was.
+            let annotations = [card.note, card.badge?.text].compactMap { $0 }
+            if !annotations.isEmpty { print("  (\(annotations.joined(separator: " · ")))") }
         }
 
         print("Sessions")

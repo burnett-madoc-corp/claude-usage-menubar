@@ -19,7 +19,11 @@ concurrency:
 jobs:
   pr-title-lint:
     name: pr-title-lint
-    runs-on: ubuntu-latest
+    # Hosted runners are refused while this repo is private (the org's Actions
+    # quota is exhausted), so run on skynet until it is public. The validator is
+    # stdlib Python either way. Fork PRs go to a hosted runner regardless, since
+    # untrusted code must never reach the self-hosted box.
+    runs-on: ${{ (github.event.repository.visibility == 'public' || github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","skynet"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

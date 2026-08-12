@@ -2,8 +2,9 @@ name: CodeQL
 
 # Static vulnerability analysis of the Swift sources. CodeQL's Swift support
 # needs a real compile, and this app links AppKit, so this only runs on macOS.
-# Hosted macOS minutes are free for public repositories; on a private repo this
-# workflow will burn paid minutes, so it is scheduled weekly rather than nightly.
+# Hosted macOS minutes are free for public repositories, which is the only
+# footing on which this can run at all -- see the job's `if` below. Weekly
+# rather than nightly because the Swift analysis costs a full build each time.
 
 on:
   push:
@@ -25,6 +26,12 @@ permissions:
 jobs:
   analyze:
     name: analyze (swift)
+    # Hosted macOS runners are refused while this repo is private (the org's
+    # Actions quota is exhausted), so the job would fail in ~3s having analysed
+    # nothing. Skip it until the repo is public, at which point the minutes are
+    # free and it starts running on its own. This check is not required to
+    # merge, so skipping it does not gate anything.
+    if: ${{ github.event.repository.visibility == 'public' }}
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
