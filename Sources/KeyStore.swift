@@ -1,5 +1,4 @@
 import Foundation
-import Security
 
 // MARK: - KeyStore
 
@@ -23,156 +22,148 @@ enum KeyAccount {
 }
 
 enum KeyStoreError: LocalizedError {
-    case osStatus(OSStatus)
+    case blocked
+    case commandFailed(action: String, code: Int32)
+    case notStored(account: String)
 
     var errorDescription: String? {
         switch self {
-        case .osStatus(let status):
-            return (SecCopyErrorMessageString(status, nil) as String?) ?? "Keychain error \(status)"
+        case .blocked:
+            return "The Keychain did not answer in time."
+        case .commandFailed(let action, let code):
+            return "Keychain \(action) failed: security exited \(code)."
+        case .notStored(let account):
+            return "The Keychain reported success for \(account) but stored nothing."
         }
     }
 }
 
-/// A KeyStore backed by Security.framework's SecItem* API — service
-/// "local.claude-usage-menubar", one generic-password item per account.
-///
-/// Deliberately NOT the /usr/bin/security subprocess Keychain (main.swift)
-/// and AntigravityProvider (Providers.swift) use elsewhere in this app —
-/// that subprocess path exists for reading OTHER apps' items (Claude Code's
-/// OAuth token, Antigravity's go-keyring blob), where this app has no ACL
-/// and a CLI round-trip is the only option. For items this app itself
-/// creates, the SecItem* API is cleaner and, once the item's ACL grants this
-/// app access, prompt-free for the creating app.
-/// Bounded, cached front end to a KeyStore, for the polling path.
-///
-/// `Config.load` reads the Keychain inside `Providers.all`, before any
-/// provider starts. The app is ad-hoc signed, so every install is a new code
-/// identity and macOS wants to ask about it — and `SecItemCopyMatching`
-/// answers that question by blocking *inside the call* until somebody clicks
-/// the dialog. One unanswered dialog therefore stopped `loadAll` from ever
-/// returning, and the entire usage section disappeared, including the
-/// providers that never touch the Keychain.
-///
-/// Forbidding UI does not fix it: `kSecUseAuthenticationUIFail` governs
-/// authentication UI, not this legacy ACL trust prompt — verified by
-/// measurement, the call still blocked with the flag set. So the read moves
-/// off the critical path instead. It runs on its own thread; the caller waits
-/// a bounded time and otherwise carries on with the last known value. The
-/// dialog still appears, so the user can still grant access — it just no
-/// longer holds the menu hostage while it waits.
-final class BoundedKeyStore: KeyStore, @unchecked Sendable {
-    private let underlying: KeyStore
-    private let timeout: TimeInterval
-    private let lock = NSLock()
-    private var cache: [String: String] = [:]
-    /// Accounts whose read is still stuck behind a dialog. Without this, every
-    /// poll would start another blocked thread for the same key and leak one
-    /// per refresh for as long as the dialog went unanswered.
-    private var inFlight: Set<String> = []
+// MARK: - security(1) argument construction
 
-    init(_ underlying: KeyStore = KeychainStore(), timeout: TimeInterval = 3) {
-        self.underlying = underlying
-        self.timeout = timeout
+/// The argument vectors and output parsing, split out from the process
+/// plumbing so --self-test can assert them directly. A wrong flag here is
+/// invisible until it writes to the wrong service or silently stores an
+/// empty value, and neither shows up as a build failure.
+enum KeychainCommand {
+    /// `security` reports a missing item with this exit status. It is a
+    /// normal outcome — no key configured yet — not an error.
+    static let itemNotFound: Int32 = 44
+    /// ...and a colliding add with this one, which after a delete means the
+    /// delete did not take, so it must surface rather than be swallowed.
+    static let duplicateItem: Int32 = 45
+
+    static func find(service: String, account: String) -> [String] {
+        ["find-generic-password", "-s", service, "-a", account, "-w"]
     }
 
-    func get(_ account: String) -> String? {
-        lock.lock()
-        let cached = cache[account]
-        let alreadyReading = inFlight.contains(account)
-        if !alreadyReading { inFlight.insert(account) }
-        lock.unlock()
-        if alreadyReading { return cached }
-
-        let finished = DispatchSemaphore(value: 0)
-        Thread.detachNewThread { [self] in
-            let value = underlying.get(account)
-            lock.lock()
-            if let value { cache[account] = value } else { cache[account] = nil }
-            inFlight.remove(account)
-            lock.unlock()
-            finished.signal()
-        }
-
-        guard finished.wait(timeout: .now() + timeout) == .success else { return cached }
-        lock.lock()
-        defer { lock.unlock() }
-        return cache[account]
+    static func add(service: String, account: String, value: String) -> [String] {
+        // Deliberately no -U. Updating in place needs *decrypt* authorization
+        // on the existing item, which is exactly what an item left over from
+        // the Security.framework era will not grant without a dialog. set()
+        // deletes first instead, so a surviving item means the delete failed
+        // and the resulting "duplicate" error is worth seeing.
+        ["add-generic-password", "-s", service, "-a", account, "-w", value]
     }
 
-    func set(_ account: String, value: String) throws {
-        try underlying.set(account, value: value)
-        lock.lock()
-        cache[account] = value
-        lock.unlock()
+    static func delete(service: String, account: String) -> [String] {
+        ["delete-generic-password", "-s", service, "-a", account]
     }
 
-    func delete(_ account: String) throws {
-        try underlying.delete(account)
-        lock.lock()
-        cache[account] = nil
-        lock.unlock()
+    /// `security -w` writes the password followed by one newline. Strip that
+    /// and nothing else: the stored value is already normalized by
+    /// APIKeySave.normalize, so any remaining whitespace would be part of the
+    /// key itself.
+    ///
+    /// A value that is not valid UTF-8 comes back as hex digits instead, which
+    /// would be silently wrong — but every value here was written by
+    /// APIKeySave from text the user typed, so it round-trips as UTF-8.
+    static func parse(_ data: Data) -> String? {
+        var text = String(decoding: data, as: UTF8.self)
+        if text.hasSuffix("\n") { text.removeLast() }
+        return text.isEmpty ? nil : text
     }
 }
 
+// MARK: - KeychainStore
+
+/// This app's own keys, in the login Keychain, reached through
+/// `/usr/bin/security`.
+///
+/// Not Security.framework's SecItem* API, which is the obvious choice and was
+/// the original one. macOS gates a Keychain item on *code identity*, twice
+/// over: the item's ACL names trusted applications, and its partition list
+/// names the signing identities allowed to use it. Both are filled in from
+/// whoever creates the item. This app is ad-hoc signed, so it has no stable
+/// identity — only a cdhash that changes with every build — and an item
+/// written through SecItemAdd came out pinned to the exact binary that wrote
+/// it, `Partitions: [cdhash:596a1133…]`. The next build was a stranger to it,
+/// macOS asked for the login password, and "Always Allow" granted access to a
+/// binary that was about to be replaced. The dialog therefore came back after
+/// every single install, forever.
+///
+/// Routing through `security` borrows an identity that does not change:
+/// the item's partition becomes `apple-tool:` and its trusted application is
+/// `security` itself, neither of which cares what this app's cdhash is
+/// today. It is also the path AntigravityProvider and the Claude Code token
+/// reader already take, and the reason those reads never prompted.
+///
+/// The trade-off is explicit: any process running as this user can also run
+/// `security` and read these keys back. That was already true of every other
+/// Keychain item this app reads, and the code-identity gate it replaces was
+/// not buying confidentiality — an ad-hoc app cannot hold one — it was only
+/// buying a dialog.
 struct KeychainStore: KeyStore {
 
     static let service = "local.claude-usage-menubar"
 
     func get(_ account: String) -> String? {
-        var query = Self.baseQuery(account: account)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess, let data = result as? Data else {
-            // Any failure — item absent, a locked login keychain
-            // (errSecInteractionNotAllowed, e.g. a headless --once over
-            // SSH), an ACL denial after an ad-hoc re-sign — degrades to "no
-            // key" rather than throwing, so callers (Config.load) fall
-            // through to the legacy JSON/no-key tiers instead of crashing.
+        switch KeychainCLI.read(KeychainCommand.find(service: Self.service, account: account)) {
+        case .success(let data):
+            return KeychainCommand.parse(data)
+        case .failure:
+            // Item absent, a locked login keychain (a headless --once over
+            // SSH), a Keychain that never answered — all degrade to "no key"
+            // rather than throwing, so Config.load falls through to the
+            // legacy JSON/no-key tiers instead of crashing.
             return nil
         }
-        return String(data: data, encoding: .utf8)
     }
 
     func set(_ account: String, value: String) throws {
-        guard let data = value.data(using: .utf8) else {
-            throw KeyStoreError.osStatus(errSecParam)
-        }
-        var addQuery = Self.baseQuery(account: account)
-        addQuery[kSecValueData as String] = data
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        if addStatus == errSecSuccess { return }
+        // Delete first: needs no authorization on the old item, so it
+        // overwrites a stale Security.framework-era entry without a prompt.
+        // A miss here is the normal case — nothing was stored yet.
+        _ = KeychainCLI.read(KeychainCommand.delete(service: Self.service, account: account))
 
-        guard addStatus == errSecDuplicateItem else {
-            throw KeyStoreError.osStatus(addStatus)
+        switch KeychainCLI.read(KeychainCommand.add(service: Self.service, account: account, value: value)) {
+        case .success:
+            break
+        case .failure(.blocked):
+            throw KeyStoreError.blocked
+        case .failure(.failed(let code)):
+            throw KeyStoreError.commandFailed(action: "save", code: code)
         }
-        // Item already exists (a prior Save, or a value from another run) —
-        // SecItemAdd doesn't overwrite, so fall back to SecItemUpdate.
-        let updateStatus = SecItemUpdate(
-            Self.baseQuery(account: account) as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
-        )
-        guard updateStatus == errSecSuccess else {
-            throw KeyStoreError.osStatus(updateStatus)
-        }
+
+        // Read back before reporting success. `security` exits 0 having
+        // stored an empty password if the value never reached it — measured,
+        // not hypothetical — and a Settings window that says "Saved" over a
+        // key that is not there is the worst possible outcome.
+        guard get(account) == value else { throw KeyStoreError.notStored(account: account) }
     }
 
     func delete(_ account: String) throws {
-        let status = SecItemDelete(Self.baseQuery(account: account) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeyStoreError.osStatus(status)
+        switch KeychainCLI.read(KeychainCommand.delete(service: Self.service, account: account)) {
+        case .success:
+            return
+        case .failure(.failed(KeychainCommand.itemNotFound)):
+            // "Clear the field, Save" with nothing stored is a no-op, not a
+            // failure the user needs to hear about.
+            return
+        case .failure(.blocked):
+            throw KeyStoreError.blocked
+        case .failure(.failed(let code)):
+            throw KeyStoreError.commandFailed(action: "delete", code: code)
         }
-    }
-
-    private static func baseQuery(account: String) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
     }
 }
 

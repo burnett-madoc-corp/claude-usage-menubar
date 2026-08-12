@@ -108,11 +108,24 @@ set, its field shows disabled instead of quietly being outranked — a saved
 Keychain key you can't tell is being ignored is exactly the kind of thing that
 costs someone an afternoon.
 
-One existing wart, not new: the app is ad-hoc signed (`build.sh`), so every
-rebuild is a different identity as far as macOS's Keychain ACLs are concerned
-— a rebuild can retrigger the "ClaudeUsage wants to access…" prompt even for a
-key this app itself created. Developer ID signing is the real fix; out of
-scope here.
+These keys are written and read through `/usr/bin/security` rather than
+Security.framework, which is the one non-obvious thing about this code. macOS
+gates a Keychain item on *code identity* — the item's ACL names trusted
+applications, and its partition list names permitted signing identities, both
+filled in from whoever created the item. This app is ad-hoc signed
+(`build.sh`), so it has no stable identity: an item written with `SecItemAdd`
+came out pinned to that exact binary, `Partitions: [cdhash:…]`, and the next
+build was a stranger to it. The result was a login-password dialog after every
+install, where "Always Allow" grants access to a binary about to be replaced.
+Going through `security` borrows an identity that does not change
+(`apple-tool:`), which is also why this app's reads of *other* apps' items
+never prompted.
+
+The trade-off is deliberate: any process running as you can also run
+`security` and read these keys back. That was already true of every other
+Keychain item this app reads, and the code-identity gate it replaces bought no
+confidentiality — an ad-hoc app cannot hold one — only a dialog. Developer ID
+signing would restore a real gate; out of scope here.
 
 Providers without a key simply show "no API key" — nothing else breaks.
 
@@ -206,8 +219,10 @@ login. To just build and run without installing:
 ./build.sh && open build/ClaudeUsage.app
 ```
 
-On first launch macOS asks for Keychain access — choose **Always Allow** so it
-does not prompt again.
+The app's own API keys never raise a Keychain dialog (see above). Items
+created by *other* apps — Claude Code's OAuth token, Antigravity's — carry
+their own access rules, so macOS may ask about one of those once; choose
+**Always Allow**.
 
 ### Uninstall
 
