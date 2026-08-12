@@ -166,13 +166,14 @@ Two complementary signals drive each row:
 - **contextPercent** — how full the context window is, against the model's
   window size. Absolute, but only as good as the window it's dividing by —
   see the limitation below.
-- **xFloor** — a *relative* cost multiple: what a turn costs right now versus
+- **BLOAT** — a *relative* cost multiple: what a turn costs right now versus
   the first few turns of the session (or since the last compaction). It needs
   no context-window constant at all, so it stays correct even in the cases
-  where contextPercent is working from a wrong denominator.
+  where contextPercent is working from a wrong denominator. (`xFloor` in the
+  source, which is where the `x` in `5.2x` comes from.)
 
 Row colour is the **worse of the two** severities — a session that opened
-with one huge turn pins xFloor near 1.0x forever while contextPercent quietly
+with one huge turn pins BLOAT near 1.0x forever while contextPercent quietly
 climbs toward full, and neither signal alone would catch that.
 
 Two row styles, chosen in Settings (default Detailed):
@@ -314,7 +315,7 @@ Sessions carries its own, smaller set:
   at start time, then a spawned subagent's `resolvedModel` as corroboration,
   then an observed-usage upgrade to 1M once real usage exceeds 200k — but no
   transcript event records a mid-session `/model` switch, so contextPercent
-  can be stale until the observed-usage tier catches up. **xFloor is
+  can be stale until the observed-usage tier catches up. **BLOAT is
   unaffected** — it never touches a window size at all.
 - **Codex session matching is start-time proximity, not identity.** A live
   `codex` process is matched to its `state_*.sqlite` thread row by cwd plus

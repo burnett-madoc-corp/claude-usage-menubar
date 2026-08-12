@@ -42,8 +42,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc sign so the Keychain grants a stable identity to the "always allow"
-# decision — without this, every rebuild re-prompts for Keychain access.
+# Ad-hoc sign so the app has a signature at all; macOS is increasingly
+# unwilling to run an unsigned bundle. It deliberately does no more than that:
+# an ad-hoc signature's cdhash changes on every build, so it cannot be the
+# thing that keeps the Keychain quiet — that is why this app's own items go
+# through /usr/bin/security instead (see Sources/KeyStore.swift).
 codesign --force --sign - "$APP" 2>/dev/null || echo "warning: ad-hoc signing failed (app still runs)"
 
 echo "Built $APP"
