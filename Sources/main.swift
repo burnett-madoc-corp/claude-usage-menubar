@@ -80,11 +80,15 @@ extension SessionScanner.Severity {
 // MARK: - Claude
 
 enum ClaudeError: LocalizedError {
-    case noCredentials, tokenExpired, http(Int)
+    case noCredentials, keychainBlocked, tokenExpired, http(Int)
 
     var errorDescription: String? {
         switch self {
         case .noCredentials: return "No Claude credentials in Keychain"
+        case .keychainBlocked:
+            // Names the fix, because the dialog is easy to miss behind other
+            // windows and the section stays empty until it is answered.
+            return "waiting for Keychain approval — click Always Allow"
         case .tokenExpired: return "Token expired — run `claude` to refresh"
         case .http(let code): return "Usage API returned HTTP \(code)"
         }
@@ -100,18 +104,14 @@ enum ClaudeError: LocalizedError {
 /// next poll, since the Keychain is re-read every time.
 enum Keychain {
     static func claudeToken() throws -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        try task.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
+        let data: Data
+        switch KeychainCLI.read(["find-generic-password", "-s", "Claude Code-credentials", "-w"]) {
+        case .success(let payload): data = payload
+        case .failure(.blocked): throw ClaudeError.keychainBlocked
+        case .failure(.failed): throw ClaudeError.noCredentials
+        }
 
-        guard task.terminationStatus == 0,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = json["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String
         else { throw ClaudeError.noCredentials }
@@ -1093,6 +1093,84 @@ private func testCompactSessionRendering() {
     precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
 }
 
+// MARK: - Keychain-timeout self-tests
+//
+// The failure this guards against is silent and total: an unanswered access
+// dialog blanks the whole usage section, because loadAll awaits every provider
+// and a blocked one never returns. So the bound itself is asserted, not just
+// the parsing around it.
+
+/// A store that never returns, standing in for a Keychain read parked behind
+/// an unanswered approval dialog.
+private final class BlockingKeyStore: KeyStore, @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    func get(_ account: String) -> String? {
+        entered.signal()
+        Thread.sleep(forTimeInterval: 30)
+        return "never"
+    }
+    func set(_ account: String, value: String) throws {}
+    func delete(_ account: String) throws {}
+}
+
+private func testBoundedKeyStore() {
+    let blocking = BlockingKeyStore()
+    let bounded = BoundedKeyStore(blocking, timeout: 0.2)
+
+    // The whole point: a read that never returns must not stall the caller.
+    let started = Date()
+    precondition(bounded.get(KeyAccount.openRouter) == nil, "a blocked read yields no key, not a hang")
+    let elapsed = Date().timeIntervalSince(started)
+    precondition(elapsed < 5, "the bounded read took \(elapsed)s — it is not bounded")
+
+    // The blocked thread is still in there; a second call must not start
+    // another one, or every poll leaks a thread while the dialog sits unanswered.
+    precondition(blocking.entered.wait(timeout: .now() + 2) == .success)
+    let secondStart = Date()
+    precondition(bounded.get(KeyAccount.openRouter) == nil)
+    precondition(Date().timeIntervalSince(secondStart) < 0.15,
+                 "a call made while a read is in flight must return at once from cache")
+
+    // A store that answers promptly still works, and its value is cached.
+    let fast = FakeKeyStore()
+    try? fast.set(KeyAccount.xai, value: "xai-abc")
+    let quick = BoundedKeyStore(fast, timeout: 5)
+    precondition(quick.get(KeyAccount.xai) == "xai-abc")
+    try? quick.set(KeyAccount.xai, value: "xai-def")
+    precondition(quick.get(KeyAccount.xai) == "xai-def", "set must not leave a stale cache entry")
+    try? quick.delete(KeyAccount.xai)
+    precondition(quick.get(KeyAccount.xai) == nil, "delete must not leave a stale cache entry")
+}
+
+private func testKeychainBounds() {
+    // A command that never exits must come back as .blocked within the
+    // timeout, not hang — this is the actual regression being prevented.
+    let started = Date()
+    let result = KeychainCLI.read(["-h"], timeout: 0.1)
+    if case .failure(.blocked) = result {
+        preconditionFailure("`security -h` exits immediately; it must not report as blocked")
+    }
+    precondition(Date().timeIntervalSince(started) < 5, "a fast command must not wait out the timeout")
+
+    // A nonexistent keychain item is a failure, never a block — the two drive
+    // different messages and only one of them tells the user to click Allow.
+    let missing = KeychainCLI.read(
+        ["find-generic-password", "-s", "local.claude-usage-menubar.definitely-absent", "-w"]
+    )
+    if case .success = missing {
+        preconditionFailure("a nonexistent item must not read as success")
+    }
+    if case .failure(.blocked) = missing {
+        preconditionFailure("a missing item is .failed, not .blocked")
+    }
+
+    // The blocked message has to name the fix; the dialog is easy to miss.
+    let blocked = ClaudeError.keychainBlocked.localizedDescription
+    precondition(blocked.contains("Keychain"))
+    precondition(blocked.contains("Allow"))
+    precondition(blocked != ClaudeError.noCredentials.localizedDescription)
+}
+
 // MARK: - Edit-menu self-tests
 //
 // The paste bug was invisible to every existing test because nothing ever
@@ -1501,6 +1579,8 @@ private func runSelfTests() {
     testSeverityOrdering()
     testEditMenu()
     PollPolicySelfTests.run()
+    testKeychainBounds()
+    testBoundedKeyStore()
 
     print("Self-tests passed")
 }
