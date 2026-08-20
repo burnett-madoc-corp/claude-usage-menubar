@@ -1,15 +1,2 @@
 build/
 .DS_Store
-
-# Per-checkout agent scaffolding, generated against one machine's absolute
-# paths: a CLAUDE.md / opencode.json that import instruction files from outside
-# the repo, plus settings, hook scripts and whatever skills that machine's
-# operator has installed. None of it is portable and none of it belongs in a
-# public repository. Repository-wide agent instructions go in AGENTS.md, which
-# is committed and which every runner reads.
-#
-# These were previously excluded only via .git/info/exclude, which is local to
-# one clone and travels with nobody — so a fresh clone had no protection at all.
-CLAUDE.md
-opencode.json
-.claude/

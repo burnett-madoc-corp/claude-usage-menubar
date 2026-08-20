@@ -153,7 +153,7 @@ def main() -> int:
     svg_files = [f for f in files if f.suffix == ".svg"]
     build_sh = REPO_ROOT / "build.sh"
 
-    text_files = [f for f in files if not is_binary(f)]
+    text_files = [f for f in files if not is_binary(f) and not f.is_dir()]
 
     check_encoding_and_line_endings(text_files)
     check_no_conflict_markers(text_files)
