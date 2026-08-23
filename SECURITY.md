@@ -74,10 +74,17 @@ another tool as a security-relevant change, and say so explicitly in the PR.
 
 ## Things that are not vulnerabilities
 
-- **The app is ad-hoc signed, not notarized.** `build.sh` signs with `-` so the
-  Keychain can grant a stable identity to your "always allow" decision. Every
-  rebuild produces a new signature and re-prompts for Keychain access. That is
-  expected.
+- **The app is ad-hoc signed, not notarized.** Ad-hoc signing gives the bundle
+  a signature so macOS will run it. It buys no Keychain stability and is not
+  what keeps the "always allow" dialog away — that job is done by routing keys
+  through `/usr/bin/security`, whose identity does not change between builds.
+- **Pre-#24 Keychain items may still prompt once per launch.** An item written
+  by a build from before #24 is pinned to that build's cdhash and costs one
+  dialog per launch until it is re-saved from Settings. That is a legitimate
+  leftover, not a regression.
+- **Any process running as you can read these keys.** Routing keys through
+  `security` trades a code-identity gate for rebuild-stability: Developer ID
+  signing would restore the gate; ad-hoc cannot.
 - **Undocumented data formats.** The Claude session registry and the Codex
   SQLite schema are internal details of tools this project does not control. The
   app degrades to "no sessions from this source" rather than crashing when they
