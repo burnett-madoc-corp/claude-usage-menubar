@@ -52,3 +52,32 @@ paste the real output rather than describing it.
   so it is a real gate, not a structural approximation. `pr-title-lint` only
   enforces the `[type][scope]` title convention, but it is required too — a
   bad title blocks the merge the same as a failing build.
+
+<!-- BEGIN estate-agent-conventions -->
+<!-- Managed by bootstrap_repo_agents.py in burnett-madoc-corp/Claude-skills.
+     Edit the source there, not this copy — local edits are refused, not merged. -->
+
+## Estate conventions
+
+Shared workflows live in [`burnett-madoc-corp/Claude-skills`](https://github.com/burnett-madoc-corp/Claude-skills)
+and load from `~/.claude/skills`. Reach for them before inventing a process:
+`raise-pr` (PR grammar, merge safety), `create-plan`, `ci-minute-optimizer`
+(runner choice, rulesets), `e2e-ship-and-deploy`, `task-plan-handoff`.
+
+**Durable plans do not live in this repo.** A plan spanning more than one
+session or more than one repository belongs in
+[`burnett-madoc-corp/ai-plans`](https://github.com/burnett-madoc-corp/ai-plans)
+under `plans/<project>/<slug>/`, together with its execution records — ledger
+at `notes.md`, task reports under `reports/`. Ephemeral session scratch stays
+here in `.agent_plans/`. See the `create-plan` skill.
+
+If a PR implements a durable plan, its body carries `Plan: <project>/<slug>`.
+
+**Merging is CI-gated.** As of 2026-08-09, `merge-gate` is the only required
+check and squash is the only permitted merge method; the `human-approved`
+status is retired. `gh pr merge --auto` is not proof CI passed — a SKIPPED
+required check satisfies the ruleset while verifying nothing. Verify with
+`verify_pr_green.py` from the `raise-pr` skill before merging.
+
+Agent-authored org PRs are authored by `t-3000-agent[bot]` via `t3000-exec`.
+<!-- END estate-agent-conventions -->
