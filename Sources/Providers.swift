@@ -104,6 +104,57 @@ struct Config: Sendable {
     }
 }
 
+/// One bounded `Process` run, shared by every subprocess this app shells out
+/// to.
+///
+/// Extracted from KeychainCLI, which carried two copies of this body.
+/// AntigravityProvider's `lsof` call is the third caller, and a third
+/// hand-written copy of a subprocess timeout is how timeouts drift apart.
+enum BoundedProcess {
+    /// `failed` carries the child's exit status so callers can tell the
+    /// routine outcomes apart from the real ones — security(1)'s 44 is "no
+    /// such item", which for a key that was never configured is not an error
+    /// at all.
+    enum Failure: Error { case blocked, failed(Int32) }
+
+    static func run(executable: String, arguments: [String],
+                    stdin: String? = nil,
+                    timeout: TimeInterval) -> Result<Data, Failure> {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        let input = stdin != nil ? Pipe() : nil
+        if let input { task.standardInput = input }
+
+        let finished = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in finished.signal() }
+        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
+
+        if let input, let stdin {
+            // At most a few hundred bytes, so this write cannot fill the pipe
+            // and block; closing afterwards is what makes the child see EOF
+            // and act on the one command it was given.
+            input.fileHandleForWriting.write(Data(stdin.utf8))
+            try? input.fileHandleForWriting.close()
+        }
+
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            // Leaves any approval dialog up — answering it makes the next call
+            // succeed. Only this run is abandoned, not the user's decision.
+            task.terminate()
+            return .failure(.blocked)
+        }
+        // Safe to read after exit only because these payloads are a few KB;
+        // a larger one could fill the pipe buffer and stall the child, which
+        // the timeout above would then catch as .blocked rather than hang.
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+    }
+}
+
 /// Bounded wrapper around `security(1)`.
 ///
 /// A Keychain read can block indefinitely: if macOS decides the caller needs
@@ -115,76 +166,26 @@ struct Config: Sendable {
 ///
 /// This app's own key no longer triggers that dialog (see KeychainStore), but
 /// the item it reads from *another* app — Claude Code's OAuth token — is
-/// written under that app's own access rules, so the timeout stays.
+/// written under that app's own access rules, so the timeout stays. That
+/// reasoning is specific to the Keychain and deliberately does not live on
+/// BoundedProcess, which `lsof` also uses.
 enum KeychainCLI {
     /// Long enough that a genuinely slow read succeeds, short enough that the
     /// menu is not held hostage to a dialog nobody is looking at.
     static let timeout: TimeInterval = 8
 
-    /// `failed` carries security(1)'s exit status so callers can tell the
-    /// routine outcomes apart from the real ones — 44 is "no such item",
-    /// which for a key that was never configured is not an error at all.
-    enum Failure: Error { case blocked, failed(Int32) }
+    typealias Failure = BoundedProcess.Failure
 
     static func read(_ arguments: [String], timeout: TimeInterval = timeout) -> Result<Data, Failure> {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = arguments
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-
-        let finished = DispatchSemaphore(value: 0)
-        task.terminationHandler = { _ in finished.signal() }
-        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
-
-        if finished.wait(timeout: .now() + timeout) == .timedOut {
-            // Leaves the approval dialog up — answering it makes the next poll
-            // succeed. Only this read is abandoned, not the user's decision.
-            task.terminate()
-            return .failure(.blocked)
-        }
-        // Safe to read after exit only because these payloads are a few KB;
-        // a larger one could fill the pipe buffer and stall the child, which
-        // the timeout above would then catch as .blocked rather than hang.
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+        BoundedProcess.run(executable: "/usr/bin/security", arguments: arguments, timeout: timeout)
     }
 
     /// Same shape as read(), for the one call site (KeychainStore.set) that
     /// cannot use argv: `security -i` reads one command line off stdin
-    /// instead, so a secret value never becomes a `ps`-visible argument. The
-    /// timeout/zombie-pipe handling is identical to read()'s — a stdin write
-    /// can park behind the same approval dialog a find/delete does, and an
-    /// abandoned child must not become a zombie the caller forgot to reap.
+    /// instead, so a secret value never becomes a `ps`-visible argument.
     static func readStdin(_ commandLine: String, timeout: TimeInterval = timeout) -> Result<Data, Failure> {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["-i"]
-        let stdin = Pipe()
-        let stdout = Pipe()
-        task.standardInput = stdin
-        task.standardOutput = stdout
-        task.standardError = FileHandle.nullDevice
-
-        let finished = DispatchSemaphore(value: 0)
-        task.terminationHandler = { _ in finished.signal() }
-        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
-
-        // The command line is at most a few hundred bytes, so this write
-        // cannot fill the pipe and block; closing afterwards is what makes
-        // `security -i` see EOF and act on the one command it was given.
-        stdin.fileHandleForWriting.write(commandLine.data(using: .utf8) ?? Data())
-        try? stdin.fileHandleForWriting.close()
-
-        if finished.wait(timeout: .now() + timeout) == .timedOut {
-            // Leaves the approval dialog up — answering it makes the next poll
-            // succeed. Only this write is abandoned, not the user's decision.
-            task.terminate()
-            return .failure(.blocked)
-        }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+        BoundedProcess.run(executable: "/usr/bin/security", arguments: ["-i"],
+                           stdin: commandLine, timeout: timeout)
     }
 }
 
