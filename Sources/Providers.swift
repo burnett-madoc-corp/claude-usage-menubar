@@ -104,6 +104,57 @@ struct Config: Sendable {
     }
 }
 
+/// One bounded `Process` run, shared by every subprocess this app shells out
+/// to.
+///
+/// Extracted from KeychainCLI, which carried two copies of this body.
+/// AntigravityProvider's `lsof` call is the third caller, and a third
+/// hand-written copy of a subprocess timeout is how timeouts drift apart.
+enum BoundedProcess {
+    /// `failed` carries the child's exit status so callers can tell the
+    /// routine outcomes apart from the real ones — security(1)'s 44 is "no
+    /// such item", which for a key that was never configured is not an error
+    /// at all.
+    enum Failure: Error { case blocked, failed(Int32) }
+
+    static func run(executable: String, arguments: [String],
+                    stdin: String? = nil,
+                    timeout: TimeInterval) -> Result<Data, Failure> {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        let input = stdin != nil ? Pipe() : nil
+        if let input { task.standardInput = input }
+
+        let finished = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in finished.signal() }
+        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
+
+        if let input, let stdin {
+            // At most a few hundred bytes, so this write cannot fill the pipe
+            // and block; closing afterwards is what makes the child see EOF
+            // and act on the one command it was given.
+            input.fileHandleForWriting.write(Data(stdin.utf8))
+            try? input.fileHandleForWriting.close()
+        }
+
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            // Leaves any approval dialog up — answering it makes the next call
+            // succeed. Only this run is abandoned, not the user's decision.
+            task.terminate()
+            return .failure(.blocked)
+        }
+        // Safe to read after exit only because these payloads are a few KB;
+        // a larger one could fill the pipe buffer and stall the child, which
+        // the timeout above would then catch as .blocked rather than hang.
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+    }
+}
+
 /// Bounded wrapper around `security(1)`.
 ///
 /// A Keychain read can block indefinitely: if macOS decides the caller needs
@@ -115,76 +166,56 @@ struct Config: Sendable {
 ///
 /// This app's own key no longer triggers that dialog (see KeychainStore), but
 /// the item it reads from *another* app — Claude Code's OAuth token — is
-/// written under that app's own access rules, so the timeout stays.
+/// written under that app's own access rules, so the timeout stays. That
+/// reasoning is specific to the Keychain and deliberately does not live on
+/// BoundedProcess, which `lsof` also uses.
 enum KeychainCLI {
     /// Long enough that a genuinely slow read succeeds, short enough that the
     /// menu is not held hostage to a dialog nobody is looking at.
     static let timeout: TimeInterval = 8
 
-    /// `failed` carries security(1)'s exit status so callers can tell the
-    /// routine outcomes apart from the real ones — 44 is "no such item",
-    /// which for a key that was never configured is not an error at all.
-    enum Failure: Error { case blocked, failed(Int32) }
+    typealias Failure = BoundedProcess.Failure
 
     static func read(_ arguments: [String], timeout: TimeInterval = timeout) -> Result<Data, Failure> {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = arguments
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-
-        let finished = DispatchSemaphore(value: 0)
-        task.terminationHandler = { _ in finished.signal() }
-        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
-
-        if finished.wait(timeout: .now() + timeout) == .timedOut {
-            // Leaves the approval dialog up — answering it makes the next poll
-            // succeed. Only this read is abandoned, not the user's decision.
-            task.terminate()
-            return .failure(.blocked)
-        }
-        // Safe to read after exit only because these payloads are a few KB;
-        // a larger one could fill the pipe buffer and stall the child, which
-        // the timeout above would then catch as .blocked rather than hang.
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+        BoundedProcess.run(executable: "/usr/bin/security", arguments: arguments, timeout: timeout)
     }
 
     /// Same shape as read(), for the one call site (KeychainStore.set) that
     /// cannot use argv: `security -i` reads one command line off stdin
-    /// instead, so a secret value never becomes a `ps`-visible argument. The
-    /// timeout/zombie-pipe handling is identical to read()'s — a stdin write
-    /// can park behind the same approval dialog a find/delete does, and an
-    /// abandoned child must not become a zombie the caller forgot to reap.
+    /// instead, so a secret value never becomes a `ps`-visible argument.
     static func readStdin(_ commandLine: String, timeout: TimeInterval = timeout) -> Result<Data, Failure> {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        task.arguments = ["-i"]
-        let stdin = Pipe()
-        let stdout = Pipe()
-        task.standardInput = stdin
-        task.standardOutput = stdout
-        task.standardError = FileHandle.nullDevice
+        BoundedProcess.run(executable: "/usr/bin/security", arguments: ["-i"],
+                           stdin: commandLine, timeout: timeout)
+    }
+}
 
-        let finished = DispatchSemaphore(value: 0)
-        task.terminationHandler = { _ in finished.signal() }
-        guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
+/// URLSession that accepts a self-signed certificate from 127.0.0.1, and from
+/// nowhere else.
+///
+/// agy's TLS port presents its own certificate. Trusting it is defensible
+/// only because the connection cannot leave this machine, so the host check
+/// below IS the security argument — it must not be widened to "any local
+/// name" or dropped for convenience. No credential is ever sent to this
+/// server; the RPC is unauthenticated.
+final class LoopbackSession: NSObject, URLSessionDelegate, @unchecked Sendable {
+    static let shared = LoopbackSession()
+    private lazy var session = URLSession(configuration: .ephemeral, delegate: self,
+                                          delegateQueue: nil)
 
-        // The command line is at most a few hundred bytes, so this write
-        // cannot fill the pipe and block; closing afterwards is what makes
-        // `security -i` see EOF and act on the one command it was given.
-        stdin.fileHandleForWriting.write(commandLine.data(using: .utf8) ?? Data())
-        try? stdin.fileHandleForWriting.close()
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await session.data(for: request)
+    }
 
-        if finished.wait(timeout: .now() + timeout) == .timedOut {
-            // Leaves the approval dialog up — answering it makes the next poll
-            // succeed. Only this write is abandoned, not the user's decision.
-            task.terminate()
-            return .failure(.blocked)
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              challenge.protectionSpace.host == "127.0.0.1",
+              let trust = challenge.protectionSpace.serverTrust
+        else {
+            completionHandler(.performDefaultHandling, nil)
+            return
         }
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
+        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 }
 
@@ -228,24 +259,13 @@ enum Net {
 struct CodexProvider: Provider {
     let name = "Codex"
 
-    static let headline = Headline()
-
-    final class Headline: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage: HeadlineValue?
-        var value: HeadlineValue? {
-            get { lock.lock(); defer { lock.unlock() }; return storage }
-            set { lock.lock(); storage = newValue; lock.unlock() }
-        }
-    }
-
     private var sessionsDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
     }
 
     func load() async -> Card {
         guard let newest = newestSessions(limit: 6), !newest.isEmpty else {
-            Self.headline.value = nil
+            TitleValues.clear(provider: .codex)
             return Card(provider: name, rows: [], error: "no Codex sessions found")
         }
 
@@ -264,7 +284,7 @@ struct CodexProvider: Provider {
                 }
             }
         }
-        Self.headline.value = nil
+        TitleValues.clear(provider: .codex)
         return Card(provider: name, rows: [], error: "no rate-limit data in recent sessions")
     }
 
@@ -284,7 +304,7 @@ struct CodexProvider: Provider {
     private func card(from limits: [String: Any], timestamp: String?) -> Card? {
         var rows: [Row] = []
 
-        Self.headline.value = Self.extractWeeklyHeadline(from: limits)
+        TitleValues.set("codex.weekly", Self.extractWeeklyHeadline(from: limits))
 
         for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
             guard let window = limits[key] as? [String: Any],
@@ -393,5 +413,242 @@ struct OpenRouterProvider: Provider {
         } catch {
             return Card(provider: name, rows: [], error: error.localizedDescription)
         }
+    }
+}
+
+// MARK: - Antigravity (agy)
+
+/// Antigravity's quota lives behind `RetrieveUserQuotaSummary`, served by the
+/// `agy` CLI's own loopback Connect server with no authentication.
+///
+/// This provider shipped once before and was removed in #33, because the RPC
+/// available then (`v1internal:retrieveUserQuota`) returned raw per-modelId
+/// buckets covering only some of the models Antigravity serves — so the card
+/// could read 0% while you were throttled on a model it never mentioned.
+/// `RetrieveUserQuotaSummary` returns two named groups spanning the whole
+/// product, which is what makes the card honest enough to ship again.
+///
+/// The *remote* form of this RPC (cloudcode-pa v1internal) returns 403
+/// SUBSCRIPTION_REQUIRED for consumer accounts on both the prod and daily
+/// hosts. See docs/superpowers/specs/2026-08-27-… before trying it again:
+/// re-test against a live token rather than re-arguing from documentation.
+///
+/// `remainingFraction` is what is LEFT (1.0 = untouched), so used = 1 - it.
+struct AntigravityProvider: Provider {
+    let name = "Antigravity"
+
+    struct Bucket {
+        let id: String
+        let label: String
+        let percent: Int
+        let resetTime: Date?
+    }
+
+    /// "Gemini Models" + "weekly" -> "Gemini · Weekly".
+    ///
+    /// The group name is the server's own marketing string. Trimming
+    /// " Models" and folding " and " to "/" is what keeps four rows inside
+    /// the dropdown's width without a hand-maintained translation table that
+    /// a newly-added group would silently fall out of.
+    static func label(group: String, window: String, fallback: String) -> String {
+        var name = group
+        for suffix in [" Models", " models"] where name.hasSuffix(suffix) {
+            name = String(name.dropLast(suffix.count))
+        }
+        name = name.replacingOccurrences(of: " and ", with: "/")
+
+        let windowName: String
+        switch window {
+        case "weekly": windowName = "Weekly"
+        case "5h": windowName = "5-hour"
+        default: windowName = fallback
+        }
+        return "\(name) · \(windowName)"
+    }
+
+    /// Accepts either the Connect envelope (`{"response": {...}}`) or a bare
+    /// body, so a future server that drops the wrapper does not silently
+    /// yield zero buckets.
+    static func buckets(from json: [String: Any]) -> [Bucket] {
+        let response = json["response"] as? [String: Any] ?? json
+        var result: [Bucket] = []
+        for case let group as [String: Any] in response["groups"] as? [Any] ?? [] {
+            let groupName = group["displayName"] as? String ?? "Antigravity"
+            for case let bucket as [String: Any] in group["buckets"] as? [Any] ?? [] {
+                guard let id = bucket["bucketId"] as? String,
+                      let remaining = (bucket["remainingFraction"] as? NSNumber)?.doubleValue
+                else { continue }
+                let resetTime = (bucket["resetTime"] as? String).flatMap {
+                    Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
+                }
+                result.append(Bucket(
+                    id: id,
+                    label: label(group: groupName,
+                                 window: bucket["window"] as? String ?? "",
+                                 fallback: bucket["displayName"] as? String ?? "Limit"),
+                    percent: Int(((1 - remaining) * 100).rounded()),
+                    resetTime: resetTime
+                ))
+            }
+        }
+        return result
+    }
+
+    static func severity(forPercent percent: Int) -> String {
+        percent >= 95 ? "critical" : (percent >= 80 ? "warning" : "normal")
+    }
+
+    static func rows(from buckets: [Bucket]) -> [Row] {
+        buckets.map { bucket in
+            Row(label: bucket.label, percent: bucket.percent,
+                detail: "resets in \(Format.countdown(to: bucket.resetTime))",
+                severity: severity(forPercent: bucket.percent))
+        }
+    }
+
+    // MARK: Cache
+    //
+    // agy is a CLI, not a daemon, so its server is absent most of the time.
+    // Without a cache this card would read "not running" almost always, which
+    // is truthful but useless. With one, the weekly numbers — the ones you
+    // actually plan around — stay on screen between agy sessions.
+
+    static let cacheKey = "antigravity.cache"
+
+    static func encodeCache(buckets: [Bucket], fetchedAt: Date) -> [String: Any] {
+        [
+            "fetchedAt": Format.iso.string(from: fetchedAt),
+            "buckets": buckets.map { bucket -> [String: Any] in
+                var encoded: [String: Any] = ["id": bucket.id, "label": bucket.label,
+                                              "percent": bucket.percent]
+                if let resetTime = bucket.resetTime {
+                    encoded["resetTime"] = Format.iso.string(from: resetTime)
+                }
+                return encoded
+            },
+        ]
+    }
+
+    /// Returns nil when the cache is absent, unreadable, or entirely past its
+    /// reset times. All three mean "show no cached rows", so the caller gets
+    /// one branch instead of three.
+    static func decodeCache(_ raw: [String: Any], now: Date) -> (buckets: [Bucket], fetchedAt: Date)? {
+        guard let stamp = raw["fetchedAt"] as? String,
+              let fetchedAt = Format.iso.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
+        else { return nil }
+
+        var buckets: [Bucket] = []
+        for case let entry as [String: Any] in raw["buckets"] as? [Any] ?? [] {
+            guard let id = entry["id"] as? String,
+                  let label = entry["label"] as? String,
+                  let percent = (entry["percent"] as? NSNumber)?.intValue
+            else { continue }
+            let resetTime = (entry["resetTime"] as? String).flatMap {
+                Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
+            }
+            // A bucket that never said when it resets is not immortal: it
+            // falls back to a week from the fetch, the longest window
+            // Antigravity actually uses. Keeping it forever would park a
+            // stale percentage on screen with nothing to ever clear it.
+            let expiresAt = resetTime ?? fetchedAt.addingTimeInterval(7 * 86400)
+            if expiresAt <= now { continue }
+            buckets.append(Bucket(id: id, label: label, percent: percent, resetTime: resetTime))
+        }
+        return buckets.isEmpty ? nil : (buckets, fetchedAt)
+    }
+
+    // MARK: Transport
+
+    /// agy opens ephemeral ports per run and writes no port file — no
+    /// lockfile carries one, and jetski_state.pbtxt does not either — so the
+    /// only way to find its server is to ask the kernel who is listening.
+    static func agyPorts(fromLsof output: String) -> [Int] {
+        var ports: [Int] = []
+        for line in output.split(separator: "\n") {
+            guard line.trimmingCharacters(in: .whitespaces).hasPrefix("agy") else { continue }
+            for field in line.split(separator: " ") where field.hasPrefix("127.0.0.1:") {
+                let digits = field.dropFirst("127.0.0.1:".count).prefix { $0.isNumber }
+                if let port = Int(digits), !ports.contains(port) { ports.append(port) }
+            }
+        }
+        return ports
+    }
+
+    private static func listeningPorts() -> [Int] {
+        guard case let .success(data) = BoundedProcess.run(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-c", "agy"],
+            timeout: 5
+        ) else { return [] }
+        return agyPorts(fromLsof: String(decoding: data, as: UTF8.self))
+    }
+
+    private static let rpcPath =
+        "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+
+    /// The IDE additionally requires an X-Codeium-Csrf-Token from its own
+    /// state; the CLI's server does not, which is the only reason this
+    /// provider can exist without shipping a token scraper.
+    private static let rpcBody = Data(
+        #"{"ideName":"antigravity","extensionName":"antigravity","locale":"en","ideVersion":"unknown"}"#.utf8)
+
+    /// agy opens one plain-HTTP port and one TLS port, and which is which is
+    /// not stable between runs, so both schemes are tried per port.
+    private static func fetch(port: Int) async -> [String: Any]? {
+        for scheme in ["http", "https"] {
+            guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)\(rpcPath)") else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.httpBody = rpcBody
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.timeoutInterval = 5
+
+            guard let (data, response) = try? await LoopbackSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            return json
+        }
+        return nil
+    }
+
+    /// Only bucket ids that exist in the registry can reach the title; an
+    /// unrecognised one from a future release still renders in the dropdown.
+    private static func publishHeadlines(_ buckets: [Bucket]) {
+        for bucket in buckets where TitleMetric.metric(id: "antigravity.\(bucket.id)") != nil {
+            TitleValues.set("antigravity.\(bucket.id)",
+                            HeadlineValue(percent: bucket.percent,
+                                          severity: severity(forPercent: bucket.percent)))
+        }
+    }
+
+    func load() async -> Card {
+        for port in Self.listeningPorts() {
+            guard let json = await Self.fetch(port: port) else { continue }
+            let buckets = Self.buckets(from: json)
+            guard !buckets.isEmpty else { continue }
+            Prefs.defaults.set(Self.encodeCache(buckets: buckets, fetchedAt: Date()),
+                               forKey: Self.cacheKey)
+            Self.publishHeadlines(buckets)
+            return Card(provider: name, rows: Self.rows(from: buckets))
+        }
+
+        // agy is not running. Replay the last reading, minus any bucket whose
+        // window has since reset, and say plainly how old it is — the same
+        // contract CodexProvider's snapshot badge makes.
+        guard let raw = Prefs.defaults.dictionary(forKey: Self.cacheKey),
+              let cached = Self.decodeCache(raw, now: Date())
+        else {
+            TitleValues.clear(provider: .antigravity)
+            return Card(provider: name, rows: [], error: "agy not running")
+        }
+        // Publish from the cached path too: a cached number in the dropdown
+        // and a blank one in the title would be incoherent, and the cache is
+        // where this provider spends most of its life.
+        Self.publishHeadlines(cached.buckets)
+        return Card(provider: name, rows: Self.rows(from: cached.buckets),
+                    badge: Badge(text: "as of \(Format.ago(cached.fetchedAt))", kind: .gray))
     }
 }

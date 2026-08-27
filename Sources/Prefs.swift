@@ -7,19 +7,21 @@ import Foundation
 /// one place that mapping lives, so the registry filter in Providers.all()
 /// never risks drifting from what's on screen.
 enum ProviderID: String, CaseIterable {
-    case claude, codex, openrouter
+    case claude, codex, openrouter, antigravity
 
-    /// Only Claude and Codex publish a headline value (main.swift:103,
-    /// Providers.swift:103) — OpenRouter has nothing to put in the title, so
-    /// its "Menu bar" checkbox doesn't exist rather than being
-    /// disabled-but-visible.
-    var supportsTitle: Bool { self == .claude || self == .codex }
+    /// A provider is title-capable if it owns at least one TitleMetric. This
+    /// replaced a hardcoded `self == .claude || self == .codex`: with seven
+    /// tickable numbers across four providers, the registry is the only
+    /// honest source for the question, and OpenRouter needs no special case —
+    /// it simply owns none.
+    var ownsTitleMetrics: Bool { TitleMetric.all.contains { $0.provider == self } }
 
     var displayName: String {
         switch self {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .openrouter: return "OpenRouter"
+        case .antigravity: return "Antigravity"
         }
     }
 
@@ -27,6 +29,52 @@ enum ProviderID: String, CaseIterable {
         guard let match = Self.allCases.first(where: { $0.displayName == displayName }) else { return nil }
         self = match
     }
+}
+
+// MARK: - Menu bar title metrics
+
+/// One tickable number in the menu bar title.
+///
+/// The title used to be two hardcoded providers with a boolean each. It is a
+/// registry because Antigravity alone contributes four numbers across two
+/// unrelated quota groups (Gemini, and Claude/GPT), and no single one of them
+/// is a fair headline for the others — so the choice of which to show has to
+/// belong to the user rather than to this code.
+struct TitleMetric: Hashable {
+    let id: String
+    let provider: ProviderID
+    /// Shown in Settings, where there is room to be unambiguous.
+    let label: String
+    /// Shown in the menu bar itself, where every character costs width.
+    /// These are exactly the strings the old hardcoded renderTitle()
+    /// appended, so a default install's title is unchanged by this refactor.
+    let shortLabel: String
+    /// Antigravity's four are false: upgrading must not silently widen
+    /// someone's menu bar.
+    let defaultOn: Bool
+
+    /// Registry order is title order. Antigravity's ids are the server's own
+    /// bucketIds, so an unrecognised bucket from a future release renders in
+    /// the dropdown and is simply absent from this list rather than showing
+    /// up as an unlabelled checkbox.
+    static let all: [TitleMetric] = [
+        TitleMetric(id: "claude.session", provider: .claude,
+                    label: "5-hour", shortLabel: "5h", defaultOn: true),
+        TitleMetric(id: "claude.weekly", provider: .claude,
+                    label: "Weekly", shortLabel: "wk", defaultOn: true),
+        TitleMetric(id: "codex.weekly", provider: .codex,
+                    label: "Weekly", shortLabel: "wk", defaultOn: true),
+        TitleMetric(id: "antigravity.gemini-weekly", provider: .antigravity,
+                    label: "Gemini · Weekly", shortLabel: "gem wk", defaultOn: false),
+        TitleMetric(id: "antigravity.gemini-5h", provider: .antigravity,
+                    label: "Gemini · 5-hour", shortLabel: "gem 5h", defaultOn: false),
+        TitleMetric(id: "antigravity.3p-weekly", provider: .antigravity,
+                    label: "Claude/GPT · Weekly", shortLabel: "3p wk", defaultOn: false),
+        TitleMetric(id: "antigravity.3p-5h", provider: .antigravity,
+                    label: "Claude/GPT · 5-hour", shortLabel: "3p 5h", defaultOn: false),
+    ]
+
+    static func metric(id: String) -> TitleMetric? { all.first { $0.id == id } }
 }
 
 // MARK: - Sessions row style
@@ -59,8 +107,34 @@ enum Prefs {
     static func showInDropdown(_ id: ProviderID) -> Bool { flag("dropdown.\(id.rawValue)") }
     static func setShowInDropdown(_ id: ProviderID, _ value: Bool) { setFlag("dropdown.\(id.rawValue)", value) }
 
-    static func showInTitle(_ id: ProviderID) -> Bool { flag("title.\(id.rawValue)") }
-    static func setShowInTitle(_ id: ProviderID, _ value: Bool) { setFlag("title.\(id.rawValue)", value) }
+    /// Unlike every other flag here, an unset key reads the metric's OWN
+    /// default rather than a blanket true — "show everything" would put four
+    /// new Antigravity numbers into the menu bar of everyone who upgrades.
+    static func showMetricInTitle(_ metric: TitleMetric) -> Bool {
+        let key = "title.metric.\(metric.id)"
+        return defaults.object(forKey: key) == nil ? metric.defaultOn : defaults.bool(forKey: key)
+    }
+
+    static func setShowMetricInTitle(_ metric: TitleMetric, _ value: Bool) {
+        setFlag("title.metric.\(metric.id)", value)
+    }
+
+    /// Carries the old per-provider `title.<id>` booleans forward, once.
+    ///
+    /// Without this, anyone who had hidden Claude or Codex from the bar gets
+    /// it back on upgrade — the one visible regression this refactor could
+    /// cause. Guarded by its own marker rather than by "are any metric keys
+    /// set", so a later manual change is never mistaken for an unmigrated
+    /// install and overwritten.
+    static func migrateTitleMetricsIfNeeded() {
+        guard defaults.object(forKey: "title.metricsMigrated") == nil else { return }
+        for metric in TitleMetric.all {
+            let legacyKey = "title.\(metric.provider.rawValue)"
+            guard defaults.object(forKey: legacyKey) != nil else { continue }
+            defaults.set(defaults.bool(forKey: legacyKey), forKey: "title.metric.\(metric.id)")
+        }
+        defaults.set(true, forKey: "title.metricsMigrated")
+    }
 
     // Unset reads true, matching the provider-visibility flags above: "never
     // configured" means "show everything".
