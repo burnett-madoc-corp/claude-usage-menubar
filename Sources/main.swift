@@ -1721,6 +1721,10 @@ private func runSelfTests() {
         } == true, "\(resource) rasterized to nothing")
     }
 
+    // runSelfTests() is nonisolated but only ever called from the main
+    // thread (see the MainActor.assumeIsolated entry point below); the
+    // Settings checks touch AppKit views, so they need that stated.
+    MainActor.assumeIsolated { SettingsWindowController.runSelfTests() }
     SessionSelfTests.run()
     testCompactSessionRendering()
     DetailedSessionRowSelfTests.run()
