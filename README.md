@@ -1,12 +1,15 @@
 # AI Usage — macOS menu bar
 
 A tiny native menu bar app showing rate-limit and credit usage for the AI
-coding tools you actually use: **Claude**, **Codex** and **OpenRouter**.
+coding tools you actually use: **Claude**, **Codex**, **OpenRouter** and
+**Antigravity**.
 
 Claude's 5-hour and weekly windows plus Codex's weekly percentage stay in the
-menu bar title. Reset times, credit balances and live agent sessions are one
-click away, alongside a Settings window (⌘,) for provider visibility, refresh
-interval and API keys.
+menu bar title by default, and you can put any of the other numbers up there
+too — the title is composed from a per-number picker, not a per-provider
+one. Reset times, credit balances and live agent sessions are one click away,
+alongside a Settings window (⌘,) for visibility, refresh interval and API
+keys.
 
 ![The menu bar title and its dropdown: Claude, Codex and OpenRouter quota
 bars above the live Sessions panel](docs/menu-bar.png)
@@ -18,18 +21,32 @@ bars above the live Sessions panel](docs/menu-bar.png)
 | Claude | `GET api.anthropic.com/api/oauth/usage` (Keychain token) | no |
 | Codex | `rate_limits` recorded in `~/.codex/sessions/**.jsonl` | no |
 | OpenRouter | `GET openrouter.ai/api/v1/credits` | yes |
+| Antigravity | `RetrieveUserQuotaSummary` on the `agy` CLI's loopback server | no |
 
 **Codex has no pollable usage API.** It does record the server's `rate_limits`
 payload into its session logs on every turn, so this reads the newest entry —
 free and local, but only as fresh as your last Codex turn. The row is labelled
 with its age (`as of 6d ago`) so a stale number never masquerades as live.
 
-All three providers are visible by default, in both the dropdown and (where
-they publish a headline) the title — see [Settings](#settings).
+**Antigravity only reports while `agy` is running.** It is a CLI, not a
+daemon: it opens a local Connect server for the life of a session and takes it
+away again on exit. So this reads the live server when there is one, and
+otherwise replays the last reading it saw, dropping each bucket as its own
+window resets — a weekly number stays useful for days, a 5-hour one expires by
+itself. Replayed rows carry an `as of 3h ago` badge, the same contract the
+Codex rows make. With no server and nothing left in the cache, the card says
+`agy not running` rather than showing a number it cannot stand behind.
+
+Antigravity reports four numbers, two per quota group: Gemini models (Flash,
+Pro) and Claude/GPT models (Opus, Sonnet, GPT-OSS) each have a weekly and a
+five-hour limit, and the two groups are entirely independent.
+
+All four providers are visible in the dropdown by default. What reaches the
+menu bar title is chosen number by number — see [Settings](#settings).
 
 ### Providers that aren't here
 
-The bar for inclusion is a source that reports *real* usage. Three tools that
+The bar for inclusion is a source that reports *real* usage. Two tools that
 look like obvious candidates don't clear it:
 
 - **Grok (xAI)** — publishes no usage or credit-balance endpoint at all.
@@ -37,15 +54,24 @@ look like obvious candidates don't clear it:
   report whether your key is blocked, which is not usage. Earlier versions
   shipped that row; it was removed rather than continue implying a quota
   reading exists.
-- **Antigravity (`agy`)** — does have a real quota RPC
-  (`v1internal:retrieveUserQuota`), but it is undocumented and incomplete: it
-  returns buckets for only some of the models Antigravity serves, so the
-  section could sit at 0% while you were being throttled on a model it never
-  reported. A partial quota display is worse than none, so it was removed too.
-  If Google documents that RPC or completes its coverage, this is the easiest
-  provider to bring back.
 - **Gemini CLI** — exposes neither. The CLI itself only learns its quota from
   the metadata attached to a 429.
+
+Antigravity used to be on this list. It was removed from the app in #33
+because the RPC available then, `v1internal:retrieveUserQuota`, returned raw
+per-model buckets covering only some of the models it serves — the section
+could sit at 0% while you were throttled on a model it never reported. It came
+back once `RetrieveUserQuotaSummary` shipped, which returns two named groups
+spanning the whole product.
+
+One trap worth recording: that RPC also exists remotely, on
+`cloudcode-pa.googleapis.com`. Do not reach for it. On a consumer account it
+returns `403 SUBSCRIPTION_REQUIRED` on both the production and `daily-` hosts,
+with or without a `project`, with or without `client-metadata` headers, and
+with the API key baked into the `agy` binary. The endpoint is alive — a bogus
+field comes back as a 400 naming that field — it just will not authenticate
+you. The local server is the supported path, and it needs no credential at
+all. Re-test against a live token before believing otherwise.
 
 ## Settings
 
@@ -53,12 +79,22 @@ One **Settings…** (⌘,) click from the dropdown — plain AppKit, no SwiftUI.
 Nothing in it needs a restart: prefs are read fresh on every poll and every
 menu rebuild.
 
-**Providers** — two independent checkboxes each: *Dropdown* (show its card)
-and *Menu bar* (put it in the title). Only Claude and Codex have a headline
-value worth 12pt of title text, so OpenRouter doesn't get that second checkbox
-at all rather than showing it disabled. Hiding a provider from both stops
-polling it entirely — a real saving, since the Anthropic usage endpoint
-rate-limits aggressively.
+**Providers** — one *Dropdown* checkbox each, controlling whether that
+provider's card appears in the menu.
+
+**Menu bar** — one checkbox per *number*, not per provider: Claude's 5-hour
+and weekly, Codex's weekly, and Antigravity's four. Per-provider was the old
+design and it cannot express Antigravity, whose two quota groups are unrelated
+— a single number standing in for both would hide whichever one you were
+actually burning. Claude and Codex are ticked by default, exactly the title
+this app has always shown; Antigravity's four start unticked, so upgrading
+never widens your menu bar without you asking. An earlier per-provider setting
+is carried across on first launch, so a provider you had hidden stays hidden.
+
+A provider hidden from the dropdown *and* contributing no ticked number is not
+polled at all — a real saving, since the Anthropic usage endpoint rate-limits
+aggressively. One ticked number is enough to keep it polling, because a
+headline that stops refreshing would sit in the title looking current.
 
 **Refresh interval** — 1/2/5/10/15 minutes, default 2, floored at 60s for the
 same reason: a faster poll trades a working title for a string of 429s.

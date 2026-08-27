@@ -57,10 +57,22 @@ transcript or rollout log is ever transmitted anywhere, it only feeds the
 Sessions section's on-screen display. Session working directory paths are
 shown in the dropdown.
 
-**Network egress** is limited to the two provider endpoints documented in the
-README (`api.anthropic.com`, `openrouter.ai`) and nothing else — Codex is read
-entirely from local files. There is no telemetry, no analytics, no crash
-reporting, and no update check.
+**Network egress** is limited to the two remote provider endpoints documented
+in the README (`api.anthropic.com`, `openrouter.ai`) and nothing else — Codex
+is read entirely from local files, and Antigravity from a loopback socket that
+by definition cannot leave the machine. There is no telemetry, no analytics,
+no crash reporting, and no update check.
+
+**One TLS exception, scoped to loopback.** The `agy` CLI serves its quota RPC
+on `127.0.0.1` and presents a self-signed certificate, so the app accepts an
+untrusted certificate when — and only when — the challenge host is exactly
+`127.0.0.1`. Every other host falls through to default validation.
+`LoopbackSession` in `Sources/Providers.swift` is the only place this applies,
+and that host comparison is the entire security argument: it must not be
+widened to hostnames that merely resolve to loopback, since those can be
+attacker-controlled. No credential is sent to that server in any case — the
+RPC is unauthenticated, which is also why this provider needs no Keychain
+item and adds no secret to protect.
 
 ## The refresh-token boundary
 
