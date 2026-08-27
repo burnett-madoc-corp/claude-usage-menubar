@@ -487,6 +487,57 @@ struct AntigravityProvider: Provider {
         }
     }
 
+    // MARK: Cache
+    //
+    // agy is a CLI, not a daemon, so its server is absent most of the time.
+    // Without a cache this card would read "not running" almost always, which
+    // is truthful but useless. With one, the weekly numbers — the ones you
+    // actually plan around — stay on screen between agy sessions.
+
+    static let cacheKey = "antigravity.cache"
+
+    static func encodeCache(buckets: [Bucket], fetchedAt: Date) -> [String: Any] {
+        [
+            "fetchedAt": Format.iso.string(from: fetchedAt),
+            "buckets": buckets.map { bucket -> [String: Any] in
+                var encoded: [String: Any] = ["id": bucket.id, "label": bucket.label,
+                                              "percent": bucket.percent]
+                if let resetTime = bucket.resetTime {
+                    encoded["resetTime"] = Format.iso.string(from: resetTime)
+                }
+                return encoded
+            },
+        ]
+    }
+
+    /// Returns nil when the cache is absent, unreadable, or entirely past its
+    /// reset times. All three mean "show no cached rows", so the caller gets
+    /// one branch instead of three.
+    static func decodeCache(_ raw: [String: Any], now: Date) -> (buckets: [Bucket], fetchedAt: Date)? {
+        guard let stamp = raw["fetchedAt"] as? String,
+              let fetchedAt = Format.iso.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
+        else { return nil }
+
+        var buckets: [Bucket] = []
+        for case let entry as [String: Any] in raw["buckets"] as? [Any] ?? [] {
+            guard let id = entry["id"] as? String,
+                  let label = entry["label"] as? String,
+                  let percent = (entry["percent"] as? NSNumber)?.intValue
+            else { continue }
+            let resetTime = (entry["resetTime"] as? String).flatMap {
+                Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
+            }
+            // A bucket that never said when it resets is not immortal: it
+            // falls back to a week from the fetch, the longest window
+            // Antigravity actually uses. Keeping it forever would park a
+            // stale percentage on screen with nothing to ever clear it.
+            let expiresAt = resetTime ?? fetchedAt.addingTimeInterval(7 * 86400)
+            if expiresAt <= now { continue }
+            buckets.append(Bucket(id: id, label: label, percent: percent, resetTime: resetTime))
+        }
+        return buckets.isEmpty ? nil : (buckets, fetchedAt)
+    }
+
     func load() async -> Card {
         Card(provider: name, rows: [], error: "not implemented")
     }

@@ -1400,6 +1400,43 @@ private func runSelfTests() {
         AntigravityProvider.Bucket(id: "y", label: "Y", percent: 83, resetTime: nil),
     ])[0].severity == "warning")
 
+    // MARK: Antigravity cache expiry
+    //
+    // A cached reading outlives the agy process by design: agy is a CLI, not
+    // a daemon, so "not running" is the normal state. Each bucket expires at
+    // its OWN resetTime — a weekly number is still true days later, a 5-hour
+    // one is not.
+    let agyNow = Date(timeIntervalSince1970: 1_800_000_000)
+    let agyCached = [
+        AntigravityProvider.Bucket(id: "gemini-weekly", label: "Gemini \u{b7} Weekly", percent: 52,
+                                   resetTime: agyNow.addingTimeInterval(3600)),
+        AntigravityProvider.Bucket(id: "gemini-5h", label: "Gemini \u{b7} 5-hour", percent: 4,
+                                   resetTime: agyNow.addingTimeInterval(-60)),
+        AntigravityProvider.Bucket(id: "3p-weekly", label: "Claude/GPT \u{b7} Weekly", percent: 75,
+                                   resetTime: nil),
+    ]
+    let agyEncoded = AntigravityProvider.encodeCache(buckets: agyCached, fetchedAt: agyNow)
+    let agyDecoded = AntigravityProvider.decodeCache(agyEncoded, now: agyNow)
+    precondition(agyDecoded != nil)
+    precondition(agyDecoded!.buckets.map(\.id) == ["gemini-weekly", "3p-weekly"],
+                 "the reset 5-hour bucket must be dropped; a bucket with no resetTime is kept")
+    precondition(agyDecoded!.buckets[0].percent == 52, "percentages survive the round trip")
+    precondition(agyDecoded!.buckets[0].label == "Gemini \u{b7} Weekly")
+    precondition(Int(agyDecoded!.fetchedAt.timeIntervalSince1970) == Int(agyNow.timeIntervalSince1970))
+
+    // Two hours on, the weekly bucket has gone but the one with no stated
+    // reset survives on its fallback horizon.
+    precondition(AntigravityProvider.decodeCache(agyEncoded,
+                                                 now: agyNow.addingTimeInterval(7200))?.buckets.map(\.id)
+                 == ["3p-weekly"])
+    // Past that fallback horizon there is nothing honest left to show.
+    precondition(AntigravityProvider.decodeCache(agyEncoded,
+                                                 now: agyNow.addingTimeInterval(8 * 86400)) == nil,
+                 "an all-expired cache must read as no cache at all")
+    // A malformed or empty blob must not crash the poll.
+    precondition(AntigravityProvider.decodeCache([:], now: agyNow) == nil)
+    precondition(AntigravityProvider.decodeCache(["fetchedAt": "not-a-date"], now: agyNow) == nil)
+
     // Provider-filter mapping: ProviderID.displayName must round-trip
     // through ProviderID(displayName:) for every case (this is the mapping
     // Providers.all() relies on to filter by Prefs.showInDropdown), and an
