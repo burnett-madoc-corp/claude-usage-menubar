@@ -63,6 +63,7 @@ final class SettingsWindowController: NSObject {
         root.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(providersSection())
+        root.addArrangedSubview(menuBarSection())
         root.addArrangedSubview(refreshSection())
         root.addArrangedSubview(apiKeysSection())
         root.addArrangedSubview(sessionsSection())
@@ -88,11 +89,11 @@ final class SettingsWindowController: NSObject {
         let header = NSTextField(labelWithString: "Providers")
         header.font = .boldSystemFont(ofSize: 13)
 
-        let grid = NSGridView(numberOfColumns: 3, rows: 0)
+        let grid = NSGridView(numberOfColumns: 2, rows: 0)
         grid.rowSpacing = 6
         grid.columnSpacing = 14
 
-        let columnTitles = ["", "Dropdown", "Menu bar"]
+        let columnTitles = ["", "Dropdown"]
         let headerRow = columnTitles.map { title -> NSView in
             let field = NSTextField(labelWithString: title)
             field.font = .systemFont(ofSize: 11, weight: .semibold)
@@ -108,18 +109,10 @@ final class SettingsWindowController: NSObject {
             dropdownCheck.state = Prefs.showInDropdown(id) ? .on : .off
             dropdownCheck.identifier = NSUserInterfaceItemIdentifier(id.rawValue)
 
-            if id.supportsTitle {
-                let titleCheck = NSButton(checkboxWithTitle: "", target: self, action: #selector(titleToggled(_:)))
-                titleCheck.state = Prefs.showInTitle(id) ? .on : .off
-                titleCheck.identifier = NSUserInterfaceItemIdentifier(id.rawValue)
-                grid.addRow(with: [nameField, dropdownCheck, titleCheck])
-            } else {
-                // Absent, not disabled: this provider has no headline value
-                // to put in the title, so there is nothing for the checkbox
-                // to control. NSGridCell.emptyContentView marks the cell as
-                // deliberately empty rather than leaving a hole.
-                grid.addRow(with: [nameField, dropdownCheck, NSGridCell.emptyContentView])
-            }
+            // What appears in the menu bar is chosen per number, not per
+            // provider, in its own section below — Antigravity contributes
+            // four unrelated numbers and one checkbox cannot speak for them.
+            grid.addRow(with: [nameField, dropdownCheck])
         }
 
         let stack = NSStackView(views: [header, grid])
@@ -134,12 +127,48 @@ final class SettingsWindowController: NSObject {
         Prefs.setShowInDropdown(id, sender.state == .on)
     }
 
-    @objc private func titleToggled(_ sender: NSButton) {
-        guard let raw = sender.identifier?.rawValue, let id = ProviderID(rawValue: raw) else { return }
-        Prefs.setShowInTitle(id, sender.state == .on)
+    @objc private func metricToggled(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue,
+              let metric = TitleMetric.metric(id: raw) else { return }
+        Prefs.setShowMetricInTitle(metric, sender.state == .on)
     }
 
     // MARK: Refresh interval section
+
+    // MARK: Menu bar section
+
+    /// One checkbox per title number rather than per provider.
+    ///
+    /// Antigravity contributes four numbers across two unrelated quota groups
+    /// (Gemini, and Claude/GPT) and no single one of them is a fair headline
+    /// for the others, so the choice belongs to the user. Claude and Codex
+    /// get the same treatment for consistency — and because someone who only
+    /// cares about their weekly window can now say so.
+    private func menuBarSection() -> NSView {
+        let header = NSTextField(labelWithString: "Menu bar")
+        header.font = .boldSystemFont(ofSize: 13)
+
+        let caption = NSTextField(labelWithString:
+            "Antigravity's numbers come from the agy CLI and are only live while it runs.")
+        caption.font = .systemFont(ofSize: 11)
+        caption.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [header])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+
+        for metric in TitleMetric.all {
+            let check = NSButton(
+                checkboxWithTitle: "\(metric.provider.displayName) · \(metric.label)",
+                target: self, action: #selector(metricToggled(_:)))
+            check.state = Prefs.showMetricInTitle(metric) ? .on : .off
+            check.identifier = NSUserInterfaceItemIdentifier(metric.id)
+            stack.addArrangedSubview(check)
+        }
+        stack.addArrangedSubview(caption)
+        return stack
+    }
 
     private func refreshSection() -> NSView {
         let header = NSTextField(labelWithString: "Refresh")

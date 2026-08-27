@@ -10,6 +10,38 @@ extension String {
     }
 }
 
+/// Headline values for the menu bar title, keyed by TitleMetric.id and
+/// published by providers as a side effect of load().
+///
+/// One store rather than a lock-box per provider: the title now reads up to
+/// seven numbers from four providers, and four bespoke singletons is three
+/// too many. Mirrors the @unchecked Sendable pattern the two Headline classes
+/// it replaces already used.
+final class TitleValues: @unchecked Sendable {
+    static let shared = TitleValues()
+    private let lock = NSLock()
+    private var storage: [String: HeadlineValue] = [:]
+
+    static func set(_ id: String, _ value: HeadlineValue?) {
+        shared.lock.lock(); defer { shared.lock.unlock() }
+        shared.storage[id] = value
+    }
+
+    static func get(_ id: String) -> HeadlineValue? {
+        shared.lock.lock(); defer { shared.lock.unlock() }
+        return shared.storage[id]
+    }
+
+    /// On an auth failure a provider's numbers are wrong, not merely old, so
+    /// they must leave the title rather than sit there looking current.
+    static func clear(provider: ProviderID) {
+        shared.lock.lock(); defer { shared.lock.unlock() }
+        for metric in TitleMetric.all where metric.provider == provider {
+            shared.storage[metric.id] = nil
+        }
+    }
+}
+
 enum Format {
     static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -125,18 +157,6 @@ enum Keychain {
 struct ClaudeProvider: Provider {
     let name = "Claude"
 
-    /// Headline numbers for the menu bar title, set as a side effect of load().
-    static let headline = Headline()
-
-    final class Headline: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage: (session: Int, weekly: Int, severity: String)?
-        var value: (session: Int, weekly: Int, severity: String)? {
-            get { lock.lock(); defer { lock.unlock() }; return storage }
-            set { lock.lock(); storage = newValue; lock.unlock() }
-        }
-    }
-
     func load() async -> Card {
         do {
             let token = try Keychain.claudeToken()
@@ -169,12 +189,16 @@ struct ClaudeProvider: Provider {
                                 detail: "resets in \(Format.countdown(to: resets))", severity: severity))
             }
 
-            Self.headline.value = (session, weekly, worst)
+            // Both numbers carry the worst severity of the two, which is what
+            // the old tuple did; Format.color ignores it and colours by
+            // percent anyway, so this only feeds the tooltip's wording.
+            TitleValues.set("claude.session", HeadlineValue(percent: session, severity: worst))
+            TitleValues.set("claude.weekly", HeadlineValue(percent: weekly, severity: worst))
             return Card(provider: name, rows: rows)
         } catch let error as NSError where error.domain == "http" && error.code == 401 {
             // Only a genuine auth failure invalidates the headline; transient
             // errors below keep the last good numbers on screen.
-            Self.headline.value = nil
+            TitleValues.clear(provider: .claude)
             return Card(provider: name, rows: [], error: ClaudeError.tokenExpired.localizedDescription)
         } catch let error as NSError where error.domain == "http" && error.code == 429 {
             return Card(provider: name, rows: [], error: "rate limited by usage API", rateLimited: true)
@@ -282,6 +306,9 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Before anything reads a title flag: carries the old per-provider
+        // booleans onto the per-metric keys exactly once.
+        Prefs.migrateTitleMetricsIfNeeded()
         NSApp.mainMenu = Self.makeMainMenu()
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         statusItem.menu = menu
@@ -412,31 +439,52 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Title — Claude and Codex are the only providers with a headline
-    // value; other providers live in the dropdown only.
+    // MARK: Title — composed from TitleMetric.all, filtered by per-metric
+    // prefs. A provider with no ticked metric simply contributes nothing.
 
     /// Plain-text title: the source of truth for the tooltip/accessibility
     /// label, and the decision renderTitle() mirrors when building the
     /// attributed (logo-bearing) version, so the two never drift apart.
     ///
+    /// Consecutive metrics from one provider share a single provider name, so
+    /// Claude's two numbers read "Claude 5h 17% wk 85%" rather than naming
+    /// Claude twice.
+    ///
     /// Both groups hidden must still produce a non-empty string — an empty
     /// title makes the status item zero-width and unclickable, and with no
     /// Dock icon (LSUIElement) that would make the app unreachable.
-    nonisolated static func headlineText(
-        claudeVisible: Bool, codexVisible: Bool,
-        claude: (session: Int, weekly: Int)?, codex: Int?
-    ) -> String {
+    nonisolated static func headlineText(_ entries: [(TitleMetric, HeadlineValue?)]) -> String {
+        // Empty must stay non-empty: a zero-width status item is unclickable
+        // and there is no Dock icon to fall back on.
+        guard !entries.isEmpty else { return "AI" }
+
         var groups: [String] = []
-        if claudeVisible {
-            let session = claude.map { "\($0.session)%" } ?? "—"
-            let weekly = claude.map { "\($0.weekly)%" } ?? "—"
-            groups.append("Claude 5h \(session) wk \(weekly)")
+        var current: (provider: ProviderID, parts: [String])?
+        for (metric, value) in entries {
+            let piece = "\(metric.shortLabel) \(value.map { "\($0.percent)%" } ?? "—")"
+            if var open = current, open.provider == metric.provider {
+                open.parts.append(piece)
+                current = open
+            } else {
+                if let open = current {
+                    groups.append(([open.provider.displayName] + open.parts).joined(separator: " "))
+                }
+                current = (metric.provider, [piece])
+            }
         }
-        if codexVisible {
-            let weekly = codex.map { "\($0)%" } ?? "—"
-            groups.append("Codex wk \(weekly)")
+        if let open = current {
+            groups.append(([open.provider.displayName] + open.parts).joined(separator: " "))
         }
-        return groups.isEmpty ? "AI" : groups.joined(separator: "   ")
+        return groups.joined(separator: "   ")
+    }
+
+    /// The metrics currently ticked, paired with whatever value their provider
+    /// last published. One source for both renderTitle() and headlineText(),
+    /// so the drawn title and the tooltip cannot disagree.
+    nonisolated static func visibleTitleEntries() -> [(TitleMetric, HeadlineValue?)] {
+        TitleMetric.all
+            .filter { Prefs.showMetricInTitle($0) }
+            .map { ($0, TitleValues.get($0.id)) }
     }
 
     nonisolated static func logoImage(resource: String) -> NSImage? {
@@ -459,18 +507,15 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         let title = NSMutableAttributedString()
-        let claude = ClaudeProvider.headline.value
-        let codex = CodexProvider.headline.value
-        let claudeVisible = Prefs.showInTitle(.claude)
-        let codexVisible = Prefs.showInTitle(.codex)
+        let entries = Self.visibleTitleEntries()
 
         func append(_ text: String, _ color: NSColor) {
             title.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
         }
 
-        func appendLogo(_ resource: String, fallback: String) {
-            guard let image = Self.logoImage(resource: resource) else {
-                append(fallback, .secondaryLabelColor)
+        func appendLogo(_ provider: ProviderID) {
+            guard let image = Self.logoImage(resource: "\(provider.rawValue)-template") else {
+                append(provider.displayName, .secondaryLabelColor)
                 return
             }
             let attachment = NSTextAttachment()
@@ -479,36 +524,27 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             title.append(NSAttributedString(attachment: attachment))
         }
 
-        if claudeVisible {
-            appendLogo("claude-template", fallback: "Claude")
-            append(" 5h ", .secondaryLabelColor)
-            append(claude.map { "\($0.session)%" } ?? "—",
-                   claude.map { Format.color(for: $0.severity, percent: $0.session) } ?? .secondaryLabelColor)
-            append("  wk ", .secondaryLabelColor)
-            append(claude.map { "\($0.weekly)%" } ?? "—",
-                   claude.map { Format.color(for: $0.severity, percent: $0.weekly) } ?? .secondaryLabelColor)
+        // Walk the registry in order, drawing each provider's mark once and
+        // then its ticked numbers — mirroring headlineText's grouping exactly.
+        var previousProvider: ProviderID?
+        for (metric, value) in entries {
+            if metric.provider != previousProvider {
+                if previousProvider != nil { append("   ", .secondaryLabelColor) }
+                appendLogo(metric.provider)
+                previousProvider = metric.provider
+            }
+            append(" \(metric.shortLabel) ", .secondaryLabelColor)
+            append(value.map { "\($0.percent)%" } ?? "—",
+                   value.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
         }
-        if claudeVisible && codexVisible {
-            append("   ", .secondaryLabelColor)
-        }
-        if codexVisible {
-            appendLogo("codex-template", fallback: "Codex")
-            append(" wk ", .secondaryLabelColor)
-            append(codex.map { "\($0.percent)%" } ?? "—",
-                   codex.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
-        }
-        if !claudeVisible && !codexVisible {
-            // Both title providers hidden: fall back to a literal label so
-            // the status item is never zero-width (see headlineText's doc).
+        if entries.isEmpty {
+            // Every metric unticked: fall back to a literal label so the
+            // status item is never zero-width (see headlineText's doc).
             append("AI", .labelColor)
         }
 
         button.attributedTitle = title
-        let plainText = Self.headlineText(
-            claudeVisible: claudeVisible, codexVisible: codexVisible,
-            claude: claude.map { ($0.session, $0.weekly) },
-            codex: codex?.percent
-        )
+        let plainText = Self.headlineText(entries)
         button.toolTip = plainText
         button.setAccessibilityLabel(plainText)
     }
@@ -916,15 +952,16 @@ enum Providers {
     /// H2: a provider must be polled if EITHER visibility flag would show
     /// it. Filtering on `showInDropdown` alone meant unticking Dropdown
     /// while leaving Menu bar ticked stopped ClaudeProvider/CodexProvider's
-    /// `load()` from ever running again — but `headline` (what the title
-    /// renders) is only ever written as a side effect of `load()`, so the
+    /// `load()` from ever running again — but the headline values the title
+    /// renders are only ever written as a side effect of `load()`, so the
     /// title froze on whatever numbers were last polled, with no staleness
     /// marker, and read as confidently wrong quota forever. `nil` (an
     /// unrecognized name) defaults to shown, matching every other Prefs
     /// lookup's "never configured means show everything".
     nonisolated static func shouldPoll(id: ProviderID?) -> Bool {
         guard let id else { return true }
-        return Prefs.showInDropdown(id) || (id.supportsTitle && Prefs.showInTitle(id))
+        return Prefs.showInDropdown(id)
+            || TitleMetric.all.contains { $0.provider == id && Prefs.showMetricInTitle($0) }
     }
 
     /// `includeHidden` is the `--once` escape hatch: headless output is a
@@ -1313,152 +1350,48 @@ private func runSelfTests() {
     ]
     precondition(CodexProvider.extractWeeklyHeadline(from: criticalLimits)?.severity == "critical")
 
-    // Title composition, all four visibility combinations (claudeVisible x
-    // codexVisible) — including the both-hidden fallback, which must be
-    // non-empty or the status item becomes a zero-width, unclickable dead
-    // end (no Dock icon to fall back on).
-    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: true, claude: (17, 85), codex: 42)
-                 == "Claude 5h 17% wk 85%   Codex wk 42%")
-    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: true, claude: nil, codex: 42)
-                 == "Claude 5h — wk —   Codex wk 42%")
-    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: true, claude: (17, 85), codex: nil)
-                 == "Claude 5h 17% wk 85%   Codex wk —")
-    precondition(UsageMenuBar.headlineText(claudeVisible: true, codexVisible: false, claude: (17, 85), codex: 42)
+    // MARK: Title composition
+    //
+    // REGRESSION GUARD: with default prefs the title must be byte-identical
+    // to what the old hardcoded renderTitle() produced. If the first
+    // assertion below ever needs "updating", this refactor has silently
+    // widened everyone's menu bar.
+    let mClaudeSession = TitleMetric.metric(id: "claude.session")!
+    let mClaudeWeekly = TitleMetric.metric(id: "claude.weekly")!
+    let mCodexWeekly = TitleMetric.metric(id: "codex.weekly")!
+    let mAgyWeekly = TitleMetric.metric(id: "antigravity.3p-weekly")!
+    let vSession = HeadlineValue(percent: 17, severity: "normal")
+    let vWeekly = HeadlineValue(percent: 85, severity: "warning")
+    let vCodex = HeadlineValue(percent: 42, severity: "normal")
+    let vAgy = HeadlineValue(percent: 75, severity: "normal")
+
+    precondition(UsageMenuBar.headlineText([(mClaudeSession, vSession), (mClaudeWeekly, vWeekly),
+                                            (mCodexWeekly, vCodex)])
+                 == "Claude 5h 17% wk 85%   Codex wk 42%",
+                 "the default title must not change shape")
+    precondition(UsageMenuBar.headlineText([(mClaudeSession, vSession), (mClaudeWeekly, vWeekly),
+                                            (mCodexWeekly, vCodex), (mAgyWeekly, vAgy)])
+                 == "Claude 5h 17% wk 85%   Codex wk 42%   Antigravity 3p wk 75%")
+    // A provider named once per run of consecutive metrics, not once per metric.
+    precondition(UsageMenuBar.headlineText([(mClaudeSession, vSession), (mClaudeWeekly, vWeekly)])
                  == "Claude 5h 17% wk 85%")
-    precondition(UsageMenuBar.headlineText(claudeVisible: false, codexVisible: true, claude: (17, 85), codex: 42)
-                 == "Codex wk 42%")
-    precondition(UsageMenuBar.headlineText(claudeVisible: false, codexVisible: false, claude: (17, 85), codex: 42)
-                 == "AI")
-    for claudeVisible in [true, false] {
-        for codexVisible in [true, false] {
-            precondition(!UsageMenuBar.headlineText(
-                claudeVisible: claudeVisible, codexVisible: codexVisible, claude: nil, codex: nil
-            ).isEmpty)
-        }
+    precondition(UsageMenuBar.headlineText([(mCodexWeekly, vCodex)]) == "Codex wk 42%")
+    // A single Antigravity metric ticked on its own still names its provider.
+    precondition(UsageMenuBar.headlineText([(mAgyWeekly, vAgy)]) == "Antigravity 3p wk 75%")
+    // A metric whose provider has not reported yet renders an em dash — not a
+    // stale number, and not a missing column.
+    precondition(UsageMenuBar.headlineText([(mCodexWeekly, nil)]) == "Codex wk —")
+    precondition(UsageMenuBar.headlineText([(mClaudeSession, nil), (mClaudeWeekly, nil)])
+                 == "Claude 5h — wk —")
+    // Everything unticked must still produce a non-empty title, or the status
+    // item becomes a zero-width, unclickable dead end.
+    precondition(UsageMenuBar.headlineText([]) == "AI")
+    // No combination of missing values may ever yield an empty title.
+    for count in 0...TitleMetric.all.count {
+        precondition(!UsageMenuBar.headlineText(
+            TitleMetric.all.prefix(count).map { ($0, nil) }
+        ).isEmpty)
     }
-
-    // MARK: Antigravity payload parsing
-    //
-    // Fixture is a trimmed copy of a real RetrieveUserQuotaSummary response
-    // from the agy loopback server.
-    let agyPayload: [String: Any] = [
-        "response": [
-            "groups": [
-                [
-                    "displayName": "Gemini Models",
-                    "buckets": [
-                        ["bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining",
-                         "window": "weekly", "remainingFraction": 0.47822708,
-                         "resetTime": "2026-08-30T10:12:38Z"],
-                        ["bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining",
-                         "window": "5h", "remainingFraction": 0.9965874,
-                         "resetTime": "2026-08-27T12:59:26Z"],
-                    ],
-                ],
-                [
-                    "displayName": "Claude and GPT models",
-                    "buckets": [
-                        ["bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining",
-                         "window": "weekly", "remainingFraction": 0.24941853,
-                         "resetTime": "2026-08-29T17:12:46Z"],
-                        ["bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining",
-                         "window": "5h", "remainingFraction": 1,
-                         "resetTime": "2026-08-27T13:28:09Z"],
-                    ],
-                ],
-            ],
-        ],
-    ]
-    let agyBuckets = AntigravityProvider.buckets(from: agyPayload)
-    precondition(agyBuckets.count == 4, "all four buckets must survive parsing")
-    precondition(agyBuckets.map(\.id) == ["gemini-weekly", "gemini-5h", "3p-weekly", "3p-5h"],
-                 "buckets keep payload order")
-    precondition(agyBuckets[0].label == "Gemini \u{b7} Weekly")
-    precondition(agyBuckets[3].label == "Claude/GPT \u{b7} 5-hour")
-    // remainingFraction is what is LEFT, so used = 1 - it.
-    precondition(agyBuckets[0].percent == 52, "0.478 remaining is 52% used")
-    precondition(agyBuckets[3].percent == 0, "a full bucket is 0% used")
-    precondition(agyBuckets[0].resetTime != nil)
-
-    // Label rules in isolation, including the fallbacks.
-    precondition(AntigravityProvider.label(group: "Gemini Models", window: "weekly",
-                                           fallback: "Weekly Limit Remaining") == "Gemini \u{b7} Weekly")
-    precondition(AntigravityProvider.label(group: "Claude and GPT models", window: "5h",
-                                           fallback: "x") == "Claude/GPT \u{b7} 5-hour")
-    // An unknown window falls back to the server's own display name, so a
-    // future bucket stays legible rather than showing a raw token.
-    precondition(AntigravityProvider.label(group: "Gemini Models", window: "monthly",
-                                           fallback: "Monthly Limit") == "Gemini \u{b7} Monthly Limit")
-
-    // Severity comes from percent, matching every other provider.
-    let agyRows = AntigravityProvider.rows(from: agyBuckets)
-    precondition(agyRows.count == 4)
-    precondition(agyRows[0].severity == "normal")
-    precondition(AntigravityProvider.rows(from: [
-        AntigravityProvider.Bucket(id: "x", label: "X", percent: 96, resetTime: nil),
-    ])[0].severity == "critical")
-    precondition(AntigravityProvider.rows(from: [
-        AntigravityProvider.Bucket(id: "y", label: "Y", percent: 83, resetTime: nil),
-    ])[0].severity == "warning")
-
-    // MARK: Antigravity cache expiry
-    //
-    // A cached reading outlives the agy process by design: agy is a CLI, not
-    // a daemon, so "not running" is the normal state. Each bucket expires at
-    // its OWN resetTime — a weekly number is still true days later, a 5-hour
-    // one is not.
-    let agyNow = Date(timeIntervalSince1970: 1_800_000_000)
-    let agyCached = [
-        AntigravityProvider.Bucket(id: "gemini-weekly", label: "Gemini \u{b7} Weekly", percent: 52,
-                                   resetTime: agyNow.addingTimeInterval(3600)),
-        AntigravityProvider.Bucket(id: "gemini-5h", label: "Gemini \u{b7} 5-hour", percent: 4,
-                                   resetTime: agyNow.addingTimeInterval(-60)),
-        AntigravityProvider.Bucket(id: "3p-weekly", label: "Claude/GPT \u{b7} Weekly", percent: 75,
-                                   resetTime: nil),
-    ]
-    let agyEncoded = AntigravityProvider.encodeCache(buckets: agyCached, fetchedAt: agyNow)
-    let agyDecoded = AntigravityProvider.decodeCache(agyEncoded, now: agyNow)
-    precondition(agyDecoded != nil)
-    precondition(agyDecoded!.buckets.map(\.id) == ["gemini-weekly", "3p-weekly"],
-                 "the reset 5-hour bucket must be dropped; a bucket with no resetTime is kept")
-    precondition(agyDecoded!.buckets[0].percent == 52, "percentages survive the round trip")
-    precondition(agyDecoded!.buckets[0].label == "Gemini \u{b7} Weekly")
-    precondition(Int(agyDecoded!.fetchedAt.timeIntervalSince1970) == Int(agyNow.timeIntervalSince1970))
-
-    // Two hours on, the weekly bucket has gone but the one with no stated
-    // reset survives on its fallback horizon.
-    precondition(AntigravityProvider.decodeCache(agyEncoded,
-                                                 now: agyNow.addingTimeInterval(7200))?.buckets.map(\.id)
-                 == ["3p-weekly"])
-    // Past that fallback horizon there is nothing honest left to show.
-    precondition(AntigravityProvider.decodeCache(agyEncoded,
-                                                 now: agyNow.addingTimeInterval(8 * 86400)) == nil,
-                 "an all-expired cache must read as no cache at all")
-    // A malformed or empty blob must not crash the poll.
-    precondition(AntigravityProvider.decodeCache([:], now: agyNow) == nil)
-    precondition(AntigravityProvider.decodeCache(["fetchedAt": "not-a-date"], now: agyNow) == nil)
-
-    // MARK: Antigravity port discovery
-    //
-    // Real `lsof -nP -iTCP -sTCP:LISTEN -a -c agy` output. Two ports per
-    // process, and the header line must not parse as one of them.
-    let lsofOutput = """
-    COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
-    agy     60695 alex   10u  IPv4 0xaa8fec6e105fe8a7      0t0  TCP 127.0.0.1:58002 (LISTEN)
-    agy     60695 alex   11u  IPv4 0xcfd3169d2c219c02      0t0  TCP 127.0.0.1:58003 (LISTEN)
-    """
-    precondition(AntigravityProvider.agyPorts(fromLsof: lsofOutput) == [58002, 58003])
-    precondition(AntigravityProvider.agyPorts(fromLsof: "").isEmpty)
-    precondition(AntigravityProvider.agyPorts(fromLsof: "COMMAND PID USER\n").isEmpty)
-    // Anything not bound to loopback is not our server, and must not be
-    // probed — the whole TLS-trust argument rests on the host being 127.0.0.1.
-    precondition(AntigravityProvider.agyPorts(
-        fromLsof: "agy 1 alex 10u IPv4 0x0 0t0 TCP *:9999 (LISTEN)").isEmpty)
-    // The same port listed twice (agy re-binding across a restart) yields one.
-    precondition(AntigravityProvider.agyPorts(fromLsof: """
-    agy 1 alex 10u IPv4 0x0 0t0 TCP 127.0.0.1:5000 (LISTEN)
-    agy 1 alex 11u IPv4 0x0 0t0 TCP 127.0.0.1:5000 (LISTEN)
-    """) == [5000])
 
     // Provider-filter mapping: ProviderID.displayName must round-trip
     // through ProviderID(displayName:) for every case (this is the mapping
@@ -1471,8 +1404,10 @@ private func runSelfTests() {
     precondition(ProviderID.claude.displayName == "Claude")
     precondition(ProviderID.codex.displayName == "Codex")
     precondition(ProviderID.openrouter.displayName == "OpenRouter")
-    precondition(ProviderID.claude.supportsTitle && ProviderID.codex.supportsTitle)
-    precondition(!ProviderID.openrouter.supportsTitle)
+    precondition(ProviderID.claude.ownsTitleMetrics && ProviderID.codex.ownsTitleMetrics)
+    precondition(ProviderID.antigravity.ownsTitleMetrics)
+    precondition(!ProviderID.openrouter.ownsTitleMetrics,
+                 "OpenRouter publishes no headline number, so it owns no metric")
 
     // Prefs — run against an isolated UserDefaults suite, never
     // UserDefaults.standard, so --self-test can't clobber the user's real
@@ -1492,34 +1427,87 @@ private func runSelfTests() {
     // Unset reads true — "never configured" means "show everything".
     for id in ProviderID.allCases {
         precondition(Prefs.showInDropdown(id) == true)
-        precondition(Prefs.showInTitle(id) == true)
     }
     Prefs.setShowInDropdown(.openrouter, false)
     precondition(Prefs.showInDropdown(.openrouter) == false)
     precondition(Prefs.showInDropdown(.claude) == true) // untouched keys stay default-true
-    Prefs.setShowInTitle(.codex, false)
-    precondition(Prefs.showInTitle(.codex) == false)
-    precondition(Prefs.showInTitle(.claude) == true)
+
+    // MARK: Title metric registry
+    precondition(TitleMetric.all.count == 7)
+    precondition(TitleMetric.all.map(\.id) == [
+        "claude.session", "claude.weekly", "codex.weekly",
+        "antigravity.gemini-weekly", "antigravity.gemini-5h",
+        "antigravity.3p-weekly", "antigravity.3p-5h",
+    ], "registry order is title order")
+    // The title must not grow on upgrade: only today's three numbers default on.
+    precondition(TitleMetric.all.filter(\.defaultOn).map(\.id)
+                 == ["claude.session", "claude.weekly", "codex.weekly"])
+    // Unset reads the metric's own default, not a blanket true.
+    for metric in TitleMetric.all {
+        precondition(Prefs.showMetricInTitle(metric) == metric.defaultOn)
+    }
+    let geminiWeekly = TitleMetric.metric(id: "antigravity.gemini-weekly")!
+    let codexWeeklyMetric = TitleMetric.metric(id: "codex.weekly")!
+    let claudeSessionMetric = TitleMetric.metric(id: "claude.session")!
+    Prefs.setShowMetricInTitle(geminiWeekly, true)
+    precondition(Prefs.showMetricInTitle(geminiWeekly))
+    Prefs.setShowMetricInTitle(codexWeeklyMetric, false)
+    precondition(!Prefs.showMetricInTitle(codexWeeklyMetric))
+    precondition(Prefs.showMetricInTitle(claudeSessionMetric), "untouched metrics keep their default")
+
+    // Migration from the old per-provider title.<id> booleans. Someone who
+    // hid Codex from the bar must stay hidden across the upgrade.
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+    Prefs.defaults.set(false, forKey: "title.codex")
+    Prefs.defaults.set(true, forKey: "title.claude")
+    Prefs.migrateTitleMetricsIfNeeded()
+    precondition(!Prefs.showMetricInTitle(codexWeeklyMetric))
+    precondition(Prefs.showMetricInTitle(claudeSessionMetric))
+    precondition(Prefs.showMetricInTitle(TitleMetric.metric(id: "claude.weekly")!))
+    // Antigravity had no legacy flag, so migration must leave it off.
+    precondition(!Prefs.showMetricInTitle(geminiWeekly),
+                 "migration must not switch on a provider that had no legacy flag")
+    // Idempotent: a second run must not undo a later manual change.
+    Prefs.setShowMetricInTitle(geminiWeekly, true)
+    Prefs.migrateTitleMetricsIfNeeded()
+    precondition(Prefs.showMetricInTitle(geminiWeekly), "migration must run once, not every launch")
+    // A fresh install has no legacy keys and must land on the defaults.
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+    Prefs.migrateTitleMetricsIfNeeded()
+    for metric in TitleMetric.all {
+        precondition(Prefs.showMetricInTitle(metric) == metric.defaultOn)
+    }
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
 
     // H2: the four Dropdown x Menu-bar visibility combinations for a
     // title-capable provider (.claude) — must poll whenever EITHER is on,
     // and rebuildMenu must still hide it from the dropdown when only the
     // title is on. Plus a non-title-capable provider, where title state
     // must never matter at all.
-    Prefs.setShowInDropdown(.claude, true); Prefs.setShowInTitle(.claude, true)
+    func setClaudeTitle(_ on: Bool) {
+        for metric in TitleMetric.all where metric.provider == .claude {
+            Prefs.setShowMetricInTitle(metric, on)
+        }
+    }
+    Prefs.setShowInDropdown(.claude, true); setClaudeTitle(true)
     precondition(Providers.shouldPoll(id: .claude))
-    Prefs.setShowInDropdown(.claude, true); Prefs.setShowInTitle(.claude, false)
+    Prefs.setShowInDropdown(.claude, true); setClaudeTitle(false)
     precondition(Providers.shouldPoll(id: .claude))
-    Prefs.setShowInDropdown(.claude, false); Prefs.setShowInTitle(.claude, true)
+    Prefs.setShowInDropdown(.claude, false); setClaudeTitle(true)
     precondition(Providers.shouldPoll(id: .claude), "menu-bar-title-only visibility must still be polled")
     precondition(!UsageMenuBar.shouldShowInDropdown(Card(provider: "Claude", rows: [])),
                  "title-only visibility must still be hidden from the dropdown")
-    Prefs.setShowInDropdown(.claude, false); Prefs.setShowInTitle(.claude, false)
+    // A SINGLE ticked metric is enough to keep the provider polled — otherwise
+    // its headline would freeze on stale numbers with no staleness marker.
+    Prefs.setShowInDropdown(.claude, false); setClaudeTitle(false)
     precondition(!Providers.shouldPoll(id: .claude), "both hidden must not be polled")
+    Prefs.setShowMetricInTitle(claudeSessionMetric, true)
+    precondition(Providers.shouldPoll(id: .claude), "one ticked metric must be enough to poll")
+    setClaudeTitle(false)
 
-    Prefs.setShowInDropdown(.openrouter, false); Prefs.setShowInTitle(.openrouter, true) // no-op: doesn't support title
+    Prefs.setShowInDropdown(.openrouter, false)
     precondition(!Providers.shouldPoll(id: .openrouter),
-                 "a non-title-capable provider's title flag must never matter")
+                 "a provider owning no title metric is polled on its dropdown flag alone")
     precondition(Providers.shouldPoll(id: nil), "an unrecognized provider id must default to polled")
 
     Prefs.setShowInDropdown(.claude, true) // restore a clean default for anything reading after this point

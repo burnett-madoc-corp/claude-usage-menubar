@@ -259,24 +259,13 @@ enum Net {
 struct CodexProvider: Provider {
     let name = "Codex"
 
-    static let headline = Headline()
-
-    final class Headline: @unchecked Sendable {
-        private let lock = NSLock()
-        private var storage: HeadlineValue?
-        var value: HeadlineValue? {
-            get { lock.lock(); defer { lock.unlock() }; return storage }
-            set { lock.lock(); storage = newValue; lock.unlock() }
-        }
-    }
-
     private var sessionsDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
     }
 
     func load() async -> Card {
         guard let newest = newestSessions(limit: 6), !newest.isEmpty else {
-            Self.headline.value = nil
+            TitleValues.clear(provider: .codex)
             return Card(provider: name, rows: [], error: "no Codex sessions found")
         }
 
@@ -295,7 +284,7 @@ struct CodexProvider: Provider {
                 }
             }
         }
-        Self.headline.value = nil
+        TitleValues.clear(provider: .codex)
         return Card(provider: name, rows: [], error: "no rate-limit data in recent sessions")
     }
 
@@ -315,7 +304,7 @@ struct CodexProvider: Provider {
     private func card(from limits: [String: Any], timestamp: String?) -> Card? {
         var rows: [Row] = []
 
-        Self.headline.value = Self.extractWeeklyHeadline(from: limits)
+        TitleValues.set("codex.weekly", Self.extractWeeklyHeadline(from: limits))
 
         for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
             guard let window = limits[key] as? [String: Any],
@@ -625,6 +614,16 @@ struct AntigravityProvider: Provider {
         return nil
     }
 
+    /// Only bucket ids that exist in the registry can reach the title; an
+    /// unrecognised one from a future release still renders in the dropdown.
+    private static func publishHeadlines(_ buckets: [Bucket]) {
+        for bucket in buckets where TitleMetric.metric(id: "antigravity.\(bucket.id)") != nil {
+            TitleValues.set("antigravity.\(bucket.id)",
+                            HeadlineValue(percent: bucket.percent,
+                                          severity: severity(forPercent: bucket.percent)))
+        }
+    }
+
     func load() async -> Card {
         for port in Self.listeningPorts() {
             guard let json = await Self.fetch(port: port) else { continue }
@@ -632,6 +631,7 @@ struct AntigravityProvider: Provider {
             guard !buckets.isEmpty else { continue }
             Prefs.defaults.set(Self.encodeCache(buckets: buckets, fetchedAt: Date()),
                                forKey: Self.cacheKey)
+            Self.publishHeadlines(buckets)
             return Card(provider: name, rows: Self.rows(from: buckets))
         }
 
@@ -641,8 +641,13 @@ struct AntigravityProvider: Provider {
         guard let raw = Prefs.defaults.dictionary(forKey: Self.cacheKey),
               let cached = Self.decodeCache(raw, now: Date())
         else {
+            TitleValues.clear(provider: .antigravity)
             return Card(provider: name, rows: [], error: "agy not running")
         }
+        // Publish from the cached path too: a cached number in the dropdown
+        // and a blank one in the title would be incoherent, and the cache is
+        // where this provider spends most of its life.
+        Self.publishHeadlines(cached.buckets)
         return Card(provider: name, rows: Self.rows(from: cached.buckets),
                     badge: Badge(text: "as of \(Format.ago(cached.fetchedAt))", kind: .gray))
     }
