@@ -58,5 +58,9 @@ echo
 echo "If the menu bar item does not appear, macOS has this app on its blocked"
 echo "list (System Settings > Menu Bar > Allow in the Menu Bar). Toggle"
 echo "ClaudeUsage off and back on there, then run:"
-echo "  launchctl kickstart -k gui/$UID/local.claude-usage-menubar"
+echo "  pkill -x ClaudeUsage    # KeepAlive relaunches it via open(1)"
+echo
+echo "Note: launchctl kickstart no longer restarts the app. The launchd job is"
+echo "open(1), which exits immediately; killing it leaves the app running, so"
+echo "the status item is never re-registered. Kill the app itself."
 echo "Uninstall: launchctl bootout gui/$UID/local.claude-usage-menubar && rm -rf '$DEST' '$PLIST'"

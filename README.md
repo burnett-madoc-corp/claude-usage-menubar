@@ -243,14 +243,25 @@ is keyed by bundle id and survives ControlCenter restarts. The only supported
 writer is the Settings pane:
 
 **System Settings → Menu Bar → Allow in the Menu Bar** → toggle **ClaudeUsage
-off, then on**, then:
+off, then on**, then restart the app so it re-registers its item:
 
 ```bash
-launchctl kickstart -k gui/$UID/local.claude-usage-menubar
+pkill -x ClaudeUsage    # KeepAlive relaunches it through open(1)
 ```
+
+Kill the **app**, not the launchd job. `launchctl kickstart -k` restarts the
+job, and the job is now `open(1)` — which has already exited. Killing it
+leaves the app running untouched, so nothing re-registers and the toggle
+appears to have done nothing.
 
 The toggle already reading "on" does not mean the app is allowed; the pane and
 the enforcement record can disagree.
+
+If the toggle does not take, the denial is stuck in ControlCenter's store and
+the only way out is **Reset Control Centre…**, at the bottom of that same
+Settings pane. That clears the menu bar records for *every* app, so anything
+else macOS has silently blocked comes back too — at the cost of resetting your
+Control Centre module layout.
 
 ### Uninstall
 
