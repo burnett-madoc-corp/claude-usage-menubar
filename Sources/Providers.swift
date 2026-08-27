@@ -36,8 +36,24 @@ struct Card {
 }
 
 struct HeadlineValue {
+    /// Always drives the colour, even when it is not what gets drawn.
     let percent: Int
     let severity: String
+    /// Drawn instead of "\(percent)%" when the number this metric is about
+    /// is not a percentage. OpenRouter's headline is a credit balance in
+    /// dollars; it still has a meaningful percent (spend against the amount
+    /// granted) to colour by, but "$8.42" is what belongs in the bar.
+    let display: String?
+
+    init(percent: Int, severity: String, display: String? = nil) {
+        self.percent = percent
+        self.severity = severity
+        self.display = display
+    }
+
+    /// The one place the drawn title and the plain-text title agree on how a
+    /// value reads.
+    var text: String { display ?? "\(percent)%" }
 }
 
 protocol Provider: Sendable {
@@ -386,8 +402,25 @@ struct OpenRouterProvider: Provider {
         return "valid — \(Format.usd(granted - used)) remaining"
     }
 
+    /// The bar shows what is left, in dollars, coloured by how much of the
+    /// granted amount has gone. With nothing granted (a pure pay-as-you-go
+    /// account) there is no denominator to be a percentage of, so the balance
+    /// colours itself: overdrawn is critical, nearly empty is a warning.
+    static func headline(granted: Double, used: Double) -> HeadlineValue {
+        let remaining = granted - used
+        let display = Format.usd(remaining)
+        guard granted > 0 else {
+            let severity = remaining <= 0 ? "critical" : (remaining < 5 ? "warning" : "normal")
+            return HeadlineValue(percent: remaining <= 0 ? 100 : 0, severity: severity, display: display)
+        }
+        let percent = Int((used / granted * 100).rounded())
+        let severity = percent >= 95 ? "critical" : (percent >= 80 ? "warning" : "normal")
+        return HeadlineValue(percent: percent, severity: severity, display: display)
+    }
+
     func load() async -> Card {
         guard let key, !key.isEmpty else {
+            TitleValues.clear(provider: .openrouter)
             return Card(provider: name, rows: [], error: "no API key — see README", missingKey: true)
         }
         do {
@@ -396,21 +429,26 @@ struct OpenRouterProvider: Provider {
             let granted = (data["total_credits"] as? NSNumber)?.doubleValue ?? 0
             let used = (data["total_usage"] as? NSNumber)?.doubleValue ?? 0
             let remaining = granted - used
+            TitleValues.set("openrouter.credit", Self.headline(granted: granted, used: used))
 
             var rows = [Row(label: "Remaining", detail: Format.usd(remaining))]
             if granted > 0 {
-                let percent = Int((used / granted * 100).rounded())
+                let headline = Self.headline(granted: granted, used: used)
                 rows.insert(Row(
                     label: "Used",
-                    percent: percent,
+                    percent: headline.percent,
                     detail: "\(Format.usd(used)) of \(Format.usd(granted))",
-                    severity: percent >= 95 ? "critical" : (percent >= 80 ? "warning" : "normal")
+                    severity: headline.severity
                 ), at: 0)
             } else {
                 rows.append(Row(label: "Spent", detail: Format.usd(used)))
             }
             return Card(provider: name, rows: rows)
         } catch {
+            // A failed fetch must not leave a stale balance in the bar: an
+            // out-of-date dollar figure reads as current in a way an em-dash
+            // does not.
+            TitleValues.clear(provider: .openrouter)
             return Card(provider: name, rows: [], error: error.localizedDescription)
         }
     }

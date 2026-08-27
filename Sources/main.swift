@@ -481,7 +481,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         var groups: [String] = []
         var current: (provider: ProviderID, parts: [String])?
         for (metric, value) in entries {
-            let piece = "\(metric.shortLabel) \(value.map { "\($0.percent)%" } ?? "—")"
+            let piece = "\(metric.shortLabel) \(value?.text ?? "—")"
             if var open = current, open.provider == metric.provider {
                 open.parts.append(piece)
                 current = open
@@ -554,7 +554,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
                 previousProvider = metric.provider
             }
             append(" \(metric.shortLabel) ", .secondaryLabelColor)
-            append(value.map { "\($0.percent)%" } ?? "—",
+            append(value?.text ?? "—",
                    value.map { Format.color(for: $0.severity, percent: $0.percent) } ?? .secondaryLabelColor)
         }
         if entries.isEmpty {
@@ -1403,6 +1403,32 @@ private func runSelfTests() {
     precondition(UsageMenuBar.headlineText([(mCodexWeekly, nil)]) == "Codex wk —")
     precondition(UsageMenuBar.headlineText([(mClaudeSession, nil), (mClaudeWeekly, nil)])
                  == "Claude 5h — wk —")
+    // A non-percentage headline draws its own text. The percent is still
+    // there, colouring it, but never reaches the bar.
+    let mCredit = TitleMetric.metric(id: "openrouter.credit")!
+    let vCredit = OpenRouterProvider.headline(granted: 20, used: 11.58)
+    precondition(vCredit.text == "$8.420")
+    precondition(vCredit.percent == 58, "colour comes from spend against the grant")
+    precondition(vCredit.severity == "normal")
+    precondition(UsageMenuBar.headlineText([(mCredit, vCredit)]) == "OpenRouter cr $8.420")
+    precondition(UsageMenuBar.headlineText([(mCodexWeekly, vCodex), (mCredit, vCredit)])
+                 == "Codex wk 42%   OpenRouter cr $8.420")
+    // Overdrawn: the balance goes negative and the colour goes critical.
+    let vOverdrawn = OpenRouterProvider.headline(granted: 20, used: 20.17)
+    precondition(vOverdrawn.text == "$-0.170")
+    precondition(vOverdrawn.severity == "critical")
+    // Nothing granted: no denominator, so the balance itself decides the
+    // colour rather than a meaningless 0%. An empty account is empty whether
+    // it got there by spending or by never being funded.
+    precondition(OpenRouterProvider.headline(granted: 0, used: 3).severity == "critical")
+    precondition(OpenRouterProvider.headline(granted: 0, used: 0).severity == "critical")
+    precondition(OpenRouterProvider.headline(granted: 0, used: -3).severity == "warning",
+                 "a small positive balance with no grant warns rather than alarms")
+    precondition(OpenRouterProvider.headline(granted: 0, used: -20).severity == "normal")
+    // A plain percentage metric carries no display string, so nothing changed
+    // for the numbers that were already there.
+    precondition(vCodex.display == nil && vCodex.text == "42%")
+
     // Everything unticked must still produce a non-empty title, or the status
     // item becomes a zero-width, unclickable dead end.
     precondition(UsageMenuBar.headlineText([]) == "AI")
@@ -1426,8 +1452,8 @@ private func runSelfTests() {
     precondition(ProviderID.openrouter.displayName == "OpenRouter")
     precondition(ProviderID.claude.ownsTitleMetrics && ProviderID.codex.ownsTitleMetrics)
     precondition(ProviderID.antigravity.ownsTitleMetrics)
-    precondition(!ProviderID.openrouter.ownsTitleMetrics,
-                 "OpenRouter publishes no headline number, so it owns no metric")
+    precondition(ProviderID.openrouter.ownsTitleMetrics,
+                 "OpenRouter publishes a credit balance, so it owns a metric")
 
     // Prefs — run against an isolated UserDefaults suite, never
     // UserDefaults.standard, so --self-test can't clobber the user's real
@@ -1453,12 +1479,16 @@ private func runSelfTests() {
     precondition(Prefs.showInDropdown(.claude) == true) // untouched keys stay default-true
 
     // MARK: Title metric registry
-    precondition(TitleMetric.all.count == 7)
+    precondition(TitleMetric.all.count == 8)
     precondition(TitleMetric.all.map(\.id) == [
-        "claude.session", "claude.weekly", "codex.weekly",
-        "antigravity.gemini-weekly", "antigravity.gemini-5h",
-        "antigravity.3p-weekly", "antigravity.3p-5h",
-    ], "registry order is title order")
+        "claude.session", "claude.weekly", "codex.weekly", "openrouter.credit",
+        "antigravity.gemini-5h", "antigravity.gemini-weekly",
+        "antigravity.3p-5h", "antigravity.3p-weekly",
+    ], "registry order is title order, shortest window first")
+    // Antigravity's Gemini pair drops the family prefix — the logo already
+    // names the provider, so only the third-party buckets label themselves.
+    precondition(TitleMetric.metric(id: "antigravity.gemini-weekly")!.shortLabel == "wk")
+    precondition(TitleMetric.metric(id: "antigravity.gemini-5h")!.shortLabel == "5h")
     // The title must not grow on upgrade: only today's three numbers default on.
     precondition(TitleMetric.all.filter(\.defaultOn).map(\.id)
                  == ["claude.session", "claude.weekly", "codex.weekly"])
@@ -1755,7 +1785,10 @@ private func runSelfTests() {
     // to miss here. The antigravity mark is machine-traced from a favicon
     // (tools/trace_antigravity_logo.py), so "does the emitted path render at
     // all" is a real question, not a formality.
-    for resource in ["claude-template", "codex-template", "antigravity-template"] {
+    // Derived from the registry rather than hardcoded, so adding a provider
+    // to TitleMetric.all without shipping its mark fails here.
+    for provider in ProviderID.allCases where provider.ownsTitleMetrics {
+        let resource = "\(provider.rawValue)-template"
         let logo = UsageMenuBar.logoImage(resource: resource)
         precondition(logo != nil, "\(resource) is missing from the app bundle")
         precondition(logo!.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)).map { bitmap in
@@ -1830,7 +1863,7 @@ if CommandLine.arguments.contains("--once") {
         print("Title")
         print("  metrics ticked: \(entries.count) of \(TitleMetric.all.count)")
         for (metric, value) in entries {
-            print("    \(metric.id) = \(value.map { "\($0.percent)%" } ?? "no value yet")")
+            print("    \(metric.id) = \(value?.text ?? "no value yet")")
         }
         let rendered = UsageMenuBar.headlineText(entries)
         print("  renders as: \"\(rendered)\" (\(rendered.count) chars)")
