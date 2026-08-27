@@ -40,21 +40,46 @@ final class SettingsWindowController: NSObject {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// Width is fixed; height is whatever the sections need, capped so the
+    /// window still fits a short laptop screen — past that the scroll view
+    /// takes over. The old fixed 460x460 silently clipped everything below
+    /// the fold when the Menu bar section was added, with no scrollbar to
+    /// hint that anything was missing.
+    static let windowWidth: CGFloat = 460
+    static let maxWindowHeight: CGFloat = 700
+
     private func makeWindow() -> NSWindow {
+        let content = buildContent()
+        let height = min(Self.maxWindowHeight, Self.contentHeight(of: content))
+
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 460),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: Self.windowWidth, height: height),
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         win.title = "AI Usage Settings"
         win.isReleasedWhenClosed = false // shared instance: hide, don't destroy
-        win.contentView = buildContent()
+        win.contentView = content
+        // Resizable vertically only: the layout is a single column, so a
+        // wider window just stretches labels.
+        win.contentMinSize = NSSize(width: Self.windowWidth, height: 240)
+        win.contentMaxSize = NSSize(width: Self.windowWidth, height: .greatestFiniteMagnitude)
         win.center()
         return win
     }
 
-    private func buildContent() -> NSView {
+    /// Height the sections want, before capping. Exposed for --self-test,
+    /// which asserts the window can actually reach every section.
+    static func contentHeight(of view: NSView) -> CGFloat {
+        guard let scroll = view as? NSScrollView, let document = scroll.documentView else {
+            return view.fittingSize.height
+        }
+        document.layoutSubtreeIfNeeded()
+        return document.fittingSize.height
+    }
+
+    fileprivate func buildContent() -> NSView {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
@@ -68,19 +93,76 @@ final class SettingsWindowController: NSObject {
         root.addArrangedSubview(apiKeysSection())
         root.addArrangedSubview(sessionsSection())
 
-        // Plain container, not a scroll view: the window is fixed-size and
-        // the content is short enough to fit. A later phase adding sections
-        // at the seam above may need to revisit that.
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(root)
+        // A scroll view, not a plain container. This used to be a plain
+        // container with a note saying a later section might need to revisit
+        // that — and the Menu bar section proved it: seven checkboxes pushed
+        // everything below 460pt off the bottom edge with no scrollbar, so
+        // the sections were simply invisible rather than merely cramped.
+        // Content that can only grow (a metric per provider number) does not
+        // belong in a container that cannot scroll.
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.documentView = root
+
         NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: container.topAnchor),
-            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            root.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
+            // Pin the column's width to the clip view so the stack lays out
+            // against a known width; only height is free to grow.
+            root.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            root.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            root.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
         ])
-        return container
+        return scroll
+    }
+
+    // MARK: Self-tests
+
+    /// Guards the defect this scroll view exists for: the Menu bar section
+    /// shipped into a fixed 460pt window and was drawn entirely below the
+    /// fold, invisible with no scrollbar to suggest anything was missing.
+    ///
+    /// Builds the real content view and asserts (a) every TitleMetric has its
+    /// own checkbox, so the section cannot silently lose a number, and (b)
+    /// the scroll view's document is taller than nothing and fully reachable,
+    /// so growth cannot clip content again.
+    @MainActor
+    static func runSelfTests() {
+        let controller = SettingsWindowController.shared
+        let content = controller.buildContent()
+
+        guard let scroll = content as? NSScrollView, let document = scroll.documentView else {
+            preconditionFailure("Settings content must be scrollable — a fixed container clips new sections")
+        }
+        document.layoutSubtreeIfNeeded()
+
+        var checkboxTitles: [String] = []
+        func walk(_ view: NSView) {
+            if let button = view as? NSButton, button.identifier != nil {
+                checkboxTitles.append(button.identifier!.rawValue)
+            }
+            view.subviews.forEach(walk)
+        }
+        walk(document)
+
+        for metric in TitleMetric.all {
+            precondition(checkboxTitles.contains(metric.id),
+                         "Settings is missing a Menu bar checkbox for \(metric.id)")
+        }
+
+        // The window sizes itself to the content, capped; either way the
+        // scroll view can reach the bottom, which the old fixed frame could
+        // not.
+        let wanted = contentHeight(of: content)
+        precondition(wanted > 0, "Settings content measured as zero-height")
+        let windowHeight = min(maxWindowHeight, wanted)
+        precondition(windowHeight <= maxWindowHeight)
+        precondition(scroll.hasVerticalScroller,
+                     "content taller than the window must remain reachable")
+        print("Settings content: \(Int(wanted))pt tall, window opens at \(Int(windowHeight))pt "
+              + "(\(checkboxTitles.count) checkboxes)")
     }
 
     // MARK: Providers section
