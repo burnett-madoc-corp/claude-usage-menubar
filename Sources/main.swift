@@ -945,6 +945,7 @@ enum Providers {
             ClaudeProvider(),
             CodexProvider(),
             OpenRouterProvider(key: openRouterKey),
+            AntigravityProvider(),
         ]
         if includeHidden { return providers }
         return providers.filter { shouldPoll(id: ProviderID(displayName: $0.name)) }
@@ -1436,6 +1437,28 @@ private func runSelfTests() {
     // A malformed or empty blob must not crash the poll.
     precondition(AntigravityProvider.decodeCache([:], now: agyNow) == nil)
     precondition(AntigravityProvider.decodeCache(["fetchedAt": "not-a-date"], now: agyNow) == nil)
+
+    // MARK: Antigravity port discovery
+    //
+    // Real `lsof -nP -iTCP -sTCP:LISTEN -a -c agy` output. Two ports per
+    // process, and the header line must not parse as one of them.
+    let lsofOutput = """
+    COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+    agy     60695 alex   10u  IPv4 0xaa8fec6e105fe8a7      0t0  TCP 127.0.0.1:58002 (LISTEN)
+    agy     60695 alex   11u  IPv4 0xcfd3169d2c219c02      0t0  TCP 127.0.0.1:58003 (LISTEN)
+    """
+    precondition(AntigravityProvider.agyPorts(fromLsof: lsofOutput) == [58002, 58003])
+    precondition(AntigravityProvider.agyPorts(fromLsof: "").isEmpty)
+    precondition(AntigravityProvider.agyPorts(fromLsof: "COMMAND PID USER\n").isEmpty)
+    // Anything not bound to loopback is not our server, and must not be
+    // probed — the whole TLS-trust argument rests on the host being 127.0.0.1.
+    precondition(AntigravityProvider.agyPorts(
+        fromLsof: "agy 1 alex 10u IPv4 0x0 0t0 TCP *:9999 (LISTEN)").isEmpty)
+    // The same port listed twice (agy re-binding across a restart) yields one.
+    precondition(AntigravityProvider.agyPorts(fromLsof: """
+    agy 1 alex 10u IPv4 0x0 0t0 TCP 127.0.0.1:5000 (LISTEN)
+    agy 1 alex 11u IPv4 0x0 0t0 TCP 127.0.0.1:5000 (LISTEN)
+    """) == [5000])
 
     // Provider-filter mapping: ProviderID.displayName must round-trip
     // through ProviderID(displayName:) for every case (this is the mapping

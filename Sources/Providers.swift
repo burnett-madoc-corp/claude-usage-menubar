@@ -189,6 +189,36 @@ enum KeychainCLI {
     }
 }
 
+/// URLSession that accepts a self-signed certificate from 127.0.0.1, and from
+/// nowhere else.
+///
+/// agy's TLS port presents its own certificate. Trusting it is defensible
+/// only because the connection cannot leave this machine, so the host check
+/// below IS the security argument — it must not be widened to "any local
+/// name" or dropped for convenience. No credential is ever sent to this
+/// server; the RPC is unauthenticated.
+final class LoopbackSession: NSObject, URLSessionDelegate, @unchecked Sendable {
+    static let shared = LoopbackSession()
+    private lazy var session = URLSession(configuration: .ephemeral, delegate: self,
+                                          delegateQueue: nil)
+
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await session.data(for: request)
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              challenge.protectionSpace.host == "127.0.0.1",
+              let trust = challenge.protectionSpace.serverTrust
+        else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+}
+
 enum Net {
     static func getJSON(_ url: URL, bearer: String,
                         extraHeaders: [String: String] = [:]) async throws -> [String: Any] {
@@ -538,7 +568,82 @@ struct AntigravityProvider: Provider {
         return buckets.isEmpty ? nil : (buckets, fetchedAt)
     }
 
+    // MARK: Transport
+
+    /// agy opens ephemeral ports per run and writes no port file — no
+    /// lockfile carries one, and jetski_state.pbtxt does not either — so the
+    /// only way to find its server is to ask the kernel who is listening.
+    static func agyPorts(fromLsof output: String) -> [Int] {
+        var ports: [Int] = []
+        for line in output.split(separator: "\n") {
+            guard line.trimmingCharacters(in: .whitespaces).hasPrefix("agy") else { continue }
+            for field in line.split(separator: " ") where field.hasPrefix("127.0.0.1:") {
+                let digits = field.dropFirst("127.0.0.1:".count).prefix { $0.isNumber }
+                if let port = Int(digits), !ports.contains(port) { ports.append(port) }
+            }
+        }
+        return ports
+    }
+
+    private static func listeningPorts() -> [Int] {
+        guard case let .success(data) = BoundedProcess.run(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-c", "agy"],
+            timeout: 5
+        ) else { return [] }
+        return agyPorts(fromLsof: String(decoding: data, as: UTF8.self))
+    }
+
+    private static let rpcPath =
+        "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+
+    /// The IDE additionally requires an X-Codeium-Csrf-Token from its own
+    /// state; the CLI's server does not, which is the only reason this
+    /// provider can exist without shipping a token scraper.
+    private static let rpcBody = Data(
+        #"{"ideName":"antigravity","extensionName":"antigravity","locale":"en","ideVersion":"unknown"}"#.utf8)
+
+    /// agy opens one plain-HTTP port and one TLS port, and which is which is
+    /// not stable between runs, so both schemes are tried per port.
+    private static func fetch(port: Int) async -> [String: Any]? {
+        for scheme in ["http", "https"] {
+            guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)\(rpcPath)") else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.httpBody = rpcBody
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.timeoutInterval = 5
+
+            guard let (data, response) = try? await LoopbackSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            return json
+        }
+        return nil
+    }
+
     func load() async -> Card {
-        Card(provider: name, rows: [], error: "not implemented")
+        for port in Self.listeningPorts() {
+            guard let json = await Self.fetch(port: port) else { continue }
+            let buckets = Self.buckets(from: json)
+            guard !buckets.isEmpty else { continue }
+            Prefs.defaults.set(Self.encodeCache(buckets: buckets, fetchedAt: Date()),
+                               forKey: Self.cacheKey)
+            return Card(provider: name, rows: Self.rows(from: buckets))
+        }
+
+        // agy is not running. Replay the last reading, minus any bucket whose
+        // window has since reset, and say plainly how old it is — the same
+        // contract CodexProvider's snapshot badge makes.
+        guard let raw = Prefs.defaults.dictionary(forKey: Self.cacheKey),
+              let cached = Self.decodeCache(raw, now: Date())
+        else {
+            return Card(provider: name, rows: [], error: "agy not running")
+        }
+        return Card(provider: name, rows: Self.rows(from: cached.buckets),
+                    badge: Badge(text: "as of \(Format.ago(cached.fetchedAt))", kind: .gray))
     }
 }

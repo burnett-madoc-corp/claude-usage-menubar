@@ -7,7 +7,7 @@ import Foundation
 /// one place that mapping lives, so the registry filter in Providers.all()
 /// never risks drifting from what's on screen.
 enum ProviderID: String, CaseIterable {
-    case claude, codex, openrouter
+    case claude, codex, openrouter, antigravity
 
     /// Only Claude and Codex publish a headline value (main.swift:103,
     /// Providers.swift:103) — OpenRouter has nothing to put in the title, so
@@ -20,6 +20,7 @@ enum ProviderID: String, CaseIterable {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .openrouter: return "OpenRouter"
+        case .antigravity: return "Antigravity"
         }
     }
 
