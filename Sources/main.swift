@@ -1711,19 +1711,27 @@ private func runSelfTests() {
         }
     }
 
-    let logo = UsageMenuBar.logoImage(resource: "codex-template")
-    precondition(logo != nil)
-    precondition(logo!.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)).map { bitmap in
-        (0..<bitmap.pixelsHigh).contains { y in
-            (0..<bitmap.pixelsWide).contains { x in
-                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
-                return color.alphaComponent > 0.5
-                    && color.redComponent > 0.9
-                    && color.greenComponent > 0.9
-                    && color.blueComponent > 0.9
+    // Every provider that can appear in the title must have a mark that
+    // actually rasterizes. A missing or malformed SVG degrades to a text
+    // fallback in renderTitle(), which is easy to miss by eye and impossible
+    // to miss here. The antigravity mark is machine-traced from a favicon
+    // (tools/trace_antigravity_logo.py), so "does the emitted path render at
+    // all" is a real question, not a formality.
+    for resource in ["claude-template", "codex-template", "antigravity-template"] {
+        let logo = UsageMenuBar.logoImage(resource: resource)
+        precondition(logo != nil, "\(resource) is missing from the app bundle")
+        precondition(logo!.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)).map { bitmap in
+            (0..<bitmap.pixelsHigh).contains { y in
+                (0..<bitmap.pixelsWide).contains { x in
+                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
+                    return color.alphaComponent > 0.5
+                        && color.redComponent > 0.9
+                        && color.greenComponent > 0.9
+                        && color.blueComponent > 0.9
+                }
             }
-        }
-    } == true)
+        } == true, "\(resource) rasterized to nothing")
+    }
 
     SessionSelfTests.run()
     testCompactSessionRendering()
