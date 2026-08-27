@@ -1336,6 +1336,70 @@ private func runSelfTests() {
         }
     }
 
+    // MARK: Antigravity payload parsing
+    //
+    // Fixture is a trimmed copy of a real RetrieveUserQuotaSummary response
+    // from the agy loopback server.
+    let agyPayload: [String: Any] = [
+        "response": [
+            "groups": [
+                [
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        ["bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining",
+                         "window": "weekly", "remainingFraction": 0.47822708,
+                         "resetTime": "2026-08-30T10:12:38Z"],
+                        ["bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining",
+                         "window": "5h", "remainingFraction": 0.9965874,
+                         "resetTime": "2026-08-27T12:59:26Z"],
+                    ],
+                ],
+                [
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        ["bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining",
+                         "window": "weekly", "remainingFraction": 0.24941853,
+                         "resetTime": "2026-08-29T17:12:46Z"],
+                        ["bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining",
+                         "window": "5h", "remainingFraction": 1,
+                         "resetTime": "2026-08-27T13:28:09Z"],
+                    ],
+                ],
+            ],
+        ],
+    ]
+    let agyBuckets = AntigravityProvider.buckets(from: agyPayload)
+    precondition(agyBuckets.count == 4, "all four buckets must survive parsing")
+    precondition(agyBuckets.map(\.id) == ["gemini-weekly", "gemini-5h", "3p-weekly", "3p-5h"],
+                 "buckets keep payload order")
+    precondition(agyBuckets[0].label == "Gemini \u{b7} Weekly")
+    precondition(agyBuckets[3].label == "Claude/GPT \u{b7} 5-hour")
+    // remainingFraction is what is LEFT, so used = 1 - it.
+    precondition(agyBuckets[0].percent == 52, "0.478 remaining is 52% used")
+    precondition(agyBuckets[3].percent == 0, "a full bucket is 0% used")
+    precondition(agyBuckets[0].resetTime != nil)
+
+    // Label rules in isolation, including the fallbacks.
+    precondition(AntigravityProvider.label(group: "Gemini Models", window: "weekly",
+                                           fallback: "Weekly Limit Remaining") == "Gemini \u{b7} Weekly")
+    precondition(AntigravityProvider.label(group: "Claude and GPT models", window: "5h",
+                                           fallback: "x") == "Claude/GPT \u{b7} 5-hour")
+    // An unknown window falls back to the server's own display name, so a
+    // future bucket stays legible rather than showing a raw token.
+    precondition(AntigravityProvider.label(group: "Gemini Models", window: "monthly",
+                                           fallback: "Monthly Limit") == "Gemini \u{b7} Monthly Limit")
+
+    // Severity comes from percent, matching every other provider.
+    let agyRows = AntigravityProvider.rows(from: agyBuckets)
+    precondition(agyRows.count == 4)
+    precondition(agyRows[0].severity == "normal")
+    precondition(AntigravityProvider.rows(from: [
+        AntigravityProvider.Bucket(id: "x", label: "X", percent: 96, resetTime: nil),
+    ])[0].severity == "critical")
+    precondition(AntigravityProvider.rows(from: [
+        AntigravityProvider.Bucket(id: "y", label: "Y", percent: 83, resetTime: nil),
+    ])[0].severity == "warning")
+
     // Provider-filter mapping: ProviderID.displayName must round-trip
     // through ProviderID(displayName:) for every case (this is the mapping
     // Providers.all() relies on to filter by Prefs.showInDropdown), and an

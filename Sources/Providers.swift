@@ -396,3 +396,98 @@ struct OpenRouterProvider: Provider {
         }
     }
 }
+
+// MARK: - Antigravity (agy)
+
+/// Antigravity's quota lives behind `RetrieveUserQuotaSummary`, served by the
+/// `agy` CLI's own loopback Connect server with no authentication.
+///
+/// This provider shipped once before and was removed in #33, because the RPC
+/// available then (`v1internal:retrieveUserQuota`) returned raw per-modelId
+/// buckets covering only some of the models Antigravity serves — so the card
+/// could read 0% while you were throttled on a model it never mentioned.
+/// `RetrieveUserQuotaSummary` returns two named groups spanning the whole
+/// product, which is what makes the card honest enough to ship again.
+///
+/// The *remote* form of this RPC (cloudcode-pa v1internal) returns 403
+/// SUBSCRIPTION_REQUIRED for consumer accounts on both the prod and daily
+/// hosts. See docs/superpowers/specs/2026-08-27-… before trying it again:
+/// re-test against a live token rather than re-arguing from documentation.
+///
+/// `remainingFraction` is what is LEFT (1.0 = untouched), so used = 1 - it.
+struct AntigravityProvider: Provider {
+    let name = "Antigravity"
+
+    struct Bucket {
+        let id: String
+        let label: String
+        let percent: Int
+        let resetTime: Date?
+    }
+
+    /// "Gemini Models" + "weekly" -> "Gemini · Weekly".
+    ///
+    /// The group name is the server's own marketing string. Trimming
+    /// " Models" and folding " and " to "/" is what keeps four rows inside
+    /// the dropdown's width without a hand-maintained translation table that
+    /// a newly-added group would silently fall out of.
+    static func label(group: String, window: String, fallback: String) -> String {
+        var name = group
+        for suffix in [" Models", " models"] where name.hasSuffix(suffix) {
+            name = String(name.dropLast(suffix.count))
+        }
+        name = name.replacingOccurrences(of: " and ", with: "/")
+
+        let windowName: String
+        switch window {
+        case "weekly": windowName = "Weekly"
+        case "5h": windowName = "5-hour"
+        default: windowName = fallback
+        }
+        return "\(name) · \(windowName)"
+    }
+
+    /// Accepts either the Connect envelope (`{"response": {...}}`) or a bare
+    /// body, so a future server that drops the wrapper does not silently
+    /// yield zero buckets.
+    static func buckets(from json: [String: Any]) -> [Bucket] {
+        let response = json["response"] as? [String: Any] ?? json
+        var result: [Bucket] = []
+        for case let group as [String: Any] in response["groups"] as? [Any] ?? [] {
+            let groupName = group["displayName"] as? String ?? "Antigravity"
+            for case let bucket as [String: Any] in group["buckets"] as? [Any] ?? [] {
+                guard let id = bucket["bucketId"] as? String,
+                      let remaining = (bucket["remainingFraction"] as? NSNumber)?.doubleValue
+                else { continue }
+                let resetTime = (bucket["resetTime"] as? String).flatMap {
+                    Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
+                }
+                result.append(Bucket(
+                    id: id,
+                    label: label(group: groupName,
+                                 window: bucket["window"] as? String ?? "",
+                                 fallback: bucket["displayName"] as? String ?? "Limit"),
+                    percent: Int(((1 - remaining) * 100).rounded()),
+                    resetTime: resetTime
+                ))
+            }
+        }
+        return result
+    }
+
+    static func severity(forPercent percent: Int) -> String {
+        percent >= 95 ? "critical" : (percent >= 80 ? "warning" : "normal")
+    }
+
+    static func rows(from buckets: [Bucket]) -> [Row] {
+        buckets.map { bucket in
+            Row(label: bucket.label, percent: bucket.percent,
+                detail: "resets in \(Format.countdown(to: bucket.resetTime))",
+                severity: severity(forPercent: bucket.percent))
+        }
+    }
+
+    func load() async -> Card {
+        Card(provider: name, rows: [], error: "not implemented")
+    }
+}
