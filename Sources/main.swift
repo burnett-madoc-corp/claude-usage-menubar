@@ -324,8 +324,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Before anything reads a title flag: carries the old per-provider
-        // booleans onto the per-metric keys exactly once.
+        // Order matters: pull settings across from the pre-rename bundle id
+        // first, so the title-metric migration below sees the legacy
+        // title.<provider> flags it is meant to read.
+        Prefs.migrateLegacyDomainIfNeeded()
         Prefs.migrateTitleMetricsIfNeeded()
         NSApp.mainMenu = Self.makeMainMenu()
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -1473,6 +1475,36 @@ private func runSelfTests() {
     precondition(!Prefs.showMetricInTitle(codexWeeklyMetric))
     precondition(Prefs.showMetricInTitle(claudeSessionMetric), "untouched metrics keep their default")
 
+    // Legacy bundle-id domain: only keys this app owns come across, and an
+    // existing value in the new domain always wins. A blanket copy would drag
+    // in the global domain and pin those values per-app. The foreign key
+    // below is deliberately a made-up name: a real global key like
+    // AppleLanguages reads back through NSGlobalDomain from any suite, so it
+    // could never prove anything.
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+    let legacyProbe = "local.claude-usage-menubar.self-test-legacy"
+    let legacyDefaults = UserDefaults(suiteName: legacyProbe)!
+    legacyDefaults.removePersistentDomain(forName: legacyProbe)
+    legacyDefaults.set(false, forKey: "dropdown.codex")
+    legacyDefaults.set(300.0, forKey: "refreshInterval")
+    legacyDefaults.set("should-not-copy", forKey: "com.example.notOurs")
+    let savedLegacyName = Prefs.legacyDomainNameForTesting
+    Prefs.legacyDomainNameForTesting = legacyProbe
+    Prefs.setShowInDropdown(.claude, false) // a pre-existing value must win
+    Prefs.migrateLegacyDomainIfNeeded()
+    precondition(!Prefs.showInDropdown(.codex), "owned keys must come across")
+    precondition(Prefs.refreshInterval() == 300, "the refresh interval must come across")
+    precondition(Prefs.defaults.object(forKey: "com.example.notOurs") == nil,
+                 "only keys this app owns may be copied")
+    precondition(!Prefs.showInDropdown(.claude), "an existing value must not be overwritten")
+    // Idempotent: a later change must survive a second call.
+    Prefs.setShowInDropdown(.codex, true)
+    Prefs.migrateLegacyDomainIfNeeded()
+    precondition(Prefs.showInDropdown(.codex), "migration must run once, not every launch")
+    Prefs.legacyDomainNameForTesting = savedLegacyName
+    legacyDefaults.removePersistentDomain(forName: legacyProbe)
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+
     // Migration from the old per-provider title.<id> booleans. Someone who
     // hid Codex from the bar must stay hidden across the upgrade.
     testDefaults.removePersistentDomain(forName: selfTestSuite)
@@ -1764,6 +1796,9 @@ if CommandLine.arguments.contains("--self-test") {
 }
 
 if CommandLine.arguments.contains("--once") {
+    // --once reads the same prefs the app does, so it needs the same
+    // migration or it reports a factory-fresh config after the rename.
+    Prefs.migrateLegacyDomainIfNeeded()
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         // --once ignores visibility on purpose (Providers.all's doc

@@ -49,7 +49,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
     <key>CFBundleName</key>            <string>ClaudeUsage</string>
     <key>CFBundleDisplayName</key>     <string>Claude Usage</string>
-    <key>CFBundleIdentifier</key>      <string>local.claude-usage-menubar</string>
+    <!-- NOT local.claude-usage-menubar. ControlCenter's menu bar allow/deny
+         list is keyed by bundle id, a denial written against an id is
+         permanent, and nothing short of Reset Control Centre clears it. That
+         id was poisoned on a real machine by a launchd job that exec'd the
+         binary directly (see README). The id below is a clean one; the
+         open(1) launch in install.sh is what stops it being poisoned too. -->
+    <key>CFBundleIdentifier</key>      <string>local.claude-usage-menubar.app</string>
     <key>CFBundleExecutable</key>      <string>ClaudeUsage</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>1.0</string>
