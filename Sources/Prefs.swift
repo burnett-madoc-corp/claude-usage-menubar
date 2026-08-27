@@ -46,14 +46,19 @@ struct TitleMetric: Hashable {
     /// Shown in Settings, where there is room to be unambiguous.
     let label: String
     /// Shown in the menu bar itself, where every character costs width.
-    /// These are exactly the strings the old hardcoded renderTitle()
-    /// appended, so a default install's title is unchanged by this refactor.
+    /// Claude's and Codex's are exactly the strings the old hardcoded
+    /// renderTitle() appended, so a default install's title is unchanged.
+    /// Antigravity's Gemini pair carries no family prefix: the logo already
+    /// says Antigravity, and Gemini is the default family, so only the
+    /// third-party buckets have to name themselves.
     let shortLabel: String
-    /// Antigravity's four are false: upgrading must not silently widen
-    /// someone's menu bar.
+    /// Only the three the app has always drawn are true: upgrading must not
+    /// silently widen someone's menu bar.
     let defaultOn: Bool
 
-    /// Registry order is title order. Antigravity's ids are the server's own
+    /// Registry order is title order, and every provider reads shortest
+    /// window first — 5-hour before weekly — so the number that moves fastest
+    /// always sits in the same place. Antigravity's ids are the server's own
     /// bucketIds, so an unrecognised bucket from a future release renders in
     /// the dropdown and is simply absent from this list rather than showing
     /// up as an unlabelled checkbox.
@@ -64,14 +69,16 @@ struct TitleMetric: Hashable {
                     label: "Weekly", shortLabel: "wk", defaultOn: true),
         TitleMetric(id: "codex.weekly", provider: .codex,
                     label: "Weekly", shortLabel: "wk", defaultOn: true),
-        TitleMetric(id: "antigravity.gemini-weekly", provider: .antigravity,
-                    label: "Gemini · Weekly", shortLabel: "gem wk", defaultOn: false),
+        TitleMetric(id: "openrouter.credit", provider: .openrouter,
+                    label: "Credit remaining", shortLabel: "cr", defaultOn: false),
         TitleMetric(id: "antigravity.gemini-5h", provider: .antigravity,
-                    label: "Gemini · 5-hour", shortLabel: "gem 5h", defaultOn: false),
-        TitleMetric(id: "antigravity.3p-weekly", provider: .antigravity,
-                    label: "Claude/GPT · Weekly", shortLabel: "3p wk", defaultOn: false),
+                    label: "Gemini · 5-hour", shortLabel: "5h", defaultOn: false),
+        TitleMetric(id: "antigravity.gemini-weekly", provider: .antigravity,
+                    label: "Gemini · Weekly", shortLabel: "wk", defaultOn: false),
         TitleMetric(id: "antigravity.3p-5h", provider: .antigravity,
                     label: "Claude/GPT · 5-hour", shortLabel: "3p 5h", defaultOn: false),
+        TitleMetric(id: "antigravity.3p-weekly", provider: .antigravity,
+                    label: "Claude/GPT · Weekly", shortLabel: "3p wk", defaultOn: false),
     ]
 
     static func metric(id: String) -> TitleMetric? { all.first { $0.id == id } }

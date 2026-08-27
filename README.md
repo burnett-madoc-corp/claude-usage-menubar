@@ -83,13 +83,24 @@ menu rebuild.
 provider's card appears in the menu.
 
 **Menu bar** — one checkbox per *number*, not per provider: Claude's 5-hour
-and weekly, Codex's weekly, and Antigravity's four. Per-provider was the old
-design and it cannot express Antigravity, whose two quota groups are unrelated
-— a single number standing in for both would hide whichever one you were
-actually burning. Claude and Codex are ticked by default, exactly the title
-this app has always shown; Antigravity's four start unticked, so upgrading
-never widens your menu bar without you asking. An earlier per-provider setting
-is carried across on first launch, so a provider you had hidden stays hidden.
+and weekly, Codex's weekly, OpenRouter's remaining credit, and Antigravity's
+four. Per-provider was the old design and it cannot express Antigravity, whose
+two quota groups are unrelated — a single number standing in for both would
+hide whichever one you were actually burning. Claude and Codex are ticked by
+default, exactly the title this app has always shown; the rest start unticked,
+so upgrading never widens your menu bar without you asking. An earlier
+per-provider setting is carried across on first launch, so a provider you had
+hidden stays hidden.
+
+Each provider's mark is drawn once, followed by its ticked numbers, so
+`Claude 5h 60% wk 69%` names Claude once rather than twice. OpenRouter's
+number is the only one that is not a percentage — it is the balance itself,
+`cr $8.420`, coloured by how much of the granted amount has gone (and by the
+balance alone on an account with nothing granted). Antigravity's Gemini pair
+is written `5h`/`wk` with no family prefix, since the logo has already said
+Antigravity and only the third-party buckets need to name themselves. Every
+provider reads shortest window first, so the number that moves fastest is
+always in the same place.
 
 A provider hidden from the dropdown *and* contributing no ticked number is not
 polled at all — a real saving, since the Anthropic usage endpoint rate-limits
