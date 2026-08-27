@@ -219,6 +219,50 @@ The app's own API key never raises a Keychain dialog (see above). Claude
 Code's OAuth token carries its own access rules, so macOS may ask about that
 one once — choose **Always Allow**.
 
+### If the menu bar item never appears
+
+On macOS 26 a third-party status item is not a window the app draws. It is a
+scene hosted by ControlCenter, allowed or denied per app against a list
+ControlCenter persists — and a denial is silent. The app runs, believes its
+item is visible, reports a sensible width, and nothing is ever drawn.
+
+Two things put an app on that list:
+
+- **Being launched as a raw executable.** A launchd job whose
+  `ProgramArguments` is the binary inside the bundle gets an `osservice`
+  identity, and the default verdict for one with no existing record is *deny*.
+  Launching through `open(1)` gives a real application identity, whose default
+  is *allow*. `install.sh` writes the LaunchAgent the second way; do not
+  "simplify" it back to the executable path.
+- **Replacing the bundle.** `install.sh` uses `ditto` into the existing
+  `.app` rather than `rm -rf` + `cp -R`, so the bundle is never destroyed and
+  recreated under a new identity mid-update.
+
+If an app is already on the blocked list, no reinstall clears it — the record
+is keyed by bundle id and survives ControlCenter restarts. The only supported
+writer is the Settings pane:
+
+**System Settings → Menu Bar → Allow in the Menu Bar** → toggle **ClaudeUsage
+off, then on**, then restart the app so it re-registers its item:
+
+```bash
+pkill -x ClaudeUsage    # KeepAlive relaunches it through open(1)
+```
+
+Kill the **app**, not the launchd job. `launchctl kickstart -k` restarts the
+job, and the job is now `open(1)` — which has already exited. Killing it
+leaves the app running untouched, so nothing re-registers and the toggle
+appears to have done nothing.
+
+The toggle already reading "on" does not mean the app is allowed; the pane and
+the enforcement record can disagree.
+
+If the toggle does not take, the denial is stuck in ControlCenter's store and
+the only way out is **Reset Control Centre…**, at the bottom of that same
+Settings pane. That clears the menu bar records for *every* app, so anything
+else macOS has silently blocked comes back too — at the cost of resetting your
+Control Centre module layout.
+
 ### Uninstall
 
 ```bash
@@ -235,6 +279,32 @@ rm -rf /Applications/ClaudeUsage.app ~/Library/LaunchAgents/local.claude-usage-m
 Prints the same numbers — every provider card plus any live Sessions — and
 exits; useful for scripting or a shell prompt. Unlike the live dropdown,
 `--once` ignores whatever is hidden in Settings.
+
+It also prints the menu bar title: which metrics are ticked, the value each
+one currently holds, and the exact string the title composes to. The title is
+the app's most important surface and used to be the one thing no diagnostic
+could show, which made "the item looks blank" impossible to investigate
+without a screenshot.
+
+```bash
+/Applications/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --status-check
+```
+
+Asks the status item what it thinks of itself — whether macOS considers it
+visible, its width, and where on which screen it was placed — then exits:
+
+```
+isVisible      = true
+length         = -1.0
+button frame   = (0.0, 0.0, 202.0, 22.0)
+window frame   = (1854.0, 1307.0, 202.0, 22.0)
+screen         = (0.0, 0.0, 2056.0, 1329.0)
+title          = "￼ 5h 0% wk 63%   ￼ wk 100%" (26 chars)
+```
+
+A missing menu bar item is otherwise undebuggable from the outside: a
+zero-width button, an item macOS has hidden, and an item placed off the edge
+of a screen all look identical — nothing at all.
 
 ## How it works
 

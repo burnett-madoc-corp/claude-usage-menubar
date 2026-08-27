@@ -96,6 +96,15 @@ enum SessionRowStyle: String {
 enum Prefs {
     static var defaults: UserDefaults = .standard
 
+    /// The bundle id this app shipped under until the ControlCenter allow-list
+    /// forced a new one. UserDefaults.standard follows the bundle id, so
+    /// without the migration below every setting would silently reset.
+    static let legacyDomain = "local.claude-usage-menubar"
+
+    /// Swapped by --self-test so the migration can be exercised against a
+    /// scratch domain instead of the user's real pre-rename settings.
+    static var legacyDomainNameForTesting = legacyDomain
+
     /// Fired by every setter below. main.swift wires this once, at launch,
     /// to reschedule the refresh timer and re-render (main.swift:187-194)
     /// whenever a checkbox or the interval popup changes.
@@ -117,6 +126,25 @@ enum Prefs {
 
     static func setShowMetricInTitle(_ metric: TitleMetric, _ value: Bool) {
         setFlag("title.metric.\(metric.id)", value)
+    }
+
+    /// Copies settings across from the pre-rename bundle id, once.
+    ///
+    /// Changing CFBundleIdentifier moves UserDefaults.standard to a brand new
+    /// domain, so an upgrade would otherwise look like a factory reset:
+    /// hidden providers reappear, the refresh interval resets, and the
+    /// Antigravity cache is lost. Only keys this app owns are copied — a
+    /// blanket copy would drag in the global domain.
+    static func migrateLegacyDomainIfNeeded() {
+        guard defaults.object(forKey: "prefs.domainMigrated") == nil else { return }
+        defer { defaults.set(true, forKey: "prefs.domainMigrated") }
+
+        guard let legacy = defaults.persistentDomain(forName: legacyDomainNameForTesting) else { return }
+        let owned = ["dropdown.", "title.", "sessions.", "refreshInterval", "antigravity."]
+        for (key, value) in legacy
+        where owned.contains(where: { key.hasPrefix($0) }) && defaults.object(forKey: key) == nil {
+            defaults.set(value, forKey: key)
+        }
     }
 
     /// Carries the old per-provider `title.<id>` booleans forward, once.

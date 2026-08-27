@@ -305,9 +305,29 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         return main
     }
 
+    /// What the status item thinks of itself, for --status-check.
+    ///
+    /// "The item is missing" is otherwise undebuggable without a screen: a
+    /// zero-width button, a hidden item, and an item macOS never placed all
+    /// look identical from the outside.
+    func statusReport() -> String {
+        let button = statusItem.button
+        let title = button?.attributedTitle.string ?? "<no button>"
+        return """
+        isVisible      = \(statusItem.isVisible)
+        length         = \(statusItem.length)
+        button frame   = \(button?.frame.debugDescription ?? "<none>")
+        window frame   = \(button?.window?.frame.debugDescription ?? "<no window>")
+        screen         = \(button?.window?.screen?.frame.debugDescription ?? "<no screen>")
+        title          = "\(title)" (\(title.count) chars)
+        """
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Before anything reads a title flag: carries the old per-provider
-        // booleans onto the per-metric keys exactly once.
+        // Order matters: pull settings across from the pre-rename bundle id
+        // first, so the title-metric migration below sees the legacy
+        // title.<provider> flags it is meant to read.
+        Prefs.migrateLegacyDomainIfNeeded()
         Prefs.migrateTitleMetricsIfNeeded()
         NSApp.mainMenu = Self.makeMainMenu()
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -1455,6 +1475,36 @@ private func runSelfTests() {
     precondition(!Prefs.showMetricInTitle(codexWeeklyMetric))
     precondition(Prefs.showMetricInTitle(claudeSessionMetric), "untouched metrics keep their default")
 
+    // Legacy bundle-id domain: only keys this app owns come across, and an
+    // existing value in the new domain always wins. A blanket copy would drag
+    // in the global domain and pin those values per-app. The foreign key
+    // below is deliberately a made-up name: a real global key like
+    // AppleLanguages reads back through NSGlobalDomain from any suite, so it
+    // could never prove anything.
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+    let legacyProbe = "local.claude-usage-menubar.self-test-legacy"
+    let legacyDefaults = UserDefaults(suiteName: legacyProbe)!
+    legacyDefaults.removePersistentDomain(forName: legacyProbe)
+    legacyDefaults.set(false, forKey: "dropdown.codex")
+    legacyDefaults.set(300.0, forKey: "refreshInterval")
+    legacyDefaults.set("should-not-copy", forKey: "com.example.notOurs")
+    let savedLegacyName = Prefs.legacyDomainNameForTesting
+    Prefs.legacyDomainNameForTesting = legacyProbe
+    Prefs.setShowInDropdown(.claude, false) // a pre-existing value must win
+    Prefs.migrateLegacyDomainIfNeeded()
+    precondition(!Prefs.showInDropdown(.codex), "owned keys must come across")
+    precondition(Prefs.refreshInterval() == 300, "the refresh interval must come across")
+    precondition(Prefs.defaults.object(forKey: "com.example.notOurs") == nil,
+                 "only keys this app owns may be copied")
+    precondition(!Prefs.showInDropdown(.claude), "an existing value must not be overwritten")
+    // Idempotent: a later change must survive a second call.
+    Prefs.setShowInDropdown(.codex, true)
+    Prefs.migrateLegacyDomainIfNeeded()
+    precondition(Prefs.showInDropdown(.codex), "migration must run once, not every launch")
+    Prefs.legacyDomainNameForTesting = savedLegacyName
+    legacyDefaults.removePersistentDomain(forName: legacyProbe)
+    testDefaults.removePersistentDomain(forName: selfTestSuite)
+
     // Migration from the old per-provider title.<id> booleans. Someone who
     // hid Codex from the bar must stay hidden across the upgrade.
     testDefaults.removePersistentDomain(forName: selfTestSuite)
@@ -1746,6 +1796,9 @@ if CommandLine.arguments.contains("--self-test") {
 }
 
 if CommandLine.arguments.contains("--once") {
+    // --once reads the same prefs the app does, so it needs the same
+    // migration or it reports a factory-fresh config after the rename.
+    Prefs.migrateLegacyDomainIfNeeded()
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         // --once ignores visibility on purpose (Providers.all's doc
@@ -1770,6 +1823,18 @@ if CommandLine.arguments.contains("--once") {
             if !annotations.isEmpty { print("  (\(annotations.joined(separator: " · ")))") }
         }
 
+        // The menu bar title is the app's most important surface and was the
+        // one thing this diagnostic could not show, which made "the item is
+        // blank/missing" impossible to debug without a screen.
+        let entries = UsageMenuBar.visibleTitleEntries()
+        print("Title")
+        print("  metrics ticked: \(entries.count) of \(TitleMetric.all.count)")
+        for (metric, value) in entries {
+            print("    \(metric.id) = \(value.map { "\($0.percent)%" } ?? "no value yet")")
+        }
+        let rendered = UsageMenuBar.headlineText(entries)
+        print("  renders as: \"\(rendered)\" (\(rendered.count) chars)")
+
         print("Sessions")
         let sessions = await Sessions.snapshot()
         if sessions.isEmpty {
@@ -1793,6 +1858,21 @@ if CommandLine.arguments.contains("--once") {
     }
     semaphore.wait()
     exit(0)
+}
+
+if CommandLine.arguments.contains("--status-check") {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        let controller = UsageMenuBar()
+        app.delegate = controller
+        app.setActivationPolicy(.accessory)
+        // Let AppKit finish placing the item before interrogating it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            print(controller.statusReport())
+            exit(0)
+        }
+        app.run()
+    }
 }
 
 // Top-level code always runs on the main thread, so asserting main-actor
