@@ -305,6 +305,24 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         return main
     }
 
+    /// What the status item thinks of itself, for --status-check.
+    ///
+    /// "The item is missing" is otherwise undebuggable without a screen: a
+    /// zero-width button, a hidden item, and an item macOS never placed all
+    /// look identical from the outside.
+    func statusReport() -> String {
+        let button = statusItem.button
+        let title = button?.attributedTitle.string ?? "<no button>"
+        return """
+        isVisible      = \(statusItem.isVisible)
+        length         = \(statusItem.length)
+        button frame   = \(button?.frame.debugDescription ?? "<none>")
+        window frame   = \(button?.window?.frame.debugDescription ?? "<no window>")
+        screen         = \(button?.window?.screen?.frame.debugDescription ?? "<no screen>")
+        title          = "\(title)" (\(title.count) chars)
+        """
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Before anything reads a title flag: carries the old per-provider
         // booleans onto the per-metric keys exactly once.
@@ -1770,6 +1788,18 @@ if CommandLine.arguments.contains("--once") {
             if !annotations.isEmpty { print("  (\(annotations.joined(separator: " · ")))") }
         }
 
+        // The menu bar title is the app's most important surface and was the
+        // one thing this diagnostic could not show, which made "the item is
+        // blank/missing" impossible to debug without a screen.
+        let entries = UsageMenuBar.visibleTitleEntries()
+        print("Title")
+        print("  metrics ticked: \(entries.count) of \(TitleMetric.all.count)")
+        for (metric, value) in entries {
+            print("    \(metric.id) = \(value.map { "\($0.percent)%" } ?? "no value yet")")
+        }
+        let rendered = UsageMenuBar.headlineText(entries)
+        print("  renders as: \"\(rendered)\" (\(rendered.count) chars)")
+
         print("Sessions")
         let sessions = await Sessions.snapshot()
         if sessions.isEmpty {
@@ -1793,6 +1823,21 @@ if CommandLine.arguments.contains("--once") {
     }
     semaphore.wait()
     exit(0)
+}
+
+if CommandLine.arguments.contains("--status-check") {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        let controller = UsageMenuBar()
+        app.delegate = controller
+        app.setActivationPolicy(.accessory)
+        // Let AppKit finish placing the item before interrogating it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            print(controller.statusReport())
+            exit(0)
+        }
+        app.run()
+    }
 }
 
 // Top-level code always runs on the main thread, so asserting main-actor
