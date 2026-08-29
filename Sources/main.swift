@@ -75,7 +75,7 @@ enum Format {
     }
 
     static func usd(_ amount: Double) -> String {
-        String(format: amount.magnitude < 10 ? "$%.3f" : "$%.2f", amount)
+        String(format: "$%.2f", amount)
     }
 
     static func bar(_ percent: Int, width: Int = 10) -> String {
@@ -716,8 +716,11 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     /// Sort by most-recent transcript activity, cap at 8 rows, report the
     /// rest as a count for a single "+N more" line — NSMenu has no internal
-    /// scrolling worth fighting. Pure and nonisolated so it's fixture-testable.
-    nonisolated static func visibleSessions(_ sessions: [AgentSession], cap: Int = 8) -> (rows: [AgentSession], overflow: Int) {
+    /// scrolling worth fighting. 12 (up from 8): a pi+agy machine routinely
+    /// runs 8-12 live agents now, and every hidden row was one the panel's
+    /// whole point — "should I clear this session?" — could not answer.
+    /// Pure and nonisolated so it's fixture-testable.
+    nonisolated static func visibleSessions(_ sessions: [AgentSession], cap: Int = 12) -> (rows: [AgentSession], overflow: Int) {
         let sorted = sessions.sorted { ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast) }
         guard sorted.count > cap else { return (sorted, 0) }
         return (Array(sorted.prefix(cap)), sorted.count - cap)
@@ -1139,14 +1142,14 @@ private func testCompactSessionRendering() {
     let normal = makeSession(contextTokens: 84_000, contextWindow: 200_000)
     precondition(UsageMenuBar.sessionGauge(for: normal).contains("42%"))
 
-    // Sorting: most-recent transcript activity first, cap at 8, "+N more".
+    // Sorting: most-recent transcript activity first, cap at 12, "+N more".
     let now = Date()
-    let many = (0..<10).map { i in makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i))) }
+    let many = (0..<15).map { i in makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i))) }
     let capped = UsageMenuBar.visibleSessions(many)
-    precondition(capped.rows.count == 8)
-    precondition(capped.overflow == 2)
+    precondition(capped.rows.count == 12)
+    precondition(capped.overflow == 3)
     precondition(capped.rows.first?.label == "s0", "most-recent activity must sort first")
-    precondition(capped.rows.last?.label == "s7")
+    precondition(capped.rows.last?.label == "s11")
 
     let few = UsageMenuBar.visibleSessions(Array(many.prefix(5)))
     precondition(few.rows.count == 5 && few.overflow == 0)
@@ -1407,15 +1410,15 @@ private func runSelfTests() {
     // there, colouring it, but never reaches the bar.
     let mCredit = TitleMetric.metric(id: "openrouter.credit")!
     let vCredit = OpenRouterProvider.headline(granted: 20, used: 11.58)
-    precondition(vCredit.text == "$8.420")
+    precondition(vCredit.text == "$8.42")
     precondition(vCredit.percent == 58, "colour comes from spend against the grant")
     precondition(vCredit.severity == "normal")
-    precondition(UsageMenuBar.headlineText([(mCredit, vCredit)]) == "OpenRouter cr $8.420")
+    precondition(UsageMenuBar.headlineText([(mCredit, vCredit)]) == "OpenRouter cr $8.42")
     precondition(UsageMenuBar.headlineText([(mCodexWeekly, vCodex), (mCredit, vCredit)])
-                 == "Codex wk 42%   OpenRouter cr $8.420")
+                 == "Codex wk 42%   OpenRouter cr $8.42")
     // Overdrawn: the balance goes negative and the colour goes critical.
     let vOverdrawn = OpenRouterProvider.headline(granted: 20, used: 20.17)
-    precondition(vOverdrawn.text == "$-0.170")
+    precondition(vOverdrawn.text == "$-0.17")
     precondition(vOverdrawn.severity == "critical")
     // Nothing granted: no denominator, so the balance itself decides the
     // colour rather than a meaningless 0%. An empty account is empty whether
@@ -1425,6 +1428,56 @@ private func runSelfTests() {
     precondition(OpenRouterProvider.headline(granted: 0, used: -3).severity == "warning",
                  "a small positive balance with no grant warns rather than alarms")
     precondition(OpenRouterProvider.headline(granted: 0, used: -20).severity == "normal")
+
+    // MARK: Top-up ledger — the API only exposes LIFETIME totals, so usage
+    // since the last top-up must be detected locally. A grown grant IS the
+    // top-up; its delta is the cycle grant. (Numbers chosen so every
+    // subtraction is exact in binary — a float here would be a lie.)
+    let atTopup = Date(timeIntervalSinceReferenceDate: 700_000_000)
+
+    // First poll on an upgrading install: no history exists, so the current
+    // balance seeds the cycle — spend counts against it, not lifetime.
+    let seededLedger = OpenRouterProvider.update(ledger: nil, granted: 20, used: 11, now: atTopup)
+    precondition(seededLedger.lastTotalCredits == 20)
+    precondition(seededLedger.topup?.seeded == true)
+    precondition(seededLedger.topup?.granted == 9, "seeded grant = current balance")
+    precondition(seededLedger.topup?.usageAtTopup == 11)
+
+    // Subsequent polls without a top-up must keep the cycle untouched.
+    let steady = OpenRouterProvider.update(ledger: seededLedger, granted: 20, used: 12, now: atTopup)
+    precondition(steady.topup == seededLedger.topup, "a poll where the grant did not move must not touch the cycle")
+
+    // A grown grant IS the top-up: delta = cycle grant, lifetime usage at
+    // that moment starts the cycle counter, seeded flag retires.
+    let toppedUp = OpenRouterProvider.update(ledger: seededLedger, granted: 30, used: 13, now: atTopup)
+    precondition(toppedUp.lastTotalCredits == 30)
+    precondition(toppedUp.topup?.granted == 10)
+    precondition(toppedUp.topup?.usageAtTopup == 13)
+    precondition(toppedUp.topup?.seeded == false)
+
+    // Cycle-aware headline: spend since the top-up against the top-up.
+    let cycleHeadline = OpenRouterProvider.headline(ledger: toppedUp, granted: 30, used: 18)
+    precondition(cycleHeadline.percent == 50, "used $5 of the $10 top-up → 50%")
+    precondition(cycleHeadline.display == "$12.00", "display stays the remaining balance")
+    precondition(cycleHeadline.severity == "normal")
+
+    // Past the cycle grant, the percent clamps at 100 and goes critical —
+    // the top-up is burned and the old balance is being eaten.
+    let burned = OpenRouterProvider.headline(ledger: toppedUp, granted: 30, used: 28.5)
+    precondition(burned.percent == 100)
+    precondition(burned.severity == "critical")
+
+    // A SHRUNK grant (adjustment/revocation) makes lifetime totals
+    // incomparable — tracking restarts and the card falls back to lifetime.
+    let shrunk = OpenRouterProvider.update(ledger: toppedUp, granted: 25, used: 14, now: atTopup)
+    precondition(shrunk.topup == nil)
+    precondition(shrunk.lastTotalCredits == 25)
+    precondition(OpenRouterProvider.headline(ledger: shrunk, granted: 25, used: 14).percent == 56,
+                 "no cycle → lifetime ratio")
+
+    // Sub-cent grant movement is float noise, not a top-up.
+    let noise = OpenRouterProvider.update(ledger: toppedUp, granted: 30.004, used: 13.1, now: atTopup)
+    precondition(noise.topup?.granted == 10)
     // A plain percentage metric carries no display string, so nothing changed
     // for the numbers that were already there.
     precondition(vCodex.display == nil && vCodex.text == "42%")
@@ -1469,6 +1522,17 @@ private func runSelfTests() {
         testDefaults.removePersistentDomain(forName: selfTestSuite)
         Prefs.defaults = savedDefaults
     }
+
+    // Ledger persistence — placed BELOW the suite swap deliberately. The
+    // cycle must survive an app relaunch, or the top-up detected before it
+    // is forgotten; but saveLedger writes wherever Prefs.defaults points,
+    // and the self-tests above this line run against the real suite.
+    OpenRouterProvider.saveLedger(toppedUp)
+    let reloaded = OpenRouterProvider.loadLedger()
+    precondition(reloaded == toppedUp, "ledger must round-trip byte-stable through the scratch suite")
+    precondition(reloaded?.topup?.topupAt == atTopup)
+    OpenRouterProvider.saveLedger(OpenRouterProvider.update(ledger: nil, granted: 0, used: 0, now: atTopup))
+    precondition(OpenRouterProvider.loadLedger()?.topup == nil)
 
     // Unset reads true — "never configured" means "show everything".
     for id in ProviderID.allCases {

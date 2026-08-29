@@ -386,10 +386,83 @@ struct CodexProvider: Provider {
 
 // MARK: - OpenRouter
 
+/// `GET /api/v1/credits` exposes only LIFETIME totals to a regular key
+/// (verified live: `/credits/history` 404s, `/activity` requires a
+/// management key):
+///
+///   total_credits — every dollar ever granted; it GROWS on each top-up and
+///                   is NOT the current balance
+///   total_usage   — every dollar ever spent
+///
+/// `remaining` (grant − usage) is therefore always honest, but a "used" bar
+/// computed from those two double-counts every earlier top-up the moment the
+/// account is funded again. So top-ups are detected locally: the app persists
+/// the last-seen lifetime grant (`OpenRouterLedger.lastTotalCredits`) and a
+/// poll where it has grown IS the top-up — the delta becomes that top-up's
+/// grant, and lifetime usage at that moment starts the cycle's spend counter.
+/// Known cost of the method: spend between the last poll before a top-up and
+/// the top-up itself is attributed to the old cycle (bounded by one refresh
+/// interval).
+struct OpenRouterLedger: Codable, Equatable {
+    var lastTotalCredits: Double
+    var topup: Cycle?
+
+    struct Cycle: Codable, Equatable {
+        var granted: Double
+        var usageAtTopup: Double
+        var topupAt: Date
+        /// True when the cycle was seeded from the current balance rather
+        /// than observed — an upgrading install has no history to say what
+        /// usage was at its last real top-up, so "since install" is the
+        /// honest label until the next real top-up lands.
+        var seeded: Bool
+    }
+}
+
 /// GET /api/v1/credits → { data: { total_credits, total_usage } } (USD).
 struct OpenRouterProvider: Provider {
     let name = "OpenRouter"
     let key: String?
+
+    static let ledgerKey = "openrouter.ledger"
+    /// A grant moving by less than half a cent is float noise, not a top-up.
+    static let topupEpsilon = 0.005
+
+    /// Ledger persistence lives in the same defaults the Antigravity cache
+    /// uses, so it survives restarts — the whole point: a top-up detected
+    /// before a relaunch must still define the cycle after it.
+    static func loadLedger() -> OpenRouterLedger? {
+        guard let data = Prefs.defaults.data(forKey: ledgerKey) else { return nil }
+        return try? JSONDecoder().decode(OpenRouterLedger.self, from: data)
+    }
+
+    static func saveLedger(_ ledger: OpenRouterLedger) {
+        Prefs.defaults.set(try? JSONEncoder().encode(ledger), forKey: ledgerKey)
+    }
+
+    /// Pure ledger transition for one poll, self-testable without network.
+    /// A grown grant is a top-up; a SHRUNK grant (adjustment/revocation)
+    /// makes lifetime totals incomparable, so tracking restarts and the card
+    /// falls back to lifetime display until the next top-up.
+    static func update(ledger: OpenRouterLedger?, granted: Double, used: Double,
+                       now: Date = Date()) -> OpenRouterLedger {
+        var ledger = ledger ?? OpenRouterLedger(
+            lastTotalCredits: granted,
+            // Upgrade path: there is no history to say what usage was at the
+            // install's last real top-up, so the current balance seeds the
+            // cycle — spend from here on counts against it, not lifetime.
+            topup: granted - used > 0
+                ? .init(granted: granted - used, usageAtTopup: used, topupAt: now, seeded: true)
+                : nil)
+        if granted < ledger.lastTotalCredits - topupEpsilon {
+            ledger = OpenRouterLedger(lastTotalCredits: granted, topup: nil)
+        } else if granted > ledger.lastTotalCredits + topupEpsilon {
+            ledger.topup = .init(granted: granted - ledger.lastTotalCredits,
+                                 usageAtTopup: used, topupAt: now, seeded: false)
+            ledger.lastTotalCredits = granted
+        }
+        return ledger
+    }
 
     /// Turns a /v1/credits response into the "valid — $X.XX remaining"
     /// message SettingsWindow's Test button shows — the same arithmetic
@@ -418,6 +491,21 @@ struct OpenRouterProvider: Provider {
         return HeadlineValue(percent: percent, severity: severity, display: display)
     }
 
+    /// Menu-bar colour source, cycle-aware: with a known top-up cycle the
+    /// percent is spend since the top-up against the top-up itself — the
+    /// number a person actually funds against; without one it falls back to
+    /// the lifetime ratio. The display is always the remaining balance.
+    static func headline(ledger: OpenRouterLedger, granted: Double, used: Double) -> HeadlineValue {
+        guard let cycle = ledger.topup, cycle.granted > 0 else {
+            return headline(granted: granted, used: used)
+        }
+        let cycleUsed = max(0, used - cycle.usageAtTopup)
+        let percent = min(100, Int((cycleUsed / cycle.granted * 100).rounded()))
+        let severity = percent >= 95 ? "critical" : (percent >= 80 ? "warning" : "normal")
+        return HeadlineValue(percent: percent, severity: severity,
+                             display: Format.usd(granted - used))
+    }
+
     func load() async -> Card {
         guard let key, !key.isEmpty else {
             TitleValues.clear(provider: .openrouter)
@@ -429,11 +517,25 @@ struct OpenRouterProvider: Provider {
             let granted = (data["total_credits"] as? NSNumber)?.doubleValue ?? 0
             let used = (data["total_usage"] as? NSNumber)?.doubleValue ?? 0
             let remaining = granted - used
-            TitleValues.set("openrouter.credit", Self.headline(granted: granted, used: used))
+
+            let ledger = Self.update(ledger: Self.loadLedger(), granted: granted, used: used)
+            Self.saveLedger(ledger)
+            let headline = Self.headline(ledger: ledger, granted: granted, used: used)
+            TitleValues.set("openrouter.credit", headline)
 
             var rows = [Row(label: "Remaining", detail: Format.usd(remaining))]
-            if granted > 0 {
-                let headline = Self.headline(granted: granted, used: used)
+            var badge: Badge?
+            if let cycle = ledger.topup {
+                let cycleUsed = max(0, used - cycle.usageAtTopup)
+                rows.insert(Row(
+                    label: "Top-up used",
+                    percent: headline.percent,
+                    detail: "\(Format.usd(cycleUsed)) of \(Format.usd(cycle.granted))",
+                    severity: headline.severity
+                ), at: 0)
+                badge = Badge(text: cycle.seeded ? "tracking since install"
+                                                 : "top-up \(Format.ago(cycle.topupAt))", kind: .gray)
+            } else if granted > 0 {
                 rows.insert(Row(
                     label: "Used",
                     percent: headline.percent,
@@ -443,7 +545,7 @@ struct OpenRouterProvider: Provider {
             } else {
                 rows.append(Row(label: "Spent", detail: Format.usd(used)))
             }
-            return Card(provider: name, rows: rows)
+            return Card(provider: name, rows: rows, badge: badge)
         } catch {
             // A failed fetch must not leave a stale balance in the bar: an
             // out-of-date dollar figure reads as current in a way an em-dash

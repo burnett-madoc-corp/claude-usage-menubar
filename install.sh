@@ -13,7 +13,17 @@ echo "Installing to ${DEST}..."
 # debugger with this app's binary path open on its command line (e.g.
 # `lldb ClaudeUsage.app/Contents/MacOS/ClaudeUsage`) would match and get
 # killed too. -x matches only the process name itself.
+#
+# Stop the KeepAlive job BEFORE killing the app: launchd relaunches via
+# open(1) the instant the app dies, and that relaunch can load the OLD
+# binary before the ditto below finishes — leaving the new version on disk
+# while an old instance keeps rendering (observed live during an upgrade:
+# the menu kept showing the previous build's features until a manual
+# restart). Booting out first also means the open(1) after the ditto
+# genuinely launches fresh instead of activating a surviving old instance.
+launchctl bootout "gui/$UID/local.claude-usage-menubar" 2>/dev/null || true
 pkill -x ClaudeUsage 2>/dev/null || true
+sleep 1
 # ditto into place rather than `rm -rf` + `cp -R`. Deleting the bundle
 # destroys the app identity macOS has records against; ditto replaces the
 # contents while the bundle keeps existing at the same path.

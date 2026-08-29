@@ -27,6 +27,19 @@ payload into its session logs on every turn, so this reads the newest entry —
 free and local, but only as fresh as your last Codex turn. The row is labelled
 with its age (`as of 6d ago`) so a stale number never masquerades as live.
 
+**OpenRouter counts usage per top-up cycle, not lifetime.** The `/credits`
+endpoint exposes only lifetime totals (`total_credits` is every dollar ever
+granted and grows on each top-up; `total_usage` is lifetime spend), so a naive
+"used" bar double-counts every earlier top-up the moment you fund the account
+again. The app therefore detects top-ups locally — it persists the last-seen
+lifetime grant, and a poll where it has grown IS the top-up — and measures the
+"Top-up used" bar as spend since that top-up against the top-up itself.
+Known cost: spend between the last poll before a top-up and the top-up itself
+lands in the old cycle (bounded by one refresh interval). An install with no
+history yet seeds the cycle from the current balance and labels it
+"tracking since install" until the first detected top-up. Money is always
+displayed to two decimals; the bar's colour is the worse of the cycle's spend.
+
 **Antigravity only reports while `agy` is running.** It is a CLI, not a
 daemon: it opens a local Connect server for the life of a session and takes it
 away again on exit. So this reads the live server when there is one, and
@@ -173,10 +186,33 @@ from measured sessions by [`tools/token_charts.py`](tools/token_charts.py).
 
 ## Sessions
 
-A read-only view of your **live** Claude Code and Codex processes, answering
-one question: *should I clear this session?* It only reads process state and
-on-disk logs — no cost estimate, no history, no way to kill or attach to a
-session from here.
+A read-only view of your **live** agent processes — Claude Code, Codex, the
+pi coding agent and Antigravity's `agy` CLI — answering one question: *should
+I clear this session?* It only reads process state and on-disk logs — no cost
+estimate, no history, no way to kill or attach to a session from here.
+
+The four sources degrade independently, and not every agent exposes the same
+signals:
+
+- **Claude Code** — registry files, transcripts, per-turn costs, BLOAT,
+  compaction (the full row).
+- **Codex** — `state_N.sqlite` threads matched to live processes by start-time
+  proximity; `token_count` rollout events for tokens.
+- **pi** — session JSONL under `~/.pi/agent/sessions`, matched to live PIDs by
+  the header's cwd + start timestamp. Context = the newest `usage.totalTokens`;
+  pi records no context-window constant in transcripts, so the bar's window is
+  resolved from `~/.pi/agent/models-store.json` (pi's own per-provider model
+  catalog, mtime-cached). A resumed session (`pi -c`) is matched to its newest
+  same-directory transcript and labelled "(unmatched)".
+- **agy** — each live agy PID is its own language server: `lsof` on the PID
+  yields the cwd, the presence lock (whose UUID *is* the conversation id), and
+  the process's own Connect port. `GetAllCascadeTrajectories` gives the title,
+  idle/running status and workspace; `GetCascadeTrajectory` gives real token
+  usage per invocation and `contextWindowMetadata` — the full context bar.
+  MB-scale trajectory payloads are re-fetched only when a conversation's
+  `lastUserInputTime` advances. If `lsof` comes up empty, the row degrades
+  through the history.jsonl cwd heuristic — a live agy session is never
+  dropped for lack of identity.
 
 A **turn** here is one request to the model and its reply — not one thing you
 type. If the model calls three tools before answering, that is four turns, and

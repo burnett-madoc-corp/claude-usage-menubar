@@ -15,6 +15,11 @@ enum SessionGrid {
     /// edge in an otherwise column-aligned panel. 124pt clears the widest pair
     /// the app can produce ("gpt-5.2-codex (200k)", 110.8pt).
     static let modelWidth: CGFloat = 124
+    /// The harness column names which agent owns the row — four sessions
+    /// sharing one panel from four different CLIs read as one undifferentiated
+    /// table otherwise (the accent colour alone was too subtle to read at a
+    /// glance). "Claude" is the widest value at 10pt; 44pt clears it.
+    static let harnessWidth: CGFloat = 44
     static let contextWidth: CGFloat = 76
     static let bloatWidth: CGFloat = 44
     static let turnsWidth: CGFloat = 34
@@ -35,6 +40,7 @@ enum SessionGrid {
     struct Columns {
         var dot: NSRect
         var name: NSRect
+        var harness: NSRect
         var model: NSRect
         var context: NSRect
         var bloat: NSRect
@@ -73,9 +79,11 @@ enum SessionGrid {
         let contextX = bloatX - Panel.columnGap - contextWidth
         let nameX = Panel.inset + dotColumn
         let modelX = contextX - Panel.columnGap - modelWidth
+        let harnessX = modelX - Panel.columnGap - harnessWidth
         return Columns(
             dot: NSRect(x: Panel.inset, y: y, width: dotColumn, height: height),
-            name: NSRect(x: nameX, y: y, width: max(0, modelX - Panel.columnGap - nameX), height: height),
+            name: NSRect(x: nameX, y: y, width: max(0, harnessX - Panel.columnGap - nameX), height: height),
+            harness: NSRect(x: harnessX, y: y, width: harnessWidth, height: height),
             model: NSRect(x: modelX, y: y, width: modelWidth, height: height),
             context: NSRect(x: contextX, y: y, width: contextWidth, height: height),
             bloat: NSRect(x: bloatX, y: y, width: bloatWidth, height: height),
@@ -176,7 +184,8 @@ enum DetailedSessionRow {
     /// only place that value is stated, and it is stated as what it is: the
     /// bar's value.
     nonisolated static func accessibilityLabel(for session: AgentSession) -> String {
-        var parts: [String] = [session.busy ? "busy" : "idle", displayName(for: session)]
+        var parts: [String] = [session.busy ? "busy" : "idle", session.kind.displayName,
+                               displayName(for: session)]
         if let model = session.model {
             parts.append(Display.modelWithWindow(model, window: session.contextWindow))
         }
@@ -197,7 +206,7 @@ enum DetailedSessionRow {
     /// The tiny uppercase column-header line above the table. Exposed as text
     /// so the header view and the accessibility label agree on the wording.
     nonisolated static let columnHeaders =
-        (name: "SESSION", model: "MODEL", context: "CONTEXT",
+        (name: "SESSION", harness: "HARNESS", model: "MODEL", context: "CONTEXT",
          bloat: "BLOAT", turns: "TURNS", inOut: "IN/OUT")
 }
 
@@ -222,6 +231,7 @@ final class SessionHeaderView: NSView {
         let color = NSColor.tertiaryLabelColor
         let headers = DetailedSessionRow.columnHeaders
         Draw.text(headers.name, font: font, color: color, in: columns.name)
+        Draw.text(headers.harness, font: font, color: color, in: columns.harness)
         Draw.text(headers.model, font: font, color: color, in: columns.model)
         Draw.text(headers.context, font: font, color: color, in: columns.context)
         Draw.text(headers.bloat, font: font, color: color,
@@ -433,6 +443,7 @@ final class SessionRowView: NSView {
 
         drawDot(in: columns.dot, accent: accent)
         drawName(in: columns.name, modelRect: columns.model, label: label, accent: accent)
+        drawHarness(in: columns.harness, secondary: secondary)
         drawContext(columns: columns, severity: severity, secondary: secondary)
         drawBloat(in: columns.bloat, severity: severity)
         drawTurns(in: columns.turns, highlighted: highlighted)
@@ -465,15 +476,22 @@ final class SessionRowView: NSView {
     /// letting the former push the latter around produced both a ragged model
     /// edge and, at narrower widths, a clipped "(200k)" — the one part of the
     /// row that cannot be inferred from anything else.
+    /// The session name is drawn a point smaller than the model column's
+    /// neighbours so a long task title reads as the label it is rather than
+    /// competing with the data cells for emphasis.
     private func drawName(in nameRect: NSRect, modelRect: NSRect, label: NSColor, accent: NSColor) {
         var runs: [(String, NSFont, NSColor)] =
-            [(DetailedSessionRow.displayName(for: session), PanelFont.text(13, .semibold), label)]
+            [(DetailedSessionRow.displayName(for: session), PanelFont.text(11, .semibold), label)]
         if !session.matched { runs.append(("(?)", PanelFont.text(10), label)) }
         Draw.runs(runs, in: nameRect)
 
         guard let model = session.model else { return }
         Draw.text(Display.modelWithWindow(model, window: session.contextWindow),
                   font: PanelFont.text(10), color: accent, in: modelRect)
+    }
+
+    private func drawHarness(in rect: NSRect, secondary: NSColor) {
+        Draw.text(session.kind.displayName, font: PanelFont.text(10), color: secondary, in: rect)
     }
 
     private func drawContext(columns: SessionGrid.Columns, severity: NSColor, secondary: NSColor) {
@@ -644,7 +662,7 @@ enum DetailedSessionRowSelfTests {
         // measuring how much of a real title actually fits — a width-per-char
         // estimate is not stable enough, since proportional glyph widths vary
         // by roughly a third between a narrow name and a wide one.
-        let nameFont = PanelFont.text(13, .semibold)
+        let nameFont = PanelFont.text(11, .semibold)
         let title = "Redesign dropdown menu layout and provider color coding"
         var fitted = 0
         for end in 1...title.count {
@@ -654,8 +672,8 @@ enum DetailedSessionRowSelfTests {
             }
             fitted = end
         }
-        precondition((16...22).contains(fitted),
-                     "the name column should afford ~19 characters of a task title, fits \(fitted)")
+        precondition((18...26).contains(fitted),
+                     "the name column should afford ~22 characters of a task title, fits \(fitted)")
     }
 
     private static func testExpandedText() {
@@ -713,7 +731,8 @@ enum DetailedSessionRowSelfTests {
         // Columns march left to right without overlapping, and the last one
         // ends exactly on the panel's right margin.
         precondition(columns.dot.maxX <= columns.name.minX)
-        precondition(columns.name.maxX <= columns.model.minX)
+        precondition(columns.name.maxX <= columns.harness.minX)
+        precondition(columns.harness.maxX <= columns.model.minX)
         precondition(columns.model.maxX <= columns.context.minX)
         precondition(columns.context.maxX <= columns.bloat.minX)
         precondition(columns.bloat.maxX <= columns.turns.minX)
@@ -731,6 +750,7 @@ enum DetailedSessionRowSelfTests {
         // column, without moving the data cell's own right edge.
         let headerFont = PanelFont.text(10, .medium)
         for (title, cell) in [
+            (DetailedSessionRow.columnHeaders.harness, columns.harness),
             (DetailedSessionRow.columnHeaders.bloat, columns.bloat),
             (DetailedSessionRow.columnHeaders.turns, columns.turns),
             (DetailedSessionRow.columnHeaders.inOut, columns.inOut),
