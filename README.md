@@ -11,8 +11,7 @@ one. Reset times, credit balances and live agent sessions are one click away,
 alongside a Settings window (⌘,) for visibility, refresh interval and API
 keys.
 
-![The menu bar title and its dropdown: Claude, Codex and OpenRouter quota
-bars above the live Sessions panel](docs/menu-bar.png)
+![The menu bar title and its dropdown: Claude, Codex and OpenRouter quota bars above the live Sessions panel](https://github.com/user-attachments/assets/f4c4e497-b6fe-4e82-8c5b-7e6f898e7bef)
 
 ## Providers
 
