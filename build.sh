@@ -16,31 +16,61 @@ cp Resources/*-template.svg "$APP/Contents/Resources/"
 # swiftc invocation (rather than `-target x86_64-apple-macosx13.0 arm64-…`,
 # which swiftc does not accept) and stitching them together with lipo is the
 # same approach Xcode itself uses under the hood for a multi-arch product.
-echo "Compiling (arm64)…"
-swiftc -O \
-  -target arm64-apple-macosx13.0 \
-  -framework AppKit \
-  -framework Security \
-  -o "$BIN-arm64" \
-  Sources/Providers.swift Sources/KeyStore.swift Sources/Prefs.swift \
-  Sources/Sessions.swift Sources/CodexSessions.swift Sources/SettingsWindow.swift \
-  Sources/Theme.swift Sources/PollPolicy.swift Sources/QuotaBlockView.swift \
-  Sources/SessionRowView.swift Sources/main.swift
+# Set ARCHS=arm64 or ARCHS=x86_64 to compile a single slice (e.g. CodeQL CI).
+ARCHS="${ARCHS:-universal}"
 
-echo "Compiling (x86_64)…"
-swiftc -O \
-  -target x86_64-apple-macosx13.0 \
-  -framework AppKit \
-  -framework Security \
-  -o "$BIN-x86_64" \
-  Sources/Providers.swift Sources/KeyStore.swift Sources/Prefs.swift \
-  Sources/Sessions.swift Sources/CodexSessions.swift Sources/SettingsWindow.swift \
-  Sources/Theme.swift Sources/PollPolicy.swift Sources/QuotaBlockView.swift \
-  Sources/SessionRowView.swift Sources/main.swift
+SRCS=(
+  Sources/Providers.swift
+  Sources/KeyStore.swift
+  Sources/Prefs.swift
+  Sources/Sessions.swift
+  Sources/CodexSessions.swift
+  Sources/OtherAgentSessions.swift
+  Sources/SettingsWindow.swift
+  Sources/Theme.swift
+  Sources/PollPolicy.swift
+  Sources/QuotaBlockView.swift
+  Sources/SessionRowView.swift
+  Sources/main.swift
+)
 
-echo "Combining into a universal binary…"
-lipo -create -output "$BIN" "$BIN-arm64" "$BIN-x86_64"
-rm -f "$BIN-arm64" "$BIN-x86_64"
+if [ "$ARCHS" = "arm64" ]; then
+  echo "Compiling (arm64)…"
+  swiftc -O \
+    -target arm64-apple-macosx13.0 \
+    -framework AppKit \
+    -framework Security \
+    -o "$BIN" \
+    "${SRCS[@]}"
+elif [ "$ARCHS" = "x86_64" ]; then
+  echo "Compiling (x86_64)…"
+  swiftc -O \
+    -target x86_64-apple-macosx13.0 \
+    -framework AppKit \
+    -framework Security \
+    -o "$BIN" \
+    "${SRCS[@]}"
+else
+  echo "Compiling (arm64)…"
+  swiftc -O \
+    -target arm64-apple-macosx13.0 \
+    -framework AppKit \
+    -framework Security \
+    -o "$BIN-arm64" \
+    "${SRCS[@]}"
+
+  echo "Compiling (x86_64)…"
+  swiftc -O \
+    -target x86_64-apple-macosx13.0 \
+    -framework AppKit \
+    -framework Security \
+    -o "$BIN-x86_64" \
+    "${SRCS[@]}"
+
+  echo "Combining into a universal binary…"
+  lipo -create -output "$BIN" "$BIN-arm64" "$BIN-x86_64"
+  rm -f "$BIN-arm64" "$BIN-x86_64"
+fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

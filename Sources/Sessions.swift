@@ -252,7 +252,20 @@ struct RegistryEntry: Decodable, Sendable {
 
 // MARK: - Session model
 
-enum AgentKind: String, Sendable { case claude, codex }
+enum AgentKind: String, Sendable { case claude, codex, pi, agy
+
+    /// The HARNES column's cell — which agent owns the row, spelled out
+    /// rather than left to the accent colour, now that four kinds share one
+    /// table.
+    var displayName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .pi: return "Pi"
+        case .agy: return "Agy"
+        }
+    }
+}
 
 struct AgentSession: Sendable {
     var kind: AgentKind
@@ -724,19 +737,24 @@ enum SessionScanner {
 // MARK: - Entry point for main.swift
 
 enum Sessions {
-    /// Claude and Codex are independent sources: a Codex DB failure (locked,
-    /// missing, schema-drifted) must never block Claude sessions from
+    /// Claude, Codex, pi and agy are independent sources: a Codex DB failure
+    /// (locked, missing, schema-drifted) must never block Claude sessions from
     /// rendering, and vice versa — each degrades to "no sessions from this
     /// source" on its own.
     static func snapshot() async -> [AgentSession] {
         let home = FileManager.default.homeDirectoryForCurrentUser
+        // One ps pass feeds every source; the per-source scanners only add
+        // the cheap per-PID lsof cwd lookups for the PIDs they care about.
+        let processes = ProcessScanner.run()
         async let claude = SessionScanner.liveSessions(
-            processList: ProcessScanner.run(),
+            processList: processes,
             mappingDir: home.appendingPathComponent(".claude/sessions"),
             projectsDir: home.appendingPathComponent(".claude/projects")
         )
         async let codex = CodexSessions.snapshot()
-        return (await claude + (await codex)).sorted { $0.label < $1.label }
+        async let pi = PiSessions.snapshot(processes: processes)
+        async let agy = AgySessions.snapshot(processes: processes)
+        return (await claude + (await codex) + (await pi) + (await agy)).sorted { $0.label < $1.label }
     }
 }
 
@@ -769,6 +787,7 @@ enum SessionSelfTests {
         testLiveSessionsEndToEnd()
         testAiTitle()
         CodexSessionSelfTests.run()
+        PiAndAgySessionSelfTests.run()
     }
 
     // MARK: ai-title — Claude Code's own name for what the session is doing,
