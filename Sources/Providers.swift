@@ -652,8 +652,13 @@ struct AntigravityProvider: Provider {
     // Without a cache this card would read "not running" almost always, which
     // is truthful but useless. With one, the weekly numbers — the ones you
     // actually plan around — stay on screen between agy sessions.
-
+    //
+    // The dropdown may replay the cache with its "as of" badge at any age,
+    // but the title has no badge: a days-old 66% there reads as live, which
+    // is exactly how a quota limit arrived unwarned. Older than
+    // titleStalenessThreshold, the title is cleared to "—" instead.
     static let cacheKey = "antigravity.cache"
+    static let titleStalenessThreshold: TimeInterval = 900
 
     static func encodeCache(buckets: [Bucket], fetchedAt: Date) -> [String: Any] {
         [
@@ -764,9 +769,37 @@ struct AntigravityProvider: Provider {
         }
     }
 
+    /// Replays the last reading (minus any bucket whose window has since
+    /// reset) under the given error, the same contract CodexProvider's
+    /// snapshot badge makes. Title values follow the cache: published while
+    /// fresh enough to be honest, cleared once past the staleness threshold
+    /// — and always cleared when there is no usable cache at all.
+    private static func cachedCard(error: String, now: Date = Date()) -> Card {
+        guard let raw = Prefs.defaults.dictionary(forKey: Self.cacheKey),
+              let cached = Self.decodeCache(raw, now: now)
+        else {
+            TitleValues.clear(provider: .antigravity)
+            return Card(provider: ProviderID.antigravity.displayName, rows: [], error: error)
+        }
+        // Publish from the cached path too: a cached number in the dropdown
+        // and a blank one in the title would be incoherent — but only while
+        // the cache is young. Past the threshold the title would state a
+        // live-looking percentage it has no badge to qualify.
+        if now.timeIntervalSince(cached.fetchedAt) > titleStalenessThreshold {
+            TitleValues.clear(provider: .antigravity)
+        } else {
+            Self.publishHeadlines(cached.buckets)
+        }
+        return Card(provider: ProviderID.antigravity.displayName, rows: Self.rows(from: cached.buckets),
+                    badge: Badge(text: "as of \(Format.ago(cached.fetchedAt))", kind: .gray))
+    }
+
     func load() async -> Card {
-        for port in Self.listeningPorts() {
+        let ports = Self.listeningPorts()
+        var rpcSucceeded = false
+        for port in ports {
             guard let json = await Self.fetch(port: port) else { continue }
+            rpcSucceeded = true
             let buckets = Self.buckets(from: json)
             guard !buckets.isEmpty else { continue }
             Prefs.defaults.set(Self.encodeCache(buckets: buckets, fetchedAt: Date()),
@@ -775,20 +808,19 @@ struct AntigravityProvider: Provider {
             return Card(provider: name, rows: Self.rows(from: buckets))
         }
 
-        // agy is not running. Replay the last reading, minus any bucket whose
-        // window has since reset, and say plainly how old it is — the same
-        // contract CodexProvider's snapshot badge makes.
-        guard let raw = Prefs.defaults.dictionary(forKey: Self.cacheKey),
-              let cached = Self.decodeCache(raw, now: Date())
-        else {
-            TitleValues.clear(provider: .antigravity)
-            return Card(provider: name, rows: [], error: "agy not running")
+        // Three distinct realities, previously collapsed into one:
+        // (a) agy is listening but every RPC failed — the process is alive,
+        //     so "not running" would be a lie; say so and replay cache.
+        if !ports.isEmpty && !rpcSucceeded {
+            return Self.cachedCard(error: "agy running — quota fetch failed")
         }
-        // Publish from the cached path too: a cached number in the dropdown
-        // and a blank one in the title would be incoherent, and the cache is
-        // where this provider spends most of its life.
-        Self.publishHeadlines(cached.buckets)
-        return Card(provider: name, rows: Self.rows(from: cached.buckets),
-                    badge: Badge(text: "as of \(Format.ago(cached.fetchedAt))", kind: .gray))
+        // (b) a live RPC answered but parsed to zero buckets — a server-side
+        //     shape change must surface, not masquerade as days-old cache.
+        if rpcSucceeded {
+            TitleValues.clear(provider: .antigravity)
+            return Card(provider: name, rows: [], error: "agy responded without quota data")
+        }
+        // (c) nothing is listening — the original "not running" + cache replay.
+        return Self.cachedCard(error: "agy not running")
     }
 }
