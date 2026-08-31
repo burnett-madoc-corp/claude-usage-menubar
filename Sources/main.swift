@@ -263,6 +263,16 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// silently undo the drifting tier a moment after a poll chose it.
     private var usageMoved = false
     private var consecutiveRateLimits = 0
+    /// When Claude's usage API rate-limited, only Claude's next attempt is
+    /// pushed out — the shared poll timer keeps ticking for agy/Codex/
+    /// OpenRouter, whose endpoints pay no price for Anthropic's 429s. A
+    /// backoff previously doubled the *shared* timer, which pinned the whole
+    /// app to one poll per hour while four agy processes went unwatched.
+    private var claudeNextPollAt: Date = .distantPast
+    /// Cheap local rescan (no network) on its own schedule: the provider
+    /// poll's quiet tier can legally be an hour away, but a newly-started agy
+    /// session must flip the ladder back to the active tier within a minute.
+    private var sessionsScanTimer: Timer?
 
     /// The settings window's text fields would not accept ⌘V.
     ///
@@ -337,6 +347,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         refresh()
         refreshSessions()
         scheduleTimer()
+        scheduleSessionRescan()
 
         Prefs.onChange = { [weak self] in
             Task { @MainActor in self?.handlePrefsChanged() }
@@ -358,8 +369,10 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
             // poll, so the first retune() after launch would otherwise decide
             // the cadence while `sessions` was still empty — parking an
             // actively-working machine in the hourly tier until the next poll,
-            // an hour away. Re-pick whenever the session set lands.
-            self.retune()
+            // an hour away. Re-pick whenever the session set lands — but a
+            // rescan may only SHORTEN the cadence (see retune(canLengthen:)),
+            // since it fires between polls and must not restart their countdown.
+            self.retune(canLengthen: false)
         }
     }
 
@@ -367,12 +380,25 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// mutable interval, and this keeps .common run-loop mode registration
     /// (needed so the timer keeps firing while a menu's modal tracking loop
     /// is open) in exactly one place.
-    private func scheduleTimer(interval: TimeInterval? = nil) {
+    private func scheduleTimer(interval: TimeInterval? = nil, canLengthen: Bool = true) {
         let target = interval ?? baseInterval
         // Rescheduling restarts the countdown, so only do it when the cadence
         // actually changed — otherwise a quiet-tier poll would keep pushing its
         // own next fire another hour out on every retune.
+        // A mid-cycle retune (from the 60s session rescan or the menu-open
+        // tick) must never LENGTHEN a poll already in flight: each
+        // reschedule restarts the countdown, so a flickering busy flag could
+        // postpone the next poll indefinitely. Those callers pass
+        // canLengthen: false and a live timer then only ever accepts a
+        // SHORTER interval. The post-poll retune passes canLengthen: true —
+        // it runs at the very start of a countdown, so slowing to the quiet
+        // tier there is the ladder working, not a postponement. And
+        // handlePrefsChanged opts out by resetting scheduledInterval = nil,
+        // because a lengthened interval there is the user's explicit choice.
         guard scheduledInterval != target || timer == nil else { return }
+        if !canLengthen, let current = scheduledInterval, timer != nil, target > current {
+            return
+        }
         scheduledInterval = target
         timer?.invalidate()
         let t = Timer.scheduledTimer(withTimeInterval: target, repeats: true) { [weak self] _ in
@@ -382,18 +408,44 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         timer = t
     }
 
+    /// Sessions-only rescan heartbeat. refreshSessions() is cheap and local
+    /// (ps + transcript mtimes, no network), so a fixed 60s cadence is
+    /// unaffected by the poll ladder's quiet tier: an app parked at the
+    /// hourly tier still notices a newly-started agy session within a
+    /// minute and retune() lifts it back to the active rate. The 2s
+    /// sessionsTick in menuWillOpen remains the finer-grained source while
+    /// the menu is actually open.
+    private func scheduleSessionRescan() {
+        sessionsScanTimer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshSessions() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        sessionsScanTimer = t
+    }
+
     /// Re-picks the cadence from what the last poll revealed, after every poll,
     /// so a session starting or the quota moving takes effect on the next
     /// interval rather than at some fixed re-evaluation point.
-    private func retune() {
+    ///
+    /// Claude 429s no longer participate: the shared timer exists to serve
+    /// every provider, and Anthropic's rate limit only throttles Claude itself
+    /// (via `claudeNextPollAt` inside refresh()). The tier ladder — active,
+    /// drifting, quiet — is the whole shared cadence.
+    ///
+    /// canLengthen: false is for callers between polls (the 60s session
+    /// rescan, the menu-open tick): they may shorten the wait because new
+    /// activity deserves a faster poll, but must not lengthen it — restarting
+    /// the countdown on every flicker of the busy flag is how a poll gets
+    /// postponed forever. canLengthen: true (after a poll) is the ordinary
+    /// tier transition, including slowing to quiet.
+    private func retune(canLengthen: Bool = true) {
         let tier = PollPolicy.tier(
             sessionsActive: PollPolicy.isActive(sessions, now: Date()),
             usageChanged: usageMoved
         )
-        scheduleTimer(interval: PollPolicy.backedOff(
-            PollPolicy.interval(base: baseInterval, tier: tier),
-            consecutiveRateLimits: consecutiveRateLimits
-        ))
+        scheduleTimer(interval: PollPolicy.interval(base: baseInterval, tier: tier),
+                      canLengthen: canLengthen)
     }
 
     /// Fires for any settings change (visibility or interval).
@@ -425,13 +477,42 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
 
     @objc func refresh() {
         Task { @MainActor in
-            let fresh = await Providers.loadAll()
+            // Claude's 429 backoff gates ONLY Claude: while it is being
+            // waited out, skip the provider entirely (no Keychain/token read,
+            // mirroring how a hidden OpenRouter skips its `security` call).
+            let claudeDeferred = Date() < claudeNextPollAt
+            var fresh = await Providers.loadAll(skipClaude: claudeDeferred)
+            // The skipped provider is simply absent from `fresh`, and merge()
+            // only maps over what it is handed — so the previous Claude card
+            // must be re-inserted (at index 0, the registry's first slot) to
+            // keep rendering with its existing stale/rows semantics. Only
+            // when Claude is still meant to be shown: hiding it mid-storm must
+            // take effect on the next poll, not be overridden by this replay.
+            if claudeDeferred, Providers.shouldPoll(id: .claude),
+               let old = cards.first(where: { $0.provider == ProviderID.claude.displayName }) {
+                fresh.insert(old, at: 0)
+            }
             // Read the rate-limit signal before merge(), which swaps a failed
             // card for the previous good rows and takes the flag with it.
-            consecutiveRateLimits = fresh.contains(where: \.rateLimited) ? consecutiveRateLimits + 1 : 0
+            // Only a real Claude poll may move the count — a deferred cycle
+            // says nothing about whether the endpoint has recovered.
+            var claudeRecovered = false
+            if !claudeDeferred,
+               fresh.contains(where: { $0.provider == ProviderID.claude.displayName }) {
+                if fresh.contains(where: \.rateLimited) {
+                    consecutiveRateLimits += 1
+                    claudeNextPollAt = Date().advanced(
+                        by: PollPolicy.backedOff(baseInterval,
+                                                 consecutiveRateLimits: consecutiveRateLimits))
+                } else {
+                    if consecutiveRateLimits > 0 { claudeRecovered = true }
+                    consecutiveRateLimits = 0
+                    claudeNextPollAt = .distantPast
+                }
+            }
             cards = Self.merge(new: fresh, previous: cards)
             let fingerprint = PollPolicy.usageFingerprint(cards)
-            usageMoved = lastUsageFingerprint.map { $0 != fingerprint } ?? false
+            usageMoved = (lastUsageFingerprint.map { $0 != fingerprint } ?? false) || claudeRecovered
             lastUsageFingerprint = fingerprint
             lastUpdated = Date()
             renderTitle()
@@ -938,8 +1019,7 @@ extension UsageMenuBar: NSMenuDelegate {
         rebuildMenu()
         if let updated = lastUpdated,
            PollPolicy.shouldRefreshOnOpen(age: Date().timeIntervalSince(updated),
-                                          base: baseInterval,
-                                          consecutiveRateLimits: consecutiveRateLimits) {
+                                          base: baseInterval) {
             refresh()
         }
         refreshSessions()
@@ -993,7 +1073,13 @@ enum Providers {
     /// (refresh(), applicationDidFinishLaunching) always calls the default,
     /// filtered form — a provider hidden from BOTH the dropdown and the
     /// title is not polled at all; one shown in either place is.
-    static func all(includeHidden: Bool = false) -> [Provider] {
+    ///
+    /// `skipClaude` implements the per-provider 429 backoff gate: while
+    /// Claude's usage endpoint is being waited out, the provider is excluded
+    /// outright — including ClaudeProvider.load()'s Keychain/token read —
+    /// the same way a fully hidden OpenRouter skips `Config.load()`. agy,
+    /// Codex and OpenRouter keep polling on the shared cadence.
+    static func all(includeHidden: Bool = false, skipClaude: Bool = false) -> [Provider] {
         // Config.load() shells out to `security` (see KeychainCLI.read) —
         // real cost, paid on every refresh. A user who hides OpenRouter from
         // both the dropdown and the title still had that subprocess run for
@@ -1001,20 +1087,22 @@ enum Providers {
         // Skip the read entirely when OpenRouter will not be shown.
         let openRouterVisible = includeHidden || shouldPoll(id: .openrouter)
         let openRouterKey = openRouterVisible ? Config.load().openRouterKey : nil
-        let providers: [Provider] = [
-            ClaudeProvider(),
-            CodexProvider(),
-            OpenRouterProvider(key: openRouterKey),
-            AntigravityProvider(),
-        ]
+        var providers: [any Provider] = []
+        if !skipClaude {
+            providers.append(ClaudeProvider())
+        }
+        providers.append(CodexProvider())
+        providers.append(OpenRouterProvider(key: openRouterKey))
+        providers.append(AntigravityProvider())
         if includeHidden { return providers }
         return providers.filter { shouldPoll(id: ProviderID(displayName: $0.name)) }
     }
 
     /// Fetch every provider concurrently but keep registry order in the menu,
-    /// so rows don't jump around between refreshes.
-    static func loadAll(includeHidden: Bool = false) async -> [Card] {
-        let providers = all(includeHidden: includeHidden)
+    /// so rows don't jump around between refreshes. `skipClaude` propagates
+    /// the per-provider backoff gate from refresh() (see `all`).
+    static func loadAll(includeHidden: Bool = false, skipClaude: Bool = false) async -> [Card] {
+        let providers = all(includeHidden: includeHidden, skipClaude: skipClaude)
         return await withTaskGroup(of: (Int, Card).self) { group in
             for (index, provider) in providers.enumerated() {
                 group.addTask { (index, await provider.load()) }
@@ -1065,6 +1153,7 @@ private final class FailingKeyStore: KeyStore, @unchecked Sendable {
 // this exact fixture builder so Compact and Detailed self-tests can never
 // silently diverge on what a given AgentSession fixture actually contains.
 func makeSession(
+    kind: AgentKind = .claude,
     label: String = "session",
     taskTitle: String? = nil,
     busy: Bool = false,
@@ -1078,7 +1167,7 @@ func makeSession(
     lastActivityAt: Date? = nil
 ) -> AgentSession {
     AgentSession(
-        kind: .claude, pid: 1, label: label, taskTitle: taskTitle,
+        kind: kind, pid: 1, label: label, taskTitle: taskTitle,
         cwd: "/Users/dev/\(label)", model: "claude-opus-5",
         busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, subagentTokens: nil,
         contextTokens: contextTokens, contextWindow: contextWindow, xFloorMultiple: xFloorMultiple,

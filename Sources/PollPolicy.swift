@@ -31,6 +31,13 @@ enum PollPolicy {
     /// and dropping to an hourly poll inside it would be wrong.
     static let activityWindow: TimeInterval = 600
 
+    /// agy spends long stretches reporting IDLE between cascades while quota
+    /// keeps burning, and `lastUserInputTime` routinely drifts past the 600s
+    /// generic window mid-task — which dropped a mid-turn agy machine to the
+    /// hourly tier. agy sessions get three times the patience before the
+    /// ladder is allowed to call them idle.
+    static let agyActivityWindow: TimeInterval = 1800
+
     static let driftingCap: TimeInterval = 600      // 10 minutes
     static let quietCap: TimeInterval = 3600        // 1 hour
     static let backoffCap: TimeInterval = 3600
@@ -45,7 +52,8 @@ enum PollPolicy {
             // Guard against a clock skew or a future-dated record making a
             // long-dead session look permanently active.
             let age = now.timeIntervalSince(last)
-            return age >= 0 && age <= activityWindow
+            let window = session.kind == .agy ? agyActivityWindow : activityWindow
+            return age >= 0 && age <= window
         }
     }
 
@@ -86,11 +94,11 @@ enum PollPolicy {
 
     /// Opening the menu is a strong statement of intent, so it may refresh
     /// ahead of an idle tier's schedule — but never faster than the active
-    /// rate, and never through an active backoff. Otherwise "open the menu to
-    /// see if it recovered" becomes the thing preventing recovery.
-    nonisolated static func shouldRefreshOnOpen(age: TimeInterval, base: TimeInterval,
-                                                consecutiveRateLimits: Int) -> Bool {
-        age > backedOff(base, consecutiveRateLimits: consecutiveRateLimits)
+    /// rate. (A Claude 429 storm no longer throttles this decision: backoff
+    /// is enforced per-provider via `claudeNextPollAt` in refresh(), where
+    /// agy/Codex/OpenRouter are free to refresh while Claude sits out.)
+    nonisolated static func shouldRefreshOnOpen(age: TimeInterval, base: TimeInterval) -> Bool {
+        age > base
     }
 
     /// What "the numbers moved" means, as a comparable value.
@@ -180,13 +188,16 @@ enum PollPolicySelfTests {
     private static func testRefreshOnOpen() {
         // Quiet tier, menu opened after 3 minutes: refresh, because the user
         // is looking at it and 3 min is past the 2 min active rate.
-        precondition(PollPolicy.shouldRefreshOnOpen(age: 180, base: 120, consecutiveRateLimits: 0))
+        precondition(PollPolicy.shouldRefreshOnOpen(age: 180, base: 120))
         // Opened again 30s later: do not.
-        precondition(!PollPolicy.shouldRefreshOnOpen(age: 30, base: 120, consecutiveRateLimits: 0))
-        // Mid-backoff, the same 3-minute-old data must not trigger a poll —
-        // otherwise opening the menu is what keeps the rate limit alive.
-        precondition(!PollPolicy.shouldRefreshOnOpen(age: 180, base: 120, consecutiveRateLimits: 2))
-        precondition(PollPolicy.shouldRefreshOnOpen(age: 600, base: 120, consecutiveRateLimits: 2))
+        precondition(!PollPolicy.shouldRefreshOnOpen(age: 30, base: 120))
+        // The active rate itself is the floor — exactly-at-base does not
+        // refresh, just past it does.
+        precondition(!PollPolicy.shouldRefreshOnOpen(age: 120, base: 120))
+        precondition(PollPolicy.shouldRefreshOnOpen(age: 121, base: 120))
+        // A slower configured base is respected: 3 minutes is still inside
+        // a 5-minute active rate.
+        precondition(!PollPolicy.shouldRefreshOnOpen(age: 180, base: 300))
     }
 
     private static func testFingerprint() {
@@ -237,5 +248,19 @@ enum PollPolicySelfTests {
 
         // One live session among idle ones is enough.
         precondition(PollPolicy.isActive([stale, never, justFinished], now: now))
+
+        // agy reports IDLE between cascades while quota still burns, so its
+        // window is deliberately 3× the generic one.
+        let agyMidTurn = makeSession(kind: .agy, busy: false,
+                                     lastActivityAt: now.addingTimeInterval(-PollPolicy.activityWindow - 1))
+        precondition(PollPolicy.isActive([agyMidTurn], now: now),
+                     "agy stays active past the 600s generic window")
+        let agyStale = makeSession(kind: .agy, busy: false,
+                                   lastActivityAt: now.addingTimeInterval(-PollPolicy.agyActivityWindow - 1))
+        precondition(!PollPolicy.isActive([agyStale], now: now))
+        // …and the longer window must not leak onto other kinds.
+        precondition(!PollPolicy.isActive([makeSession(kind: .codex, busy: false,
+                                                       lastActivityAt: agyMidTurn.lastActivityAt)],
+                                         now: now))
     }
 }
