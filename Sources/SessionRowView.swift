@@ -24,6 +24,7 @@ enum SessionGrid {
     static let bloatWidth: CGFloat = 44
     static let turnsWidth: CGFloat = 34
     static let inOutWidth: CGFloat = 72
+    static let spentWidth: CGFloat = 44
 
     static let rowHeight: CGFloat = 24
     static let headerHeight: CGFloat = 16
@@ -46,6 +47,7 @@ enum SessionGrid {
         var bloat: NSRect
         var turns: NSRect
         var inOut: NSRect
+        var spent: NSRect
 
         /// The no-usage state is the one cell content that cannot fit its own
         /// column: "starting — no usage yet" is wider than the 76pt context
@@ -73,7 +75,8 @@ enum SessionGrid {
 
     static func columns(width: CGFloat, y: CGFloat, height: CGFloat) -> Columns {
         let right = width - Panel.inset
-        let inOutX = right - inOutWidth
+        let spentX = right - spentWidth
+        let inOutX = spentX - Panel.columnGap - inOutWidth
         let turnsX = inOutX - Panel.columnGap - turnsWidth
         let bloatX = turnsX - Panel.columnGap - bloatWidth
         let contextX = bloatX - Panel.columnGap - contextWidth
@@ -88,7 +91,8 @@ enum SessionGrid {
             context: NSRect(x: contextX, y: y, width: contextWidth, height: height),
             bloat: NSRect(x: bloatX, y: y, width: bloatWidth, height: height),
             turns: NSRect(x: turnsX, y: y, width: turnsWidth, height: height),
-            inOut: NSRect(x: inOutX, y: y, width: inOutWidth, height: height)
+            inOut: NSRect(x: inOutX, y: y, width: inOutWidth, height: height),
+            spent: NSRect(x: spentX, y: y, width: spentWidth, height: height)
         )
     }
 }
@@ -207,7 +211,7 @@ enum DetailedSessionRow {
     /// so the header view and the accessibility label agree on the wording.
     nonisolated static let columnHeaders =
         (name: "SESSION", harness: "HARNESS", model: "MODEL", context: "CONTEXT",
-         bloat: "BLOAT", turns: "TURNS", inOut: "IN/OUT")
+         bloat: "BLOAT", turns: "TURNS", inOut: "IN/OUT", spent: "$ SPENT")
 }
 
 // MARK: - Column-header line
@@ -240,6 +244,8 @@ final class SessionHeaderView: NSView {
                   in: columns.headerCell(columns.turns), alignment: .right)
         Draw.text(headers.inOut, font: font, color: color,
                   in: columns.headerCell(columns.inOut), alignment: .right)
+        Draw.text(headers.spent, font: font, color: color,
+                  in: columns.headerCell(columns.spent), alignment: .right)
     }
 }
 
@@ -448,6 +454,7 @@ final class SessionRowView: NSView {
         drawBloat(in: columns.bloat, severity: severity)
         drawTurns(in: columns.turns, highlighted: highlighted)
         drawInOut(in: columns.inOut, highlighted: highlighted, secondary: secondary)
+        drawSpent(in: columns.spent, highlighted: highlighted, secondary: secondary)
 
         guard isExpanded else { return }
         let text = DetailedSessionRow.expandedText(for: session)
@@ -532,6 +539,21 @@ final class SessionRowView: NSView {
             (Display.inOutSeparator, font, secondary),
             (Format.tokens(session.outputTokens), font, outputColor),
         ], in: rect, alignment: .right)
+    }
+
+    private func drawSpent(in rect: NSRect, highlighted: Bool, secondary: NSColor) {
+        guard session.hasUsage else { return }
+        let text: String
+        if let spent = session.exactSpent {
+            text = String(format: "$%.3f", spent)
+        } else if session.kind != .pi {
+            // For now, only pi is fully implemented
+            text = "—"
+        } else {
+            text = "—"
+        }
+        let color = highlighted ? NSColor.selectedMenuItemTextColor : secondary
+        Draw.text(text, font: PanelFont.number(11), color: color, in: rect, alignment: .right)
     }
 }
 
@@ -737,7 +759,8 @@ enum DetailedSessionRowSelfTests {
         precondition(columns.context.maxX <= columns.bloat.minX)
         precondition(columns.bloat.maxX <= columns.turns.minX)
         precondition(columns.turns.maxX <= columns.inOut.minX)
-        precondition(columns.inOut.maxX == Panel.width - Panel.inset)
+        precondition(columns.inOut.maxX <= columns.spent.minX)
+        precondition(columns.spent.maxX == Panel.width - Panel.inset)
         precondition(columns.name.width > 0, "the flexible name column must survive the fixed ones")
 
         // The merged no-usage cell covers both columns it borrows, and only those.
@@ -754,6 +777,7 @@ enum DetailedSessionRowSelfTests {
             (DetailedSessionRow.columnHeaders.bloat, columns.bloat),
             (DetailedSessionRow.columnHeaders.turns, columns.turns),
             (DetailedSessionRow.columnHeaders.inOut, columns.inOut),
+            (DetailedSessionRow.columnHeaders.spent, columns.spent),
         ] {
             let header = columns.headerCell(cell)
             precondition(header.maxX == cell.maxX, "the header must stay aligned to its column's right edge")

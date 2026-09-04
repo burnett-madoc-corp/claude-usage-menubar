@@ -145,6 +145,19 @@ enum CwdLookup {
     }
 
     static func cwd(pid: pid_t) -> String? {
+        #if canImport(Darwin)
+        var vpi = proc_vnodepathinfo()
+        let size = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vpi, Int32(MemoryLayout<proc_vnodepathinfo>.size))
+        if size == MemoryLayout<proc_vnodepathinfo>.size {
+            let path = withUnsafeBytes(of: &vpi.pvi_cdir.vip_path) { bytes in
+                String(cString: bytes.bindMemory(to: CChar.self).baseAddress!)
+            }
+            if !path.isEmpty {
+                return path
+            }
+        }
+        #endif
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         task.arguments = ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]
@@ -479,7 +492,7 @@ enum CodexSessionScanner {
                     kind: .codex, pid: match.process.pid,
                     label: PathEncoding.label(cwd: match.process.cwd),
                     cwd: match.process.cwd, model: nil, busy: true,
-                    turns: 0, inputTokens: 0, outputTokens: 0,
+                    turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
                     subagentTokens: nil, contextTokens: nil, contextWindow: nil,
                     xFloorMultiple: nil, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil, lastCompactionPostCtx: nil,
@@ -504,7 +517,7 @@ enum CodexSessionScanner {
                 busy: true,
                 turns: 0,   // Codex has no per-turn/xFloor metric in v1 — see plan
                 inputTokens: acc.totalUsage?.input ?? 0,
-                outputTokens: acc.totalUsage?.output ?? 0,
+                outputTokens: acc.totalUsage?.output ?? 0, exactSpent: nil,
                 subagentTokens: nil,
                 // Pending is not zero: no token_count event yet (verified to
                 // persist even after a completed turn) must read as unknown,

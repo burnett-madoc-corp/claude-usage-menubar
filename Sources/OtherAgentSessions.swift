@@ -146,6 +146,12 @@ enum PiSessionFold {
         acc.rawInputTokens += input + cacheRead + cacheWrite
         acc.rawOutputTokens += output
         acc.turns += 1
+        
+        if let cost = usage.dict("cost"), let totalCost = (cost["total"] as? NSNumber)?.doubleValue {
+            let current = acc.exactSpent ?? 0.0
+            acc.exactSpent = current + totalCost
+        }
+
         if let total = usage.int64("totalTokens") { acc.contextTokens = total }
         if let model = message.string("model") { acc.lastModel = model }
         if let provider = message.string("provider") { acc.lastProvider = provider }
@@ -170,6 +176,7 @@ actor PiSessionReader {
 
         var rawInputTokens: Int64 = 0
         var rawOutputTokens: Int64 = 0
+        var exactSpent: Double? = nil
         var turns: Int = 0
         var contextTokens: Int64?
         var lastModel: String?
@@ -334,7 +341,7 @@ enum PiSessions {
                 result.append(AgentSession(
                     kind: .pi, pid: match.process.pid, label: label, taskTitle: nil,
                     cwd: match.process.cwd, model: nil, busy: true,
-                    turns: 0, inputTokens: 0, outputTokens: 0,
+                    turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
                     subagentTokens: nil, contextTokens: nil, contextWindow: nil,
                     xFloorMultiple: nil, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil, lastCompactionPostCtx: nil,
@@ -361,7 +368,7 @@ enum PiSessions {
                 busy: true,
                 turns: acc.turns,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens,
+                outputTokens: acc.rawOutputTokens, exactSpent: acc.exactSpent,
                 subagentTokens: nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
@@ -530,7 +537,7 @@ enum AgySessions {
                     busy: busy,
                     turns: acc?.turns ?? 0,
                     inputTokens: acc?.inputTokens ?? 0,
-                    outputTokens: acc?.outputTokens ?? 0,
+                    outputTokens: acc?.outputTokens ?? 0, exactSpent: nil,
                     subagentTokens: nil,
                     contextTokens: acc?.contextTokens,
                     contextWindow: acc?.contextWindow,
@@ -560,7 +567,7 @@ enum AgySessions {
                     label: PathEncoding.label(cwd: cwd),
                     taskTitle: prompt, cwd: cwd,
                     model: nil, busy: true,
-                    turns: 0, inputTokens: 0, outputTokens: 0,
+                    turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
                     subagentTokens: nil, contextTokens: nil, contextWindow: nil,
                     xFloorMultiple: nil, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil,
@@ -582,7 +589,7 @@ enum AgySessions {
             label: cwd.isEmpty ? "Agy" : PathEncoding.label(cwd: cwd),
             taskTitle: nil, cwd: cwd,
             model: nil, busy: true,
-            turns: 0, inputTokens: 0, outputTokens: 0,
+            turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
             subagentTokens: nil, contextTokens: nil, contextWindow: nil,
             xFloorMultiple: nil, compactionCount: 0,
             lastCompactionAt: nil, lastCompactionPreCtx: nil, lastCompactionPostCtx: nil,
@@ -871,6 +878,7 @@ enum PiAndAgySessionSelfTests {
         precondition(acc.turns == 2)
         precondition(acc.rawInputTokens == 5_614 + 47_168 + 790 + 46_400)
         precondition(acc.contextTokens == 790 + 3_061 + 46_400, "the newest usage total must win")
+        precondition(abs((acc.exactSpent ?? 0) - 0.002) < 0.0001, "exact spent must sum message costs")
     }
 
     private static func testPiFoldDedup() {
@@ -881,6 +889,7 @@ enum PiAndAgySessionSelfTests {
         PiSessionFold.fold(line: dup, into: &acc)
         precondition(acc.turns == 1, "repeated message ids (streaming retries) must dedup to one turn")
         precondition(acc.rawInputTokens == 2 + 47_168)
+        precondition(abs((acc.exactSpent ?? 0) - 0.001) < 0.0001, "deduped turns must not double-count cost")
     }
 
     private static func testPiMatcher() {

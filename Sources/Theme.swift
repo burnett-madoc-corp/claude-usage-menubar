@@ -11,9 +11,10 @@ enum Panel {
     /// Sized so the session-name column lands at ~19 characters — enough for a
     /// task title to say what the task is, without the panel sprawling. Every
     /// other column is fixed (the HARNES column added ~52pt for agent-kind
-    /// labels across four CLIs), so the name column is exactly what this
-    /// width gives it; `testNameColumnBudget` pins the resulting band.
-    static let width: CGFloat = 620
+    /// labels across four CLIs, the $ SPENT column added ~52pt for session spend),
+    /// so the name column is exactly what this width gives it; `testNameColumnBudget`
+    /// pins the resulting band.
+    static let width: CGFloat = 672
     /// Left/right text margin. Intra-quota dividers are inset by this much on
     /// each side; the dividers before Sessions and before the footer are
     /// NSMenu's own full-width separators.

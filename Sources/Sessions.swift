@@ -282,6 +282,7 @@ struct AgentSession: Sendable {
     var turns: Int
     var inputTokens: Int64
     var outputTokens: Int64
+    var exactSpent: Double? = nil
     var subagentTokens: Int64?
     var contextTokens: Int64?
     var contextWindow: Int64?
@@ -716,7 +717,7 @@ enum SessionScanner {
                                         processStopped: processByPid[registry.pid]?.isStopped ?? false),
                 turns: acc.turnCosts.count,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens,
+                outputTokens: acc.rawOutputTokens, exactSpent: nil,
                 subagentTokens: acc.hasSubagentTokens ? acc.subagentTokens : nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
