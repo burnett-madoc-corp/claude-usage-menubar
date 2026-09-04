@@ -878,6 +878,7 @@ enum PiAndAgySessionSelfTests {
         precondition(acc.turns == 2)
         precondition(acc.rawInputTokens == 5_614 + 47_168 + 790 + 46_400)
         precondition(acc.contextTokens == 790 + 3_061 + 46_400, "the newest usage total must win")
+        precondition(abs((acc.exactSpent ?? 0) - 0.002) < 0.0001, "exact spent must sum message costs")
     }
 
     private static func testPiFoldDedup() {
@@ -888,6 +889,7 @@ enum PiAndAgySessionSelfTests {
         PiSessionFold.fold(line: dup, into: &acc)
         precondition(acc.turns == 1, "repeated message ids (streaming retries) must dedup to one turn")
         precondition(acc.rawInputTokens == 2 + 47_168)
+        precondition(abs((acc.exactSpent ?? 0) - 0.001) < 0.0001, "deduped turns must not double-count cost")
     }
 
     private static func testPiMatcher() {
@@ -1026,7 +1028,7 @@ enum PiAndAgySessionSelfTests {
             var calls = 0
             let acc = AgyRPC.TrajectoryAcc(model: "gemini-3.1-pro-low",
                                            contextTokens: 27_400, contextWindow: 128_000,
-                                           inputTokens: 35_399, outputTokens: 1_935, exactSpent: nil, turns: 2)
+                                           inputTokens: 35_399, outputTokens: 1_935, turns: 2)
             let fetcher: AgyRPC.Fetch = { _, _, _ in
                 calls += 1
                 return trajectoryFixture()

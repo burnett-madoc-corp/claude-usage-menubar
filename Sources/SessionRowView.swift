@@ -759,7 +759,8 @@ enum DetailedSessionRowSelfTests {
         precondition(columns.context.maxX <= columns.bloat.minX)
         precondition(columns.bloat.maxX <= columns.turns.minX)
         precondition(columns.turns.maxX <= columns.inOut.minX)
-        precondition(columns.inOut.maxX == Panel.width - Panel.inset)
+        precondition(columns.inOut.maxX <= columns.spent.minX)
+        precondition(columns.spent.maxX == Panel.width - Panel.inset)
         precondition(columns.name.width > 0, "the flexible name column must survive the fixed ones")
 
         // The merged no-usage cell covers both columns it borrows, and only those.
@@ -776,6 +777,7 @@ enum DetailedSessionRowSelfTests {
             (DetailedSessionRow.columnHeaders.bloat, columns.bloat),
             (DetailedSessionRow.columnHeaders.turns, columns.turns),
             (DetailedSessionRow.columnHeaders.inOut, columns.inOut),
+            (DetailedSessionRow.columnHeaders.spent, columns.spent),
         ] {
             let header = columns.headerCell(cell)
             precondition(header.maxX == cell.maxX, "the header must stay aligned to its column's right edge")
