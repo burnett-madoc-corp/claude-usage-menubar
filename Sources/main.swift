@@ -744,6 +744,29 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         if visible.overflow > 0 {
             addLine("  +\(visible.overflow) more", color: .tertiaryLabelColor, size: 10)
         }
+
+        if detailed {
+            var totalSpent = 0.0
+            var hasSpent = false
+            for session in visible.rows {
+                if let spent = session.exactSpent {
+                    totalSpent += spent
+                    hasSpent = true
+                }
+            }
+            if hasSpent {
+                let text = String(format: "$%.2f across %d sessions", totalSpent, visible.rows.count)
+                let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = .right
+                item.attributedTitle = NSAttributedString(string: text, attributes: [
+                    .font: NSFont.systemFont(ofSize: 10),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: paragraph
+                ])
+                menu.addItem(item)
+            }
+        }
     }
 
     /// Worst-first, with most-recent activity breaking ties. The tiebreak is
@@ -1169,7 +1192,7 @@ func makeSession(
     AgentSession(
         kind: kind, pid: 1, label: label, taskTitle: taskTitle,
         cwd: "/Users/dev/\(label)", model: "claude-opus-5",
-        busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, subagentTokens: nil,
+        busy: busy, turns: turns, inputTokens: 1_000_000, outputTokens: 45_000, exactSpent: nil, subagentTokens: nil,
         contextTokens: contextTokens, contextWindow: contextWindow, xFloorMultiple: xFloorMultiple,
         compactionCount: compactionCount, lastCompactionAt: nil, lastCompactionPreCtx: nil,
         lastCompactionPostCtx: nil, hasUsage: hasUsage, lastActivityAt: lastActivityAt, matched: matched

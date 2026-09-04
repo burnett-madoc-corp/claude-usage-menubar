@@ -146,6 +146,12 @@ enum PiSessionFold {
         acc.rawInputTokens += input + cacheRead + cacheWrite
         acc.rawOutputTokens += output
         acc.turns += 1
+        
+        if let cost = usage.dict("cost"), let totalCost = (cost["total"] as? NSNumber)?.doubleValue {
+            let current = acc.exactSpent ?? 0.0
+            acc.exactSpent = current + totalCost
+        }
+
         if let total = usage.int64("totalTokens") { acc.contextTokens = total }
         if let model = message.string("model") { acc.lastModel = model }
         if let provider = message.string("provider") { acc.lastProvider = provider }
@@ -170,6 +176,7 @@ actor PiSessionReader {
 
         var rawInputTokens: Int64 = 0
         var rawOutputTokens: Int64 = 0
+        var exactSpent: Double? = nil
         var turns: Int = 0
         var contextTokens: Int64?
         var lastModel: String?
@@ -334,7 +341,7 @@ enum PiSessions {
                 result.append(AgentSession(
                     kind: .pi, pid: match.process.pid, label: label, taskTitle: nil,
                     cwd: match.process.cwd, model: nil, busy: true,
-                    turns: 0, inputTokens: 0, outputTokens: 0,
+                    turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
                     subagentTokens: nil, contextTokens: nil, contextWindow: nil,
                     xFloorMultiple: nil, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil, lastCompactionPostCtx: nil,
@@ -361,7 +368,7 @@ enum PiSessions {
                 busy: true,
                 turns: acc.turns,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens,
+                outputTokens: acc.rawOutputTokens, exactSpent: acc.exactSpent,
                 subagentTokens: nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
@@ -530,7 +537,7 @@ enum AgySessions {
                     busy: busy,
                     turns: acc?.turns ?? 0,
                     inputTokens: acc?.inputTokens ?? 0,
-                    outputTokens: acc?.outputTokens ?? 0,
+                    outputTokens: acc?.outputTokens ?? 0, exactSpent: nil,
                     subagentTokens: nil,
                     contextTokens: acc?.contextTokens,
                     contextWindow: acc?.contextWindow,
@@ -560,7 +567,7 @@ enum AgySessions {
                     label: PathEncoding.label(cwd: cwd),
                     taskTitle: prompt, cwd: cwd,
                     model: nil, busy: true,
-                    turns: 0, inputTokens: 0, outputTokens: 0,
+                    turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
                     subagentTokens: nil, contextTokens: nil, contextWindow: nil,
                     xFloorMultiple: nil, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil,
@@ -582,7 +589,7 @@ enum AgySessions {
             label: cwd.isEmpty ? "Agy" : PathEncoding.label(cwd: cwd),
             taskTitle: nil, cwd: cwd,
             model: nil, busy: true,
-            turns: 0, inputTokens: 0, outputTokens: 0,
+            turns: 0, inputTokens: 0, outputTokens: 0, exactSpent: nil,
             subagentTokens: nil, contextTokens: nil, contextWindow: nil,
             xFloorMultiple: nil, compactionCount: 0,
             lastCompactionAt: nil, lastCompactionPreCtx: nil, lastCompactionPostCtx: nil,
@@ -1019,7 +1026,7 @@ enum PiAndAgySessionSelfTests {
             var calls = 0
             let acc = AgyRPC.TrajectoryAcc(model: "gemini-3.1-pro-low",
                                            contextTokens: 27_400, contextWindow: 128_000,
-                                           inputTokens: 35_399, outputTokens: 1_935, turns: 2)
+                                           inputTokens: 35_399, outputTokens: 1_935, exactSpent: nil, turns: 2)
             let fetcher: AgyRPC.Fetch = { _, _, _ in
                 calls += 1
                 return trajectoryFixture()
