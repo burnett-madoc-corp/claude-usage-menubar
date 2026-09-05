@@ -64,8 +64,12 @@ enum PiModelRegistry {
 // Live-process matching is start-time proximity (like Codex): the pi process's
 // `lstart` lines up with the header timestamp to the second (the filename
 // embeds the same instant, UTC). A live PID with no fresh session for its
-// cwd is a resumed session — shown with the newest same-cwd transcript as a
-// labelled best guess; a live PID with no session at all renders pending.
+// cwd is shown with the newest same-cwd transcript ONLY when that transcript
+// was modified after the process started — the fingerprint of `pi -c`/resume
+// appending to it. A transcript untouched since before the process launched
+// is a finished job in the same workspace and never matches: the row renders
+// pending rather than donating its token counts to a brand-new session (the
+// stale-session bug).
 
 /// A session file found on disk, with what the matcher needs.
 /// `Meta` (below) is the parsed first-line header.
@@ -90,8 +94,9 @@ struct PiProcessCandidate: Sendable, Equatable {
 struct PiMatch: Sendable {
     var process: PiProcessCandidate
     var session: PiLiveSession?
-    /// No session started within tolerance, but a same-cwd transcript exists
-    /// (most likely `pi -c` / resume) — shown with its data, labelled.
+    /// No session started within tolerance, but a same-cwd transcript was
+    /// modified after the process started (most likely `pi -c` / resume) —
+    /// shown with its data, labelled.
     var viaFallback: Bool = false
 }
 
@@ -145,6 +150,8 @@ enum PiSessionFold {
 
         acc.rawInputTokens += input + cacheRead + cacheWrite
         acc.rawOutputTokens += output
+        acc.rawCacheReadTokens += cacheRead
+        acc.rawCacheWriteTokens += cacheWrite
         acc.turns += 1
         
         if let cost = usage.dict("cost"), let totalCost = (cost["total"] as? NSNumber)?.doubleValue {
@@ -176,6 +183,10 @@ actor PiSessionReader {
 
         var rawInputTokens: Int64 = 0
         var rawOutputTokens: Int64 = 0
+        // The cache split of rawInputTokens — API pricing bills each at a
+        // different rate (see ModelPricing.swift).
+        var rawCacheReadTokens: Int64 = 0
+        var rawCacheWriteTokens: Int64 = 0
         var exactSpent: Double? = nil
         var turns: Int = 0
         var contextTokens: Int64?
@@ -278,7 +289,12 @@ actor PiSessionReader {
 enum PiSessionMatcher {
     /// Confident: same cwd AND session start within tolerance of process
     /// start. Otherwise the newest same-cwd transcript is a labelled best
-    /// guess; no same-cwd transcript at all renders pending.
+    /// guess — but ONLY if that transcript was modified after the process
+    /// started, the fingerprint of a live `pi -c`/resume appending to it.
+    /// A transcript whose last write predates the process is last week's
+    /// finished job in the same workspace: it must render pending, never
+    /// donate its token counts to a brand-new session (the "new pi session
+    /// inherits an old job's costs" bug).
     static func match(processes: [PiProcessCandidate],
                       sessions: [PiLiveSession]) -> [PiMatch] {
         processes.map { process in
@@ -293,7 +309,11 @@ enum PiSessionMatcher {
             }) {
                 return PiMatch(process: process, session: closest)
             }
-            if let newest = sameCwd.max(by: { $0.modified < $1.modified }) {
+            // Tolerance on the mtime side too: a file written in the same
+            // instant the process launched is plausibly this process's.
+            let freshnessFloor = process.startedLocal.addingTimeInterval(-PiSessionParsing.startTolerance)
+            if let newest = sameCwd.max(by: { $0.modified < $1.modified }),
+               newest.modified >= freshnessFloor {
                 return PiMatch(process: process, session: newest, viaFallback: true)
             }
             return PiMatch(process: process, session: nil)
@@ -316,7 +336,8 @@ enum PiSessions {
         processes: [ProcInfo] = ProcessScanner.run(),
         sessionsDir: URL = defaultSessionsDir,
         cwdLookup: (pid_t) -> String? = { CwdLookup.cwd(pid: $0) },
-        reader: PiSessionReader = .shared
+        reader: PiSessionReader = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
         // comm is exactly "pi" — a token-substring check would drag in pips
         // and scripts that merely contain the two letters in argv.
@@ -368,7 +389,19 @@ enum PiSessions {
                 busy: true,
                 turns: acc.turns,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens, exactSpent: acc.exactSpent,
+                outputTokens: acc.rawOutputTokens,
+                // pi's own `cost.total` IS the API price (pi bills each
+                // provider's per-token rates), so it wins when present;
+                // the OpenRouter estimate only fills providers that report
+                // no cost block.
+                exactSpent: acc.exactSpent,
+                estimatedSpent: acc.exactSpent ?? OpenRouterCatalog.estimate(
+                    model: acc.lastModel, catalog: pricing,
+                    input: max(0, acc.rawInputTokens - acc.rawCacheReadTokens - acc.rawCacheWriteTokens),
+                    output: acc.rawOutputTokens,
+                    cacheRead: acc.rawCacheReadTokens, cacheWrite: acc.rawCacheWriteTokens),
+                cacheReadTokens: acc.rawCacheReadTokens,
+                cacheWriteTokens: acc.rawCacheWriteTokens,
                 subagentTokens: nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
@@ -491,7 +524,8 @@ enum AgySessions {
         cwdLookup: (pid_t) -> String? = { CwdLookup.cwd(pid: $0) },
         lsofOutput: (pid_t) -> String? = { AgyProcessScanner.run(pid: $0) },
         fetcher: AgyRPC.Fetch = AgyRPC.defaultFetch,
-        cache: AgyTrajectoryCache = .shared
+        cache: AgyTrajectoryCache = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
         let live = processes.filter { $0.comm == "agy" }
         guard !live.isEmpty else { return [] }
@@ -527,17 +561,24 @@ enum AgySessions {
                 let cwd = summary.workspace ?? scan.cwd
                 let label = cwd.map(PathEncoding.label) ?? "Agy"
                 let busy = summary.status.map { !$0.contains("IDLE") } ?? true
+                let model = acc?.model
+                // agy reports no cache split, so everything prices at the
+                // fresh-input rate — a slight overestimate where the model
+                // serves cached prompts.
                 result.append(AgentSession(
                     kind: .agy,
                     pid: proc.pid,
                     label: label,
                     taskTitle: summary.title,
                     cwd: cwd ?? "",
-                    model: acc?.model,
+                    model: model,
                     busy: busy,
                     turns: acc?.turns ?? 0,
                     inputTokens: acc?.inputTokens ?? 0,
-                    outputTokens: acc?.outputTokens ?? 0, exactSpent: nil,
+                    outputTokens: acc?.outputTokens ?? 0,
+                    estimatedSpent: OpenRouterCatalog.estimate(
+                        model: model, catalog: pricing,
+                        input: acc?.inputTokens ?? 0, output: acc?.outputTokens ?? 0),
                     subagentTokens: nil,
                     contextTokens: acc?.contextTokens,
                     contextWindow: acc?.contextWindow,
@@ -925,6 +966,8 @@ enum PiAndAgySessionSelfTests {
         precondition(acc.turns == 1)
         precondition(acc.rawInputTokens == 5_614 + 47_168, "input must include cacheRead (cacheWrite is 0 here)")
         precondition(acc.rawOutputTokens == 833)
+        precondition(acc.rawCacheReadTokens == 47_168 && acc.rawCacheWriteTokens == 0,
+                     "the cache split must track rawInputTokens for API-cost pricing")
         precondition(acc.contextTokens == 5_614 + 833 + 47_168,
                      "context must be the usage total, mirroring Codex last_token_usage")
         precondition(acc.lastModel == "grok-4.6")
@@ -963,13 +1006,25 @@ enum PiAndAgySessionSelfTests {
                                startedAt: started.addingTimeInterval(4.9), modified: started)])
         precondition(conf.count == 1 && conf[0].session?.meta.id == "in" && !conf[0].viaFallback)
 
-        // Out of tolerance (resumed session) but same cwd — labelled fallback
-        // onto the newest same-cwd transcript, never dropped, never guessed wrong silently.
+        // Out of tolerance (resumed session) but same cwd AND the transcript
+        // was modified after the process started (a live `pi -c` appending
+        // to it) — labelled fallback onto that transcript, never dropped,
+        // never guessed wrong silently.
         let resumed = PiSessionMatcher.match(
             processes: [proc],
             sessions: [session(name: "old", cwd: "/Users/dev/proj",
-                               startedAt: started.addingTimeInterval(-3600), modified: started.addingTimeInterval(-10))])
+                               startedAt: started.addingTimeInterval(-3600), modified: started.addingTimeInterval(10))])
         precondition(resumed.count == 1 && resumed[0].session?.meta.id == "old" && resumed[0].viaFallback)
+
+        // Out of tolerance AND untouched since before the process started —
+        // last week's finished job in the same workspace. Must render pending,
+        // never donate its token counts to the brand-new session.
+        let stale = PiSessionMatcher.match(
+            processes: [proc],
+            sessions: [session(name: "stale", cwd: "/Users/dev/proj",
+                               startedAt: started.addingTimeInterval(-604_800), modified: started.addingTimeInterval(-604_700))])
+        precondition(stale.count == 1 && stale[0].session == nil && !stale[0].viaFallback,
+                     "a pre-process transcript must not be inherited by a new session")
 
         // No transcript for this cwd at all — pending.
         let pending = PiSessionMatcher.match(

@@ -283,6 +283,17 @@ struct AgentSession: Sendable {
     var inputTokens: Int64
     var outputTokens: Int64
     var exactSpent: Double? = nil
+    // API-equivalent estimate from OpenRouter's per-token prices (see
+    // ModelPricing.swift): what these tokens would have cost billed per
+    // token instead of inside a plan. nil when the model is not in the
+    // catalog — never a fabricated number.
+    var estimatedSpent: Double? = nil
+    // The cache components of inputTokens where the source reports them
+    // (Claude: cacheRead/cacheCreation; Codex: cached_input_tokens; pi:
+    // cacheRead/cacheWrite; agy reports neither). Fresh input is then
+    // inputTokens - cacheRead - cacheWrite. nil = source reports no split.
+    var cacheReadTokens: Int64? = nil
+    var cacheWriteTokens: Int64? = nil
     var subagentTokens: Int64?
     var contextTokens: Int64?
     var contextWindow: Int64?
@@ -340,6 +351,11 @@ actor TranscriptReader {
         var seenMessageIdOrder: [String] = []   // FIFO eviction order, parallel to the set above
         var rawInputTokens: Int64 = 0      // input+cacheRead+cacheCreation, incl. sidechains (they bill)
         var rawOutputTokens: Int64 = 0
+        // The cache split of rawInputTokens, kept separately because API
+        // pricing bills each at a different rate (see ModelPricing.swift).
+        // Both include sidechains, matching rawInputTokens's contract.
+        var rawCacheReadTokens: Int64 = 0
+        var rawCacheWriteTokens: Int64 = 0
         var subagentTokens: Int64 = 0
         var hasSubagentTokens: Bool = false
 
@@ -532,6 +548,8 @@ enum SessionScanner {
         // chain feeds turn counts, both xFloor windows, and contextPercent.
         acc.rawInputTokens += quantity
         acc.rawOutputTokens += output
+        acc.rawCacheReadTokens += cacheRead
+        acc.rawCacheWriteTokens += cacheCreation
 
         // Activity recency counts any usage record, sidechain included — a
         // subagent turn still means the file was touched just now.
@@ -676,7 +694,8 @@ enum SessionScanner {
         projectsDir: URL,
         userSettingsPath: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/settings.json"),
-        reader: TranscriptReader = .shared
+        reader: TranscriptReader = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
         guard let files = try? FileManager.default.contentsOfDirectory(at: mappingDir, includingPropertiesForKeys: nil)
         else { return [] }
@@ -717,7 +736,14 @@ enum SessionScanner {
                                         processStopped: processByPid[registry.pid]?.isStopped ?? false),
                 turns: acc.turnCosts.count,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens, exactSpent: nil,
+                outputTokens: acc.rawOutputTokens,
+                estimatedSpent: OpenRouterCatalog.estimate(
+                    model: acc.lastModel, catalog: pricing,
+                    input: max(0, acc.rawInputTokens - acc.rawCacheReadTokens - acc.rawCacheWriteTokens),
+                    output: acc.rawOutputTokens,
+                    cacheRead: acc.rawCacheReadTokens, cacheWrite: acc.rawCacheWriteTokens),
+                cacheReadTokens: acc.rawCacheReadTokens,
+                cacheWriteTokens: acc.rawCacheWriteTokens,
                 subagentTokens: acc.hasSubagentTokens ? acc.subagentTokens : nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
@@ -747,14 +773,18 @@ enum Sessions {
         // One ps pass feeds every source; the per-source scanners only add
         // the cheap per-PID lsof cwd lookups for the PIDs they care about.
         let processes = ProcessScanner.run()
+        // One OpenRouter catalog feeds every source's API-cost estimate —
+        // cache-backed, never blocking (see ModelPricing.swift).
+        let pricing = await ModelPricingStore.shared.catalog()
         async let claude = SessionScanner.liveSessions(
             processList: processes,
             mappingDir: home.appendingPathComponent(".claude/sessions"),
-            projectsDir: home.appendingPathComponent(".claude/projects")
+            projectsDir: home.appendingPathComponent(".claude/projects"),
+            pricing: pricing
         )
-        async let codex = CodexSessions.snapshot()
-        async let pi = PiSessions.snapshot(processes: processes)
-        async let agy = AgySessions.snapshot(processes: processes)
+        async let codex = CodexSessions.snapshot(pricing: pricing)
+        async let pi = PiSessions.snapshot(processes: processes, pricing: pricing)
+        async let agy = AgySessions.snapshot(processes: processes, pricing: pricing)
         return (await claude + (await codex) + (await pi) + (await agy)).sorted { $0.label < $1.label }
     }
 }

@@ -26,6 +26,7 @@ SRCS=(
   Sources/Sessions.swift
   Sources/CodexSessions.swift
   Sources/OtherAgentSessions.swift
+  Sources/ModelPricing.swift
   Sources/SettingsWindow.swift
   Sources/Theme.swift
   Sources/PollPolicy.swift

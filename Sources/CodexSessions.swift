@@ -337,7 +337,11 @@ actor CodexRolloutReader {
         var sessionContextWindow: Int64? // session_meta.payload.context_window fallback, when numeric
 
         var lastTokenCount: (total: Int64, window: Int64?)?
-        var totalUsage: (input: Int64, output: Int64)?
+        // OpenAI semantics: `input` is the TOTAL prompt bill including the
+        // cached subset; `cachedInput` is the cache-read part of it, and
+        // `cacheWriteInput` the cache-write part. Kept because API pricing
+        // bills each at a different rate (see ModelPricing.swift).
+        var totalUsage: (input: Int64, output: Int64, cachedInput: Int64, cacheWriteInput: Int64)?
         var hasTokenCountEvent: Bool = false
     }
 
@@ -464,7 +468,12 @@ enum CodexRolloutParsing {
                 acc.lastTokenCount = (total: total, window: info.int64("model_context_window"))
             }
             if let usage = info.dict("total_token_usage") {
-                acc.totalUsage = (input: usage.int64("input_tokens") ?? 0, output: usage.int64("output_tokens") ?? 0)
+                acc.totalUsage = (
+                    input: usage.int64("input_tokens") ?? 0,
+                    output: usage.int64("output_tokens") ?? 0,
+                    cachedInput: usage.int64("cached_input_tokens") ?? 0,
+                    cacheWriteInput: usage.int64("cache_write_input_tokens") ?? 0
+                )
             }
 
         default:
@@ -479,7 +488,8 @@ enum CodexSessionScanner {
     static func liveSessions(
         processes: [CodexProcess],
         threads: [CodexThread],
-        reader: CodexRolloutReader = .shared
+        reader: CodexRolloutReader = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
         var sessions: [AgentSession] = []
         var scannedPaths: Set<String> = []
@@ -508,16 +518,31 @@ enum CodexSessionScanner {
             if match.ambiguous { label += " (?)" }
             else if match.viaFallback { label += " (unmatched)" }
 
+            let model = acc.model ?? thread.model
+            let usage = acc.totalUsage
             sessions.append(AgentSession(
                 kind: .codex,
                 pid: match.process.pid,
                 label: label,
                 cwd: cwd,
-                model: acc.model ?? thread.model,
+                model: model,
                 busy: true,
                 turns: 0,   // Codex has no per-turn/xFloor metric in v1 — see plan
-                inputTokens: acc.totalUsage?.input ?? 0,
-                outputTokens: acc.totalUsage?.output ?? 0, exactSpent: nil,
+                inputTokens: usage?.input ?? 0,
+                outputTokens: usage?.output ?? 0,
+                estimatedSpent: usage.flatMap { usage in
+                    // OpenAI bills cached input at a fraction of the fresh
+                    // rate; input_tokens includes the cached subset, so
+                    // fresh = input - cached.
+                    OpenRouterCatalog.estimate(
+                        model: model, catalog: pricing,
+                        input: max(0, usage.input - usage.cachedInput - usage.cacheWriteInput),
+                        output: usage.output,
+                        cacheRead: usage.cachedInput,
+                        cacheWrite: usage.cacheWriteInput)
+                },
+                cacheReadTokens: usage.map { $0.cachedInput },
+                cacheWriteTokens: usage.map { $0.cacheWriteInput },
                 subagentTokens: nil,
                 // Pending is not zero: no token_count event yet (verified to
                 // persist even after a completed turn) must read as unknown,
@@ -541,14 +566,14 @@ enum CodexSessions {
     /// Any failure here (DB missing/locked/schema-drifted) degrades to "no
     /// codex sessions this cycle" — never blocks Claude session rendering,
     /// never crashes.
-    static func snapshot() async -> [AgentSession] {
+    static func snapshot(pricing: OpenRouterCatalog.Catalog = .init()) async -> [AgentSession] {
         let codexDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         guard let dbURL = CodexDB.newestStateDB(in: codexDir),
               let threads = CodexDB.threads(dbPath: dbURL)
         else { return [] }
         let processes = CodexProcessScanner.run()
         guard !processes.isEmpty else { return [] }
-        return await CodexSessionScanner.liveSessions(processes: processes, threads: threads)
+        return await CodexSessionScanner.liveSessions(processes: processes, threads: threads, pricing: pricing)
     }
 }
 
@@ -705,6 +730,8 @@ enum CodexSessionSelfTests {
         CodexRolloutParsing.fold(line: tokenCountLine(lastTotal: 1_000, window: 258_400, cumIn: 26_575_483, cumOut: 59_122), into: &acc)
         precondition(acc.totalUsage?.input == 26_575_483)
         precondition(acc.totalUsage?.output == 59_122)
+        precondition(acc.totalUsage?.cachedInput == 0 && acc.totalUsage?.cacheWriteInput == 0,
+                     "a rollout with no cache fields must read 0, not nil")
         // A second, newer event_msg must overwrite (newest wins), not sum.
         CodexRolloutParsing.fold(line: tokenCountLine(lastTotal: 2_000, window: 258_400, cumIn: 26_634_605, cumOut: 60_000), into: &acc)
         precondition(acc.totalUsage?.input == 26_634_605)
