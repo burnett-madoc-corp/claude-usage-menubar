@@ -543,15 +543,7 @@ final class SessionRowView: NSView {
 
     private func drawSpent(in rect: NSRect, highlighted: Bool, secondary: NSColor) {
         guard session.hasUsage else { return }
-        let text: String
-        if let spent = session.exactSpent {
-            text = String(format: "$%.3f", spent)
-        } else if session.kind != .pi {
-            // For now, only pi is fully implemented
-            text = "—"
-        } else {
-            text = "—"
-        }
+        let text = Display.spentCell(exact: session.exactSpent, estimated: session.estimatedSpent)
         let color = highlighted ? NSColor.selectedMenuItemTextColor : secondary
         Draw.text(text, font: PanelFont.number(11), color: color, in: rect, alignment: .right)
     }

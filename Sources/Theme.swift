@@ -199,6 +199,21 @@ enum Display {
 
     static let inOutSeparator = " / "
 
+    /// The $ SPENT cell: "$0.456" when the session's own harness reports an
+    /// exact per-provider cost (pi), "~$12.34" when it is the API-equivalent
+    /// estimate from OpenRouter's per-token prices (Claude/Codex/agy plans),
+    /// "—" when neither is known. The tilde is load-bearing: it is the only
+    /// thing telling the two numbers apart, and the estimate is exactly that.
+    /// Plain-text form used by self-tests.
+    nonisolated static func spentCell(exact: Double?, estimated: Double?) -> String {
+        if let exact { return String(format: "$%.3f", exact) }
+        if let estimated {
+            return estimated >= 100 ? String(format: "~$%.0f", estimated)
+                                    : String(format: "~$%.2f", estimated)
+        }
+        return "—"
+    }
+
     /// Trims a model id down to what actually distinguishes it in a 10pt cell:
     /// "claude-opus-5" -> "opus-5", "gpt-5.2-codex" unchanged. Drops a vendor
     /// prefix path, a leading "claude-", and a trailing -YYYYMMDD build stamp.
@@ -357,6 +372,17 @@ enum ThemeSelfTests {
     static func run() {
         testGradeThresholds()
         testDisplayComposition()
+        testSpentCell()
+    }
+
+    private static func testSpentCell() {
+        precondition(Display.spentCell(exact: 0.4561, estimated: nil) == "$0.456")
+        precondition(Display.spentCell(exact: nil, estimated: 12.341) == "~$12.34",
+                     "estimates carry the tilde — exact and estimated must never read the same")
+        precondition(Display.spentCell(exact: nil, estimated: 123.456) == "~$123")
+        precondition(Display.spentCell(exact: nil, estimated: nil) == "—")
+        precondition(Display.spentCell(exact: 0.5, estimated: 9.99) == "$0.500",
+                     "an exact cost always wins over the estimate")
     }
 
     private static func testGradeThresholds() {
