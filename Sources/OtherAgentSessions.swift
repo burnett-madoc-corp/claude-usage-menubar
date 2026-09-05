@@ -541,7 +541,7 @@ enum AgySessions {
                     subagentTokens: nil,
                     contextTokens: acc?.contextTokens,
                     contextWindow: acc?.contextWindow,
-                    xFloorMultiple: nil, compactionCount: 0,
+                    xFloorMultiple: acc?.xFloorMultiple, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil,
                     lastCompactionPostCtx: nil,
                     hasUsage: acc?.contextTokens != nil,
@@ -718,6 +718,11 @@ enum AgyRPC {
         var inputTokens: Int64 = 0
         var outputTokens: Int64 = 0
         var turns: Int = 0
+        var turnCosts: [Int64] = []
+
+        var xFloorMultiple: Double? {
+            SessionScanner.xFloor(turnCosts: turnCosts)
+        }
     }
 
     /// Pure parser for GetCascadeTrajectory. Fields verified live:
@@ -756,12 +761,17 @@ enum AgyRPC {
                 acc.outputTokens += output
                 lastUsage = (input, output)
 
+                var turnCost = input + output
                 if let start = chat["chatStartMetadata"] as? [String: Any],
                    let windowMeta = start["contextWindowMetadata"] as? [String: Any] {
                     acc.contextWindow = number(windowMeta["maxContextTokens"]) ?? acc.contextWindow
                     let estimated = number(windowMeta["estimatedTokensUsed"]) ?? 0
                     let current = max(estimated, lastUsage!.input + lastUsage!.output)
                     acc.contextTokens = max(acc.contextTokens ?? 0, current)
+                    turnCost = current
+                }
+                if turnCost > 0 {
+                    acc.turnCosts.append(turnCost)
                 }
             }
             if acc.contextTokens == nil, let lastUsage {
@@ -778,7 +788,53 @@ enum AgyRPC {
                 return planner["modelName"] as? String
             }.last
         }
+
+        if acc.contextWindow != nil || acc.contextTokens != nil {
+            acc.contextWindow = contextWindow(for: acc.model,
+                                              reported: acc.contextWindow,
+                                              observedTokens: acc.contextTokens)
+        }
         return acc
+    }
+
+    /// Resolves the context window for an agy session's model.
+    ///
+    /// The agy Connect RPC returns a placeholder 128,000 maxContextTokens in
+    /// contextWindowMetadata regardless of the model in use (including Gemini
+    /// 3.1 Pro). We override known model families with their actual context
+    /// limits: Gemini Pro / 3.1 gets 2,000,000, Gemini Flash gets 1,000,000,
+    /// Claude gets 200,000 (or 1,000,000 if suffixed -1m), and GPT-OSS / GPT-4o
+    /// gets 128,000. If observed tokens exceed the nominal window, the window
+    /// expands to fit, matching Claude's behavior.
+    static func contextWindow(for model: String?, reported: Int64? = nil, observedTokens: Int64? = nil) -> Int64? {
+        var window: Int64?
+        if let model = model?.lowercased() {
+            if model.contains("gemini") {
+                if model.contains("flash") {
+                    window = 1_000_000
+                } else if model.contains("pro") || model.contains("3.1") {
+                    window = 2_000_000
+                } else {
+                    window = 1_000_000
+                }
+            } else if model.contains("claude") {
+                window = model.contains("1m") ? 1_000_000 : 200_000
+            } else if model.contains("gpt-oss") || model.contains("gpt-4o") {
+                window = 128_000
+            } else if model.contains("codex") {
+                window = 200_000
+            }
+        }
+        if window == nil {
+            window = reported
+        }
+        if let reported, reported != 128_000, let current = window, reported > current {
+            window = reported
+        }
+        if let observed = observedTokens, let current = window, observed > current {
+            window = observed
+        }
+        return window
     }
 
     /// agy emits integers as bare ints in contextWindowMetadata but as
@@ -1001,15 +1057,38 @@ enum PiAndAgySessionSelfTests {
 
     private static func testAgyTrajectoryParse() {
         let acc = AgyRPC.parseTrajectory(data: trajectoryFixture())
-        precondition(acc.contextWindow == 128_000)
+        precondition(acc.contextWindow == 2_000_000,
+                     "gemini-3.1-pro-low must resolve to 2m context window, overriding reported 128k")
         // Context = max(newest start estimate, newest input+output):
         // 25217 vs 26000+1400 → the fresher, larger view wins.
         precondition(acc.contextTokens == 27_400)
         precondition(acc.inputTokens == 9_399 + 26_000, "usage totals sum every invocation")
         precondition(acc.outputTokens == 535 + 1_400)
         precondition(acc.turns == 2)
+        precondition(acc.turnCosts == [9_934, 27_400])
+        precondition(acc.xFloorMultiple == nil, "fewer than 5 turns must yield nil bloat")
         precondition(acc.model == "gemini-3.1-pro-low",
                      "the newest executor's planner modelName is the live model")
+
+        // Context window resolution rules
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1-pro-low", reported: 128_000) == 2_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1-pro-high", reported: 128_000) == 2_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1", reported: 128_000) == 2_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.8-flash-high", reported: 128_000) == 1_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3-flash", reported: 128_000) == 1_000_000)
+        precondition(AgyRPC.contextWindow(for: "claude-sonnet-4-6", reported: 128_000) == 200_000)
+        precondition(AgyRPC.contextWindow(for: "claude-opus-4-6-1m", reported: 128_000) == 1_000_000)
+        precondition(AgyRPC.contextWindow(for: "gpt-oss-120b-medium", reported: 128_000) == 128_000)
+        precondition(AgyRPC.contextWindow(for: "custom-model", reported: 500_000) == 500_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1-pro-low", reported: 128_000, observedTokens: 2_500_000) == 2_500_000)
+
+        // Trajectory with 5+ turns computes bloat (xFloorMultiple)
+        let bloatData = Data(#"{"trajectory":{"trajectoryId":"b","generatorMetadata":[{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}}],"executorMetadatas":[{"cascadeConfig":{"plannerConfig":{"modelName":"gemini-3.1-pro-high"}}}]}}"#.utf8)
+        let bloatAcc = AgyRPC.parseTrajectory(data: bloatData)
+        precondition(bloatAcc.turns == 10)
+        precondition(bloatAcc.turnCosts.count == 10)
+        precondition(bloatAcc.xFloorMultiple == 2.5, "bloat must compute live/baseline ratio")
+        precondition(bloatAcc.contextWindow == 2_000_000)
 
         // A trajectory with no generator metadata (fresh conversation) must
         // stay pending — never a fabricated 0% context.
@@ -1027,8 +1106,9 @@ enum PiAndAgySessionSelfTests {
             let cache = AgyTrajectoryCache()
             var calls = 0
             let acc = AgyRPC.TrajectoryAcc(model: "gemini-3.1-pro-low",
-                                           contextTokens: 27_400, contextWindow: 128_000,
-                                           inputTokens: 35_399, outputTokens: 1_935, turns: 2)
+                                           contextTokens: 27_400, contextWindow: 2_000_000,
+                                           inputTokens: 35_399, outputTokens: 1_935, turns: 2,
+                                           turnCosts: [9_934, 27_400])
             let fetcher: AgyRPC.Fetch = { _, _, _ in
                 calls += 1
                 return trajectoryFixture()
