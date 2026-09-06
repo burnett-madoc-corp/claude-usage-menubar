@@ -3,11 +3,7 @@ import Foundation
 import SQLite3
 
 // MARK: - JSON helpers
-//
-// Sessions.swift declares an equivalent extension, but `private` on a
-// top-level extension is file-scoped in Swift — it is not visible here even
-// though both files compile into the same target. Redeclared rather than
-// widening the other file's access, to keep this phase's diff isolated.
+// File-scoped JSON helper dictionary extensions declared locally.
 
 private extension Dictionary where Key == String, Value == Any {
     func int64(_ key: String) -> Int64? { (self[key] as? NSNumber)?.int64Value }
@@ -16,13 +12,7 @@ private extension Dictionary where Key == String, Value == Any {
 }
 
 // MARK: - state_*.sqlite discovery and read-only access
-//
-// Read-only, non-negotiable: `state_N.sqlite` is a live WAL-mode database
-// owned a running `codex` process. We open it with SQLITE_OPEN_READONLY
-// only, never touch -wal/-shm directly, and treat any open/prepare failure
-// (locked mid-checkpoint, missing table, schema drift after a codex
-// upgrade) as "codex sessions unavailable this cycle" rather than crashing
-// or blocking Claude session rendering.
+// Read-only access to live WAL database to prevent locks and handle schema drift gracefully.
 
 struct CodexThread: Sendable, Equatable {
     var id: String
@@ -40,9 +30,7 @@ struct CodexThread: Sendable, Equatable {
 enum CodexDB {
     private static let filenameRegex = try! NSRegularExpression(pattern: #"^state_(\d+)\.sqlite$"#)
 
-    /// The state DB filename is versioned across codex releases (verified
-    /// siblings: logs_2, goals_1, queue_1) — glob for the newest, never
-    /// hardcode a version number.
+    /// Locates the latest versioned state database file in directory.
     static func newestStateDB(in dir: URL) -> URL? {
         guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
         else { return nil }
@@ -60,9 +48,7 @@ enum CodexDB {
         return best?.url
     }
 
-    /// Only the columns this feature needs. A missing table or column
-    /// (schema drift) makes `sqlite3_prepare_v2` fail — surfaced as `nil`
-    /// ("unavailable"), not a crash.
+    /// Fetches active threads from the state database, returning nil on schema mismatch.
     static func threads(dbPath: URL) -> [CodexThread]? {
         var db: OpaquePointer?
         let rc = sqlite3_open_v2(dbPath.path, &db, SQLITE_OPEN_READONLY, nil)
@@ -114,12 +100,7 @@ enum CodexDB {
 }
 
 // MARK: - Live codex process discovery
-//
-// The fd-open approach is dead (rollouts are append-and-close, verified —
-// see the plan). A live codex runs as two processes: a `node` wrapper and
-// the real binary under `.../codex-darwin-arm64/.../codex`. Neither `ps`
-// nor the registry files Claude has exist for codex, so cwd comes from
-// `lsof` — bounded to the handful of live codex PIDs found.
+// Discovers live codex processes and resolves working directories via lsof.
 
 struct CodexProcess: Sendable, Equatable {
     var pid: pid_t
@@ -135,8 +116,7 @@ struct RawProcCandidate: Sendable, Equatable {
 }
 
 enum CwdLookup {
-    /// Pure parser for `lsof -a -p <pid> -d cwd -Fn` field output: a line
-    /// beginning `n` carries the path.
+    /// Parses cwd path from lsof output lines prefixed with 'n'.
     static func parse(lsofOutput: String) -> String? {
         for line in lsofOutput.split(separator: "\n") where line.hasPrefix("n") {
             return String(line.dropFirst())
@@ -172,9 +152,7 @@ enum CwdLookup {
 }
 
 enum CodexProcessScanner {
-    // pid, then a fixed 24-char `lstart` (ctime-style, day space-padded),
-    // then the full command (greedy final group — the real binary's path is
-    // long and the node wrapper's argv contains spaces).
+    // Matches pid, 24-character lstart timestamp, and full command.
     private static let lineRegex = try! NSRegularExpression(
         pattern: #"^\s*(\d+)\s+(\w{3}\s+\w{3}\s+[\d ]\d\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$"#
     )
@@ -197,17 +175,7 @@ enum CodexProcessScanner {
         return result
     }
 
-    /// Matches "codex" as the *executable*, not merely present anywhere in
-    /// argv — a bare substring check treats `vim ~/notes/codex.md` as a
-    /// Codex process and can render a phantom session for it. Checks the
-    /// first token (the direct-exec shape, including the real binary under
-    /// `codex-darwin-arm64/…/bin/codex`) and the last token (the `node
-    /// <script>` wrapper shape, where the interpreter is first and the
-    /// actual codex script path is last) against the executable's own last
-    /// path component: exactly "codex", or a "codex-" prefix for the
-    /// vendor per-arch binary names. A file merely named `codex.md` fails
-    /// both — its last path component is "codex.md", not "codex" and not
-    /// "codex-"-prefixed.
+    /// Checks whether the command executes a codex binary or wrapper rather than referencing a filename.
     static func isCodexCommand(_ command: String) -> Bool {
         let tokens = command.split(whereSeparator: \.isWhitespace)
         guard let first = tokens.first, let last = tokens.last else { return false }
@@ -221,9 +189,7 @@ enum CodexProcessScanner {
 
     static func isRealBinary(_ command: String) -> Bool { command.contains("codex-darwin-arm64") }
 
-    /// A live codex is two processes sharing the same start second and cwd
-    /// (the node wrapper's fork/exec of the real binary) — dedupe to one,
-    /// preferring the real binary's pid.
+    /// Deduplicates parent wrapper and child binary processes sharing start time and cwd.
     static func dedupe(_ processes: [CodexProcess]) -> [CodexProcess] {
         var seen: [String: CodexProcess] = [:]
         for p in processes {
@@ -237,10 +203,7 @@ enum CodexProcessScanner {
         return Array(seen.values)
     }
 
-    /// Real IO: `ps` for candidates, `lsof` for each candidate's cwd
-    /// (bounded — usually zero or one live codex). UNVERIFIED against a
-    /// live codex process on this machine (none was running while this was
-    /// built) — exercised only by injected fixtures in self-tests.
+    /// Scans running processes for codex candidates and resolves their working directories.
     static func run() -> [CodexProcess] {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -274,13 +237,9 @@ enum CodexMatcher {
     struct Match: Sendable {
         var process: CodexProcess
         var thread: CodexThread?
-        /// Two-or-more threads matched the same process within tolerance,
-        /// same cwd — genuinely ambiguous. Both are rendered, both flagged,
-        /// rather than silently guessing.
+        /// Indicates multiple threads matched the same process within time and cwd tolerance.
         var ambiguous: Bool = false
-        /// No thread matched within the time tolerance, but a non-archived
-        /// thread with the same cwd exists (most likely `codex resume`) —
-        /// shown with its data as a labelled best guess, not silently.
+        /// Indicates matching by fallback cwd when process start fell outside tolerance window.
         var viaFallback: Bool = false
     }
 
@@ -297,8 +256,7 @@ enum CodexMatcher {
             if withinTolerance.count == 1 {
                 results.append(Match(process: proc, thread: withinTolerance[0]))
             } else if withinTolerance.count > 1 {
-                // Tie-break by preferring larger updated_at_ms for ordering,
-                // but mark every candidate ambiguous rather than guessing.
+                // Prefer larger updated_at_ms while marking each candidate ambiguous.
                 let sorted = withinTolerance.sorted { ($0.updatedAtMs ?? 0) > ($1.updatedAtMs ?? 0) }
                 for thread in sorted {
                     results.append(Match(process: proc, thread: thread, ambiguous: true))
@@ -306,8 +264,7 @@ enum CodexMatcher {
             } else if let newest = sameCwd.sorted(by: { ($0.updatedAtMs ?? 0) > ($1.updatedAtMs ?? 0) }).first {
                 results.append(Match(process: proc, thread: newest, viaFallback: true))
             } else {
-                // No threads row at all for this cwd yet — lazy row
-                // creation (verified: no row before the first user turn).
+                // Thread row is absent until first user turn completes.
                 results.append(Match(process: proc, thread: nil))
             }
         }
@@ -316,13 +273,7 @@ enum CodexMatcher {
 }
 
 // MARK: - Incremental rollout reader
-//
-// Mirrors TranscriptReader's byte-offset/accumulator/shrink-discard design
-// (Sessions.swift) rather than sharing its type — the accumulated fields are
-// Codex-specific (token_count/session_meta/turn_context, not Claude's
-// usage/compaction shape) and Claude's reader must not change shape for this
-// phase. Rollouts run to ~5MB; re-scans while the menu is open fold only
-// appended bytes.
+// Incrementally reads appended rollout bytes to update accumulated session metrics.
 
 actor CodexRolloutReader {
     static let shared = CodexRolloutReader()
@@ -347,10 +298,7 @@ actor CodexRolloutReader {
 
     private var accumulators: [String: Acc] = [:]
 
-    /// Same unbounded-growth trap as TranscriptReader's, in a sibling file:
-    /// without this, every rollout ever scanned keeps its accumulator for the
-    /// life of the process, and this is a menu-bar app expected to run for
-    /// weeks. Called once per scan cycle with the paths still live.
+    /// Evicts accumulators for rollout paths that are no longer active.
     func evictAccumulators(keeping livePaths: Set<String>) {
         accumulators = accumulators.filter { livePaths.contains($0.key) }
     }
@@ -398,14 +346,7 @@ actor CodexRolloutReader {
             CodexRolloutParsing.fold(line: String(decoding: lineData, as: UTF8.self), into: &acc)
             searchStart = combined.index(after: nlIndex)
         }
-        // byteOffset tracks raw bytes actually read off disk, mirroring
-        // TranscriptReader's M3 fix (Sessions.swift): `size` is a stat taken
-        // *before* the read, so if the writer appends between the stat and
-        // `readToEnd()`, the handle reads past `size` to the real EOF and
-        // `newBytes.count` exceeds `size - acc.byteOffset`. Advancing by the
-        // actual byte count read (not the stale `size`) keeps this correct in
-        // that race and is a no-op in the (overwhelmingly common)
-        // non-racing case, where the two are equal.
+        // Advance offset by bytes actually read to avoid races with concurrent writes.
         acc.partialTail = Data(combined[searchStart...])
         acc.byteOffset += UInt64(newBytes.count)
 
@@ -417,11 +358,7 @@ actor CodexRolloutReader {
 // MARK: - Rollout line parsing
 
 enum CodexRolloutParsing {
-    /// Correction: the nickname lives one level deeper than the plan
-    /// documents — `payload.source.subagent.thread_spawn.agent_nickname` —
-    /// with a convenience duplicate at top-level `payload.agent_nickname`.
-    /// Verified live on this machine (both present, identical values); the
-    /// top-level one is simpler and preferred.
+    /// Extracts agent nickname from top-level payload or nested thread_spawn dictionary.
     static func subagentNickname(payload: [String: Any]) -> String? {
         if let nickname = payload.string("agent_nickname") { return nickname }
         if let nickname = payload.dict("source")?.dict("subagent")?.dict("thread_spawn")?.string("agent_nickname") {
@@ -430,12 +367,7 @@ enum CodexRolloutParsing {
         return nil
     }
 
-    /// Folds one rollout JSONL line into the running accumulator. Pure and
-    /// synchronous so self-tests can drive it directly with literal fixture
-    /// lines. `compacted` is a top-level record type (verified — NOT an
-    /// event_msg subtype as the plan implies) and is explicitly a no-op
-    /// here: Codex's own `token_count` self-corrects across a compaction,
-    /// so there is no Codex-side compaction metric in v1.
+    /// Folds a rollout JSONL line into the running accumulator.
     static func fold(line: String, into acc: inout CodexRolloutReader.Acc) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
@@ -448,11 +380,7 @@ enum CodexRolloutParsing {
         case "session_meta":
             guard let payload = obj.dict("payload") else { return }
             if let cwd = payload.string("cwd") { acc.cwd = cwd }
-            // Verified live on this machine: `context_window` here is an
-            // object (`{"window_id": "…"}`), not the numeric fallback the
-            // task's corrections describe — so this only ever fires if a
-            // future codex build changes the shape. Harmless either way:
-            // `.int64` returns nil on a non-numeric value, never crashes.
+            // Parse numeric context window fallback when present.
             if let window = payload.int64("context_window") { acc.sessionContextWindow = window }
             if let nickname = subagentNickname(payload: payload) { acc.agentNickname = nickname }
 
@@ -477,7 +405,7 @@ enum CodexRolloutParsing {
             }
 
         default:
-            return   // includes "compacted" — explicitly ignored, see doc comment
+            return
         }
     }
 }
@@ -495,9 +423,7 @@ enum CodexSessionScanner {
         var scannedPaths: Set<String> = []
         for match in CodexMatcher.match(processes: processes, threads: threads) {
             guard let thread = match.thread else {
-                // Live PID, no threads row yet — lazy row creation, verified
-                // to persist even after a completed turn. Must still
-                // render: unknown usage, never dropped, never 0%.
+                // Render session when PID is active even if thread row has not been created yet.
                 sessions.append(AgentSession(
                     kind: .codex, pid: match.process.pid,
                     label: PathEncoding.label(cwd: match.process.cwd),
@@ -527,13 +453,11 @@ enum CodexSessionScanner {
                 cwd: cwd,
                 model: model,
                 busy: true,
-                turns: 0,   // Codex has no per-turn/xFloor metric in v1 — see plan
+                turns: 0,
                 inputTokens: usage?.input ?? 0,
                 outputTokens: usage?.output ?? 0,
                 estimatedSpent: usage.flatMap { usage in
-                    // OpenAI bills cached input at a fraction of the fresh
-                    // rate; input_tokens includes the cached subset, so
-                    // fresh = input - cached.
+                    // OpenAI bills cached input at a fraction of fresh rate; deduct to rate-bill fresh tokens.
                     OpenRouterCatalog.estimate(
                         model: model, catalog: pricing,
                         input: max(0, usage.input - usage.cachedInput - usage.cacheWriteInput),
@@ -544,9 +468,7 @@ enum CodexSessionScanner {
                 cacheReadTokens: usage.map { $0.cachedInput },
                 cacheWriteTokens: usage.map { $0.cacheWriteInput },
                 subagentTokens: nil,
-                // Pending is not zero: no token_count event yet (verified to
-                // persist even after a completed turn) must read as unknown,
-                // never a fabricated 0%.
+                // Keep context pending when token_count event is missing to avoid showing 0%.
                 contextTokens: acc.hasTokenCountEvent ? acc.lastTokenCount?.total : nil,
                 contextWindow: acc.lastTokenCount?.window ?? acc.sessionContextWindow,
                 xFloorMultiple: nil,
@@ -563,9 +485,7 @@ enum CodexSessionScanner {
 // MARK: - Entry point for Sessions.swift
 
 enum CodexSessions {
-    /// Any failure here (DB missing/locked/schema-drifted) degrades to "no
-    /// codex sessions this cycle" — never blocks Claude session rendering,
-    /// never crashes.
+    /// Returns live Codex sessions or an empty array on DB failure.
     static func snapshot(pricing: OpenRouterCatalog.Catalog = .init()) async -> [AgentSession] {
         let codexDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         guard let dbURL = CodexDB.newestStateDB(in: codexDir),
@@ -739,9 +659,7 @@ enum CodexSessionSelfTests {
     }
 
     private static func testSubagentNicknameCorrectedNesting() {
-        // Corrected nesting: payload.source.subagent.thread_spawn.agent_nickname,
-        // with a top-level convenience duplicate at payload.agent_nickname —
-        // NOT payload.source.subagent.agent_nickname as originally documented.
+        // Verifies fallback from top-level agent_nickname to nested thread_spawn.agent_nickname.
         var acc = CodexRolloutReader.Acc()
         CodexRolloutParsing.fold(line: sessionMetaLine(nicknameTopLevel: "Nash"), into: &acc)
         precondition(acc.agentNickname == "Nash", "top-level payload.agent_nickname must be read")
@@ -757,9 +675,7 @@ enum CodexSessionSelfTests {
     }
 
     private static func testPendingVsZero() {
-        // Verified real state: a completed turn (task_complete) with no
-        // token_count event yet — tokens_used stays 0 in the DB too. Must
-        // render as unknown ("context —"), never a fabricated 0%.
+        // A completed turn without a token_count event remains pending.
         var acc = CodexRolloutReader.Acc()
         CodexRolloutParsing.fold(line: sessionMetaLine(), into: &acc)
         CodexRolloutParsing.fold(line: turnContextLine(model: "gpt-5.6-sol"), into: &acc)
@@ -770,9 +686,7 @@ enum CodexSessionSelfTests {
     }
 
     private static func testCompactedTopLevelIgnored() {
-        // Correction: `compacted` is a TOP-LEVEL record type, not an
-        // event_msg subtype — must not be mistaken for a token_count event
-        // or crash the fold.
+        // Ignores top-level compacted record type during event parsing.
         var acc = CodexRolloutReader.Acc()
         CodexRolloutParsing.fold(line: tokenCountLine(lastTotal: 5_000, window: 258_400, cumIn: 10_000, cumOut: 500), into: &acc)
         CodexRolloutParsing.fold(line: compactedLine(), into: &acc)
@@ -794,9 +708,7 @@ enum CodexSessionSelfTests {
         precondition(CodexProcessScanner.isCodexCommand(parsed[1].command))
         precondition(CodexProcessScanner.isRealBinary(parsed[1].command))
         precondition(!CodexProcessScanner.isCodexCommand(parsed[2].command), "an unrelated process must not match")
-        // Regression: a bare substring check matched this too — the file
-        // being edited merely contains "codex" in its name, and vim is not
-        // Codex.
+        // Command substrings in editor arguments must not match as Codex executables.
         precondition(!CodexProcessScanner.isCodexCommand(parsed[3].command),
                      "editing a file named codex.md must not be mistaken for a codex process")
     }
@@ -817,8 +729,7 @@ enum CodexSessionSelfTests {
         precondition(deduped.count == 1, "same start time + cwd must dedupe to one process")
         precondition(deduped[0].pid == 101, "the real binary must be preferred over the node wrapper")
 
-        // Distinct cwd or start time must NOT collapse into one — two
-        // genuinely separate live codex instances.
+        // Distinct cwd or start time preserves separate live processes.
         let other = CodexProcess(pid: 200, startedLocal: started.addingTimeInterval(120), cwd: "/Users/dev", isRealBinary: true)
         precondition(CodexProcessScanner.dedupe([wrapper, real, other]).count == 2)
     }
@@ -848,8 +759,7 @@ enum CodexSessionSelfTests {
         let started = Date()
         let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/dev", isRealBinary: true)
 
-        // 5.1s out of tolerance — a resumed session — but the cwd matches,
-        // so it must fall back to a labelled best guess, not pending.
+        // Resumed sessions outside time tolerance fall back to cwd matching.
         let resumed = thread(id: "resumed", cwd: "/Users/dev", createdAt: started.addingTimeInterval(-3600),
                               updatedAt: started.addingTimeInterval(-10))
         let matches = CodexMatcher.match(processes: [proc], threads: [resumed])
@@ -863,7 +773,7 @@ enum CodexSessionSelfTests {
         let started = Date()
         let proc = CodexProcess(pid: 1, startedLocal: started, cwd: "/Users/dev", isRealBinary: true)
 
-        // Two threads, same second, same cwd — genuinely ambiguous.
+        // Multiple threads matching cwd and timestamp are flagged as ambiguous.
         let a = thread(id: "a", cwd: "/Users/dev", createdAt: started.addingTimeInterval(1), updatedAt: started.addingTimeInterval(100))
         let b = thread(id: "b", cwd: "/Users/dev", createdAt: started.addingTimeInterval(-1), updatedAt: started.addingTimeInterval(50))
         let matches = CodexMatcher.match(processes: [proc], threads: [a, b])
@@ -874,7 +784,7 @@ enum CodexSessionSelfTests {
 
     private static func testMatchPendingNoThreadsRow() {
         let proc = CodexProcess(pid: 1, startedLocal: Date(), cwd: "/Users/dev/fresh-project", isRealBinary: true)
-        // No thread anywhere shares this cwd — lazy row creation, pre-first-turn.
+        // Unmatched cwd renders as pending when no thread row exists.
         let unrelated = thread(id: "x", cwd: "/Users/somewhere/else", createdAt: Date())
         let matches = CodexMatcher.match(processes: [proc], threads: [unrelated])
         precondition(matches.count == 1)
@@ -929,8 +839,7 @@ enum CodexSessionSelfTests {
         sem.wait()
     }
 
-    // MARK: end-to-end pending case (no self-test can exercise a live PID —
-    // this drives CodexSessionScanner.liveSessions with injected fixtures)
+    // MARK: end-to-end pending case
 
     private static func testLiveSessionsEndToEndPending() {
         let sem = DispatchSemaphore(value: 0)

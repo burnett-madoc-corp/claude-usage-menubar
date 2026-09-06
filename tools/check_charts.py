@@ -28,9 +28,7 @@ from pathlib import Path
 
 CHART_DIR = Path(__file__).resolve().parents[1] / "docs" / "charts"
 
-# Rough advance width of the mono face used by the charts, as a fraction of
-# font-size. Deliberately generous: a false positive costs a look, a false
-# negative ships a struck-through label.
+# Generous advance width ratio of monospace font to detect potential label collisions.
 ADVANCE = 0.62
 
 failures: list[str] = []
@@ -121,8 +119,7 @@ def check_file(path: Path) -> None:
         if right > vw + 0.5:
             fail(f"{path.name}: rect right edge {right:.0f} past viewBox {vw:.0f}")
 
-    # Text against text. A value label running into the column beside it is the
-    # same defect as a curve through a label, and just as invisible in a diff.
+    # Verify text labels do not overlap adjacent text elements.
     items = texts(src)
     for i, a in enumerate(items):
         for b in items[i + 1:]:
@@ -147,8 +144,7 @@ def check_cross_chart() -> None:
     def all_text(name):
         return " | ".join(t["s"] for t in texts(src[name]))
 
-    # The cumulative total at turn 100 appears in chart 02 (its last labelled
-    # dot) and chart 06 (the input bar). They must agree.
+    # Cumulative total at turn 100 in chart 02 must match input bar in chart 06.
     c02 = re.findall(r"([\d.]+M)", all_text("02-cumulative-input.svg"))
     c06 = re.findall(r"([\d.]+M)", all_text("06-output-vs-input.svg"))
     if c02 and c06 and c02[-1] != c06[0]:
@@ -157,8 +153,7 @@ def check_cross_chart() -> None:
             f"{c02[-1]} vs {c06[0]}"
         )
 
-    # The fixed floor appears in chart 04's reference line and chart 07's
-    # legend. They must agree.
+    # Fixed floor reference line in chart 04 must match legend in chart 07.
     f04 = number_after(src["04-input-per-turn-by-band.svg"], "floor ≈")
     f07 = number_after(src["07-input-composition-by-turn.svg"], "system + tools")
     if f04 and f07 and f04 != f07:

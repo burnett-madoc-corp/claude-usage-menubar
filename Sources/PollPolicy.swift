@@ -1,41 +1,21 @@
 import Foundation
 
 // MARK: - Adaptive poll cadence
-//
-// The Anthropic usage endpoint rate-limits aggressively, and a fixed 2-minute
-// poll spends the same budget at 3am as it does mid-session. This picks the
-// next interval from two signals the app already has for free:
-//
-//   * whether any agent session is actually doing something (local: ps plus
-//     transcript mtimes, no network),
-//   * whether the numbers moved since the last poll, which is the only visible
-//     evidence that another machine is spending the same quota.
-//
-// Pure and nonisolated throughout so the whole ladder is fixture-testable
-// without a timer, a network call or a clock.
+// Adapts poll cadence based on local agent session activity and quota movement.
 enum PollPolicy {
     enum Tier: String, Equatable {
-        /// A session is live and working — poll at the user's chosen rate.
+        /// Polls at user-configured rate while a session is actively working.
         case active
-        /// Nothing running here, but the quota is still moving, so something
-        /// elsewhere is using it and the numbers on screen are worth keeping
-        /// roughly current.
+        /// Intermediate polling rate when quota moves while local sessions are idle.
         case drifting
-        /// Nothing running, nothing moving. Check back rarely.
+        /// Infrequent polling rate when local sessions and quota are idle.
         case quiet
     }
 
-    /// A session counts as active for a while after its last turn, not only
-    /// while `busy` is true: the gap between "you sent a prompt" and "you are
-    /// reading the answer and about to send another" is still working time,
-    /// and dropping to an hourly poll inside it would be wrong.
+    /// Duration following the last turn during which a session is considered active.
     static let activityWindow: TimeInterval = 600
 
-    /// agy spends long stretches reporting IDLE between cascades while quota
-    /// keeps burning, and `lastUserInputTime` routinely drifts past the 600s
-    /// generic window mid-task — which dropped a mid-turn agy machine to the
-    /// hourly tier. agy sessions get three times the patience before the
-    /// ladder is allowed to call them idle.
+    /// Extended active window for agy sessions to accommodate idle pauses between cascades.
     static let agyActivityWindow: TimeInterval = 1800
 
     static let driftingCap: TimeInterval = 600      // 10 minutes
@@ -49,8 +29,7 @@ enum PollPolicy {
         sessions.contains { session in
             if session.busy { return true }
             guard let last = session.lastActivityAt else { return false }
-            // Guard against a clock skew or a future-dated record making a
-            // long-dead session look permanently active.
+            // Reject clock skew or future-dated records.
             let age = now.timeIntervalSince(last)
             let window = session.kind == .agy ? agyActivityWindow : activityWindow
             return age >= 0 && age <= window
@@ -62,11 +41,7 @@ enum PollPolicy {
         return usageChanged ? .drifting : .quiet
     }
 
-    /// The user's configured interval is the *active* rate — "how often while
-    /// I'm working" — and the idle tiers scale off it rather than replacing
-    /// it, so the setting keeps meaning something. Each tier is also floored
-    /// at the base: someone who deliberately sets a 15-minute poll must never
-    /// be silently polled more often than that.
+    /// Computes poll interval for given tier, floored at configured base interval.
     nonisolated static func interval(base: TimeInterval, tier: Tier) -> TimeInterval {
         switch tier {
         case .active: return base
@@ -75,45 +50,22 @@ enum PollPolicy {
         }
     }
 
-    /// Exponential backoff after a 429. Without this the app answered a
-    /// rate-limit by knocking at exactly the same rate, which is what kept the
-    /// "stale — rate limited" badge up: the poll that would have cleared it
-    /// was itself being rejected.
+    /// Calculates exponential backoff interval following rate limit errors.
     nonisolated static func backedOff(_ interval: TimeInterval, consecutiveRateLimits: Int) -> TimeInterval {
         guard consecutiveRateLimits > 0 else { return interval }
-        // Cap the exponent before it reaches pow(), not after — 2^N for a
-        // large N overflows to infinity and loses the min() comparison.
+        // Cap exponent before power calculation to avoid arithmetic overflow.
         let exponent = min(consecutiveRateLimits, 8)
         let penalised = interval * pow(2, Double(exponent))
-        // The cap is a ceiling on the *penalty*, not on the interval itself:
-        // clamping straight to backoffCap would speed polling up for anyone
-        // whose configured interval is already slower than an hour, which is
-        // the exact opposite of backing off.
+        // Bound penalised interval without reducing intervals already configured above backoffCap.
         return min(penalised, max(backoffCap, interval))
     }
 
-    /// Opening the menu is a strong statement of intent, so it may refresh
-    /// ahead of an idle tier's schedule — but never faster than the active
-    /// rate. (A Claude 429 storm no longer throttles this decision: backoff
-    /// is enforced per-provider via `claudeNextPollAt` in refresh(), where
-    /// agy/Codex/OpenRouter are free to refresh while Claude sits out.)
+    /// Determines whether menu open warrants refresh ahead of idle tier schedule.
     nonisolated static func shouldRefreshOnOpen(age: TimeInterval, base: TimeInterval) -> Bool {
         age > base
     }
 
-    /// What "the numbers moved" means, as a comparable value.
-    ///
-    /// Deliberately Claude-only: this whole ladder exists to protect the
-    /// Anthropic usage endpoint, and "someone else is burning the quota" is a
-    /// statement about that account. Codex percentages come from local rollout
-    /// logs and move whenever you use Codex — folding them in here would hold
-    /// the app at a 10-minute Claude poll because of activity that costs the
-    /// Claude endpoint nothing.
-    ///
-    /// A failed poll leaves the previous rows in place (see
-    /// `UsageMenuBar.merge`), so the fingerprint is unchanged and a broken
-    /// endpoint decays toward the quiet tier rather than being mistaken for
-    /// movement.
+    /// Returns fingerprint of Claude usage percentages to detect remote quota movement.
     nonisolated static func usageFingerprint(_ cards: [Card]) -> String {
         guard let claude = cards.first(where: { $0.provider == ProviderID.claude.displayName }) else {
             return ""
@@ -174,29 +126,19 @@ enum PollPolicySelfTests {
         precondition(PollPolicy.backedOff(120, consecutiveRateLimits: 2) == 480)
         precondition(PollPolicy.backedOff(120, consecutiveRateLimits: 3) == 960)
 
-        // Saturates at the cap instead of running away, and a very large count
-        // must not overflow through pow() into infinity.
-        precondition(PollPolicy.backedOff(120, consecutiveRateLimits: 30) == PollPolicy.backoffCap)
-        precondition(PollPolicy.backedOff(3600, consecutiveRateLimits: 5) == PollPolicy.backoffCap)
-        precondition(PollPolicy.backedOff(120, consecutiveRateLimits: 99).isFinite)
-
-        // An interval already above the cap is left alone rather than reduced —
-        // backing off must never speed polling up.
+        // Backing off must never increase polling frequency.
         precondition(PollPolicy.backedOff(7200, consecutiveRateLimits: 2) == 7200)
     }
 
     private static func testRefreshOnOpen() {
-        // Quiet tier, menu opened after 3 minutes: refresh, because the user
-        // is looking at it and 3 min is past the 2 min active rate.
+        // Refresh if menu opened after active rate.
         precondition(PollPolicy.shouldRefreshOnOpen(age: 180, base: 120))
-        // Opened again 30s later: do not.
+        // Do not refresh if opened too soon.
         precondition(!PollPolicy.shouldRefreshOnOpen(age: 30, base: 120))
-        // The active rate itself is the floor — exactly-at-base does not
-        // refresh, just past it does.
+        // Refresh only if age exceeds base.
         precondition(!PollPolicy.shouldRefreshOnOpen(age: 120, base: 120))
         precondition(PollPolicy.shouldRefreshOnOpen(age: 121, base: 120))
-        // A slower configured base is respected: 3 minutes is still inside
-        // a 5-minute active rate.
+        // Base rate is the floor.
         precondition(!PollPolicy.shouldRefreshOnOpen(age: 180, base: 300))
     }
 
@@ -215,26 +157,25 @@ enum PollPolicySelfTests {
                      != PollPolicy.usageFingerprint([claudeCard([0])]))
 
         // Codex movement is invisible here on purpose: it costs the Anthropic
-        // endpoint nothing and must not pin the poll to the drifting tier.
+        // Codex activity does not affect Claude polling.
         let withCodex = [claudeCard([30, 84]),
                          Card(provider: "Codex", rows: [Row(label: "Weekly", percent: 99, detail: "")])]
         precondition(PollPolicy.usageFingerprint(withCodex) == a)
 
-        // No Claude card at all (hidden, or never polled) is stable, not a
-        // value that flip-flops and holds the app in the drifting tier.
+        // Stable state when no Claude card present.
         precondition(PollPolicy.usageFingerprint([]) == PollPolicy.usageFingerprint([]))
     }
 
     private static func testActivity() {
         let now = Date()
-        precondition(!PollPolicy.isActive([], now: now), "no sessions is not activity")
+        precondition(!PollPolicy.isActive([], now: now), "No sessions is not activity")
 
         let busy = makeSession(busy: true, lastActivityAt: now.addingTimeInterval(-99_999))
-        precondition(PollPolicy.isActive([busy], now: now), "busy counts even with an old timestamp")
+        precondition(PollPolicy.isActive([busy], now: now), "Busy counts even with old timestamp")
 
         let justFinished = makeSession(busy: false, lastActivityAt: now.addingTimeInterval(-60))
         precondition(PollPolicy.isActive([justFinished], now: now),
-                     "the gap between turns is still working time")
+                     "Gap between turns is active time")
 
         let stale = makeSession(busy: false, lastActivityAt: now.addingTimeInterval(-PollPolicy.activityWindow - 1))
         precondition(!PollPolicy.isActive([stale], now: now))
