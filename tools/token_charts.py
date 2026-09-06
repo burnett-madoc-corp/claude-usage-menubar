@@ -45,10 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CHART_DIR = REPO_ROOT / "docs" / "charts"
 TRANSCRIPTS = "~/.claude/projects/*/*.jsonl"
 
-# One colour, one meaning -- across the whole set, not per chart.
-# Data categories are categorical hues; RED is reserved for limit lines and is
-# never a data category, so a reader carrying the legend between charts cannot
-# misread a bar as a severity grade.
+# Reserve red strictly for limit lines to avoid confusing data bars with severity.
 CARD = "#101014"
 TEXT = "#e8e8e8"
 MUTED = "#9a9aa2"
@@ -125,9 +122,7 @@ def nice_top(v: float) -> float:
     return v
 
 
-# --------------------------------------------------------------------------
-# measurement
-# --------------------------------------------------------------------------
+# Measurement
 
 def measure() -> list[dict]:
     """Return one dict per real session, with per-turn context and totals."""
@@ -211,11 +206,7 @@ def derive(sessions: list[dict]) -> dict:
             }
         )
 
-    # ONE cohort drives charts 01, 02, 03, 05, 06 and 07: sessions that reached
-    # 100 turns, measured at each turn index. Restricting to a single cohort is
-    # what stops two charts describing different populations of session while
-    # appearing to describe the same one -- the subtler form of the drift this
-    # script exists to prevent. Chart 04 is the deliberate exception and says so.
+    # Use a single 100-turn session cohort across charts 01, 02, 03, 05, 06, and 07 for consistency.
     cohort = [s for s in sessions if s["turns"] >= 100]
     med = lambda key, i: statistics.median(s[key][i] for s in cohort)
     ramp = [med("ctx", i) for i in range(100)]
@@ -223,10 +214,7 @@ def derive(sessions: list[dict]) -> dict:
     out_ramp = [med("out", i) for i in range(100)]
     cache_ramp = [med("cache_read", i) for i in range(100)]
 
-    # Cumulative is the median of each session's OWN running total, not the
-    # running total of the per-turn medians: medians do not sum, and the
-    # difference is exactly the kind of quiet arithmetic slip that put a 5M and
-    # a 7.4M claim about the same session into the same document.
+    # Cumulative is the median of per-session running totals because medians do not sum.
     ramp_cum = [
         statistics.median(sum(s["ctx"][: i + 1]) for s in cohort) for i in range(100)
     ]
@@ -234,8 +222,7 @@ def derive(sessions: list[dict]) -> dict:
         statistics.median(sum(s["out"][: i + 1]) for s in cohort) for i in range(100)
     ]
 
-    # Three real sessions for the panel mock, so the numbers it shows tally
-    # with the band chart instead of being invented plausible-looking ones.
+    # Select real session data to keep panel mock consistent with band chart.
     def xfloor(s):
         first = statistics.median(s["ctx"][:5])
         last = statistics.median(s["ctx"][-5:])
@@ -294,9 +281,7 @@ def split(d: dict, i: int) -> tuple[float, float, float]:
     return fixed, max(0.0, total - fixed - new), new
 
 
-# --------------------------------------------------------------------------
-# charts
-# --------------------------------------------------------------------------
+# Charts
 
 def chart_01(d) -> str:
     """Anatomy of one turn, at the measured mid-session size."""
@@ -317,9 +302,7 @@ def chart_01(d) -> str:
         body.append(rect(x, 110, w, 44, colour))
         x += w + 2
     body.append(text(x + 12, 138, f"{fmt_k(total)} in", size=12, fill=TEXT))
-    # Stacked, not laid out under the segments: the "new this turn" slice is
-    # ~1k of 123k and six pixels wide, so a label under it would either collide
-    # with its neighbour or point at nothing.
+    # Stack labels because narrow segment widths cause horizontal collisions.
     ly = 190
     for value, colour, label in parts + [(d["out"][49], OUTPUT, "output (not input — shown for scale)")]:
         body.append(rect(80, ly - 11, 14, 14, colour, rx=3))
@@ -350,8 +333,7 @@ def chart_02(d) -> str:
         body.append(text(sx(t), 350, str(t), anchor="middle"))
     body.append(text((x0 + x1) / 2, 370, "turns", anchor="middle"))
 
-    # The polyline IS the data -- every turn, no fit -- so a labelled point
-    # cannot sit off the line that annotates it.
+    # Annotate points directly on the un-fitted data polyline.
     path = " ".join(f"{sx(i + 1):.1f},{sy(v):.1f}" for i, v in enumerate(cum))
     body.append(
         f'<polyline points="{path}" fill="none" stroke="{HISTORY}" stroke-width="2"></polyline>'
@@ -361,10 +343,7 @@ def chart_02(d) -> str:
         body.append(
             f'<circle cx="{sx(t):.1f}" cy="{sy(v):.1f}" r="4" fill="{HISTORY}"></circle>'
         )
-        # Above-and-left of the dot: the curve rises left-to-right, so that
-        # quadrant is the one guaranteed clear of it. Enforced by
-        # tools/check_charts.py, which is how the original set's struck-through
-        # labels would have been caught.
+        # Position label above and left to stay clear of the rising curve.
         body.append(text(sx(t) - 10, sy(v) - 12, fmt_m(v), fill=TEXT, anchor="end"))
 
     k, per_doubling = growth_exponent(cum)
@@ -413,14 +392,12 @@ def chart_03(d) -> str:
              fill=LIMIT, anchor="end")
     )
     body.append(line(x0, sy(window * 0.8), x1, sy(window * 0.8), HISTORY, dash="3 4"))
-    # Left end, not right: the curve reaches this line near the right edge, so
-    # a right-anchored label here is exactly the struck-through case.
+    # Anchor label at left end to avoid intersection with the rising curve near the right edge.
     body.append(
         text(x0 + 8, sy(window * 0.8) - 8, "80% — auto-compact", fill=HISTORY)
     )
     body.append(text(x0 + 14, y0 - 8, "fixed floor: system prompt + tools", fill=FLOOR))
-    # Placed high and left where the band is tall; clearance is checked by
-    # tools/check_charts.py rather than by eye.
+    # Position label in the tall upper-left region of the band.
     body.append(text(x0 + 30, sy(window * 0.62), "history + tool-result bloat", fill=HISTORY))
     return svg(390, body)
 
@@ -431,12 +408,9 @@ def chart_04(d) -> str:
     floor = d["floor"]
     top = max(b["per_turn"] for b in bands)
     labels = [f"{fmt_k(b['per_turn'])} · {b['per_turn'] / floor:.1f}× floor" for b in bands]
-    # Carry n per band: 5-25 and 700+ rest on a single session each, and a bar
-    # that thin should not look as solid as one backed by sixteen.
+    # Display sample count n per band to indicate backing session volume.
     totals = [f"{fmt_m(b['total'])} · n={b['n']}" for b in bands]
-    # Size the bars from the widest label so the value text cannot run into the
-    # session-total column. Measuring what fits beats a width-per-character
-    # guess; 0.62em is the mono advance the checker also assumes.
+    # Size bars against the widest label to prevent value text overlapping adjacent columns.
     lab_w = max(len(s) for s in labels) * 0.62 * 12
     tot_w = max(len(s) for s in totals) * 0.62 * 12
     x0 = 230
@@ -483,9 +457,7 @@ def chart_05(d) -> str:
         body.append(rect(x, sy(read + fresh), bw, sy(read) - sy(read + fresh), NEW, rx=2))
         body.append(text(x + bw / 2, y0 + 20, str(i + 1), anchor="middle"))
     body.append(text((x0 + 810) / 2, y0 + 40, "turn", anchor="middle"))
-    # Turn 1 is a cold cache by definition, so quoting the range from it reads
-    # as "0% cached" rather than as the cold start it is. State the steady
-    # state and name the cold turn separately.
+    # Exclude cold-start turn 1 from the steady-state cache ratio range.
     shares = [r / (r + f) for r, f in cache]
     body.append(
         text(120, sy(top) + 14,
@@ -503,9 +475,7 @@ def chart_06(d) -> str:
     x0, span = 200, 600
     body = [
         text(32, 40, f"Output vs input, one {turns}-turn session", size=16, fill=TEXT, bold=True),
-        # Thinking tokens are billed as output but are not written to the
-        # transcript, so the recorded figure is a floor. Saying so on the chart
-        # keeps the multiple from reading as more precise than it is.
+        # Thinking tokens are absent from transcripts, so transcript output is a lower bound.
         text(32, 64, "output_tokens as recorded — extended thinking is not in the "
                      "transcript, so output is understated"),
     ]
@@ -634,9 +604,7 @@ def chart_09(d) -> str:
         text(32, 40, "Live sessions in the menu bar", size=16, fill=TEXT, bold=True),
         text(32, 64, "Every metric above, per running Claude Code session"),
     ]
-    # Explicit positions in the 860 viewBox, and a dense single-line row: the
-    # supplied mock laid its columns out on a wider imagined canvas, so IN/OUT
-    # ran 49px past the right edge and was clipped in the render.
+    # Explicit column coordinates prevent row content exceeding viewBox width.
     NAME_X, MODEL_X, BAR_X, BAR_W = 60, 292, 430, 150
     BLOAT_X, TURNS_X, IO_X = 652, 722, 828
     y = 108

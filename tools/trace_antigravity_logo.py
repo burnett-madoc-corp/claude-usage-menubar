@@ -22,21 +22,13 @@ import sys
 
 from PIL import Image
 
-# The mark is drawn with soft anti-aliased edges. Half-alpha is the midpoint
-# of that ramp and keeps the arch's stroke at its drawn weight; pushing it
-# lower fattens the glyph, higher eats the thin apex.
+# Half-alpha midpoint maintains stroke weight across anti-aliased edges.
 ALPHA_THRESHOLD = 128
 
-# The favicon is only 48px square, so tracing its pixel grid directly yields a
-# visibly stair-stepped outline. Upsampling the ALPHA channel first recovers
-# the true edge: anti-aliasing already encodes where the boundary really falls
-# between pixels, so a smooth resample followed by a threshold lands much
-# closer to the drawn curve than the raw grid does.
+# Upsample alpha channel to recover smooth contours before thresholding.
 SUPERSAMPLE = 4
 
-# Douglas-Peucker tolerance, in output (24-unit) coordinates. Large enough to
-# collapse the residual staircase, small enough to keep the flared feet and
-# the notch under the apex.
+# Douglas-Peucker tolerance in output coordinates to preserve corner details.
 SIMPLIFY_TOLERANCE = 0.12
 
 
@@ -84,9 +76,7 @@ def trace_contours(mask):
     for y in range(h - 1):
         for x in range(w - 1):
             here = mask[y][x]
-            # Walk boundaries counter-clockwise around ink so outer contours
-            # and holes wind oppositely, which is what makes the even-odd
-            # fill in the emitted path behave.
+            # Walk CCW around ink so opposite winding enables even-odd fill.
             if here != mask[y][x + 1]:
                 add((x + 1, y), (x + 1, y + 1)) if here else add((x + 1, y + 1), (x + 1, y))
             if here != mask[y + 1][x]:
@@ -156,8 +146,7 @@ def simplify(loop, tolerance):
     """
     if len(loop) < 4:
         return loop
-    # Split at the two extremes so the closed loop becomes two open chains
-    # neither of which can be collapsed to a single degenerate segment.
+    # Split into two open chains to avoid collapsing the closed loop.
     start = min(range(len(loop)), key=lambda i: (loop[i][1], loop[i][0]))
     rotated = loop[start:] + loop[:start]
     half = len(rotated) // 2

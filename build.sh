@@ -1,6 +1,5 @@
 #!/bin/bash
-# Builds ClaudeUsage.app — a menu bar app showing Claude 5-hour, weekly and
-# per-model (Fable) rate-limit usage.
+# Builds ClaudeUsage.app menu bar application.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -12,11 +11,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Resources/*-template.svg "$APP/Contents/Resources/"
 
-# One binary that runs on both CPU families. Building each slice with its own
-# swiftc invocation (rather than `-target x86_64-apple-macosx13.0 arm64-…`,
-# which swiftc does not accept) and stitching them together with lipo is the
-# same approach Xcode itself uses under the hood for a multi-arch product.
-# Set ARCHS=arm64 or ARCHS=x86_64 to compile a single slice (e.g. CodeQL CI).
+# Build universal slices separately with swiftc and combine with lipo.
 ARCHS="${ARCHS:-universal}"
 
 SRCS=(
@@ -79,12 +74,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
     <key>CFBundleName</key>            <string>ClaudeUsage</string>
     <key>CFBundleDisplayName</key>     <string>Claude Usage</string>
-    <!-- NOT local.claude-usage-menubar. ControlCenter's menu bar allow/deny
-         list is keyed by bundle id, a denial written against an id is
-         permanent, and nothing short of Reset Control Centre clears it. That
-         id was poisoned on a real machine by a launchd job that exec'd the
-         binary directly (see README). The id below is a clean one; the
-         open(1) launch in install.sh is what stops it being poisoned too. -->
+    <!-- ControlCenter menu bar allow/deny list keys permanent decisions by bundle id. -->
     <key>CFBundleIdentifier</key>      <string>local.claude-usage-menubar.app</string>
     <key>CFBundleExecutable</key>      <string>ClaudeUsage</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
@@ -97,11 +87,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc sign so the app has a signature at all; macOS is increasingly
-# unwilling to run an unsigned bundle. It deliberately does no more than that:
-# an ad-hoc signature's cdhash changes on every build, so it cannot be the
-# thing that keeps the Keychain quiet — that is why this app's own items go
-# through /usr/bin/security instead (see Sources/KeyStore.swift).
+# Ad-hoc sign bundle to satisfy macOS execution requirements.
 codesign --force --sign - "$APP" 2>/dev/null || echo "warning: ad-hoc signing failed (app still runs)"
 
 echo "Built $APP"

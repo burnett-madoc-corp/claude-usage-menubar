@@ -1,10 +1,6 @@
 name: CodeQL
 
-# Static vulnerability analysis of the Swift sources. CodeQL's Swift support
-# needs a real compile, and this app links AppKit, so this only runs on macOS.
-# Hosted macOS minutes are free for public repositories, which is the only
-# footing on which this can run at all -- see the job's `if` below. Weekly
-# rather than nightly because the Swift analysis costs a full build each time.
+# Weekly static vulnerability analysis requiring AppKit compilation on macOS.
 
 on:
   push:
@@ -12,8 +8,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Mondays, 04:17 UTC. Off the hour so it does not pile into the top-of-hour
-    # scheduling queue, which is when GitHub delays cron runs the longest.
+    # Scheduled off-hour to avoid queue congestion.
     - cron: "17 4 * * 1"
 
 concurrency:
@@ -26,11 +21,7 @@ permissions:
 jobs:
   analyze:
     name: analyze (swift)
-    # Hosted macOS runners are refused while this repo is private (the org's
-    # Actions quota is exhausted), so the job would fail in ~3s having analysed
-    # nothing. Skip it until the repo is public, at which point the minutes are
-    # free and it starts running on its own. This check is not required to
-    # merge, so skipping it does not gate anything.
+    # Run only on public repositories where hosted macOS runner minutes are permitted.
     if: ${{ github.event.repository.visibility == 'public' }}
     runs-on: macos-latest
     permissions:
@@ -45,8 +36,7 @@ jobs:
         uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: swift
-          # `autobuild` does not understand a bare `swiftc` invocation with no
-          # Package.swift or xcodeproj, so the build is driven explicitly.
+          # Bare swiftc project requires manual build mode instead of autobuild.
           build-mode: manual
 
       - name: Build
