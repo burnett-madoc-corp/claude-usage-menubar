@@ -454,8 +454,19 @@ enum CodexSessionScanner {
                 model: model,
                 busy: true,
                 turns: 0,
-                inputTokens: acc.totalUsage?.input ?? 0,
-                outputTokens: acc.totalUsage?.output ?? 0, exactSpent: nil,
+                inputTokens: usage?.input ?? 0,
+                outputTokens: usage?.output ?? 0,
+                estimatedSpent: usage.flatMap { usage in
+                    // OpenAI bills cached input at a fraction of fresh rate; deduct to rate-bill fresh tokens.
+                    OpenRouterCatalog.estimate(
+                        model: model, catalog: pricing,
+                        input: max(0, usage.input - usage.cachedInput - usage.cacheWriteInput),
+                        output: usage.output,
+                        cacheRead: usage.cachedInput,
+                        cacheWrite: usage.cacheWriteInput)
+                },
+                cacheReadTokens: usage.map { $0.cachedInput },
+                cacheWriteTokens: usage.map { $0.cacheWriteInput },
                 subagentTokens: nil,
                 // Keep context pending when token_count event is missing to avoid showing 0%.
                 contextTokens: acc.hasTokenCountEvent ? acc.lastTokenCount?.total : nil,
@@ -475,7 +486,7 @@ enum CodexSessionScanner {
 
 enum CodexSessions {
     /// Returns live Codex sessions or an empty array on DB failure.
-    static func snapshot() async -> [AgentSession] {
+    static func snapshot(pricing: OpenRouterCatalog.Catalog = .init()) async -> [AgentSession] {
         let codexDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         guard let dbURL = CodexDB.newestStateDB(in: codexDir),
               let threads = CodexDB.threads(dbPath: dbURL)
