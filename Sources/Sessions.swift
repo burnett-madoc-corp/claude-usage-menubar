@@ -167,18 +167,6 @@ enum PathEncoding {
         return matches.count == 1 ? matches[0] : primary
     }
 }
-        let primary = projectsDir.appendingPathComponent(encoded).appendingPathComponent("\(sessionId).jsonl")
-        guard !FileManager.default.fileExists(atPath: primary.path) else { return primary }
-
-        guard let dirs = try? FileManager.default.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)
-        else { return primary }
-        let matches = dirs.compactMap { dir -> URL? in
-            let candidate = dir.appendingPathComponent("\(sessionId).jsonl")
-            return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
-        }
-        return matches.count == 1 ? matches[0] : primary
-    }
-}
 
 // MARK: - Registry file (~/.claude/sessions/<pid>.json)
 
