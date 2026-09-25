@@ -62,7 +62,7 @@ paste the real output rather than describing it.
 Shared workflows live in [`burnett-madoc-corp/Claude-skills`](https://github.com/burnett-madoc-corp/Claude-skills)
 and load from `~/.claude/skills`. Reach for them before inventing a process:
 `raise-pr` (PR grammar, merge safety), `create-plan`, `ci-minute-optimizer`
-(runner choice, rulesets), `e2e-ship-and-deploy`, `task-plan-handoff`.
+(runner choice, rulesets), `e2e-ship-and-deploy`.
 
 **Durable plans do not live in this repo.** A plan spanning more than one
 session or more than one repository belongs in
