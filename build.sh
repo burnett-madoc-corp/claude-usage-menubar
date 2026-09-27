@@ -13,6 +13,9 @@ cp Resources/*-template.svg "$APP/Contents/Resources/"
 
 # Build universal slices separately with swiftc and combine with lipo.
 ARCHS="${ARCHS:-universal}"
+# Keep release optimization as the default; static-analysis builds can opt out
+# of optimizer cost without changing the source set CodeQL extracts.
+SWIFT_OPTIMIZATION="${SWIFT_OPTIMIZATION:--O}"
 
 SRCS=(
   Sources/Providers.swift
@@ -32,7 +35,7 @@ SRCS=(
 
 if [ "$ARCHS" = "arm64" ]; then
   echo "Compiling (arm64)…"
-  swiftc -O \
+  swiftc "$SWIFT_OPTIMIZATION" \
     -target arm64-apple-macosx13.0 \
     -framework AppKit \
     -framework Security \
@@ -40,7 +43,7 @@ if [ "$ARCHS" = "arm64" ]; then
     "${SRCS[@]}"
 elif [ "$ARCHS" = "x86_64" ]; then
   echo "Compiling (x86_64)…"
-  swiftc -O \
+  swiftc "$SWIFT_OPTIMIZATION" \
     -target x86_64-apple-macosx13.0 \
     -framework AppKit \
     -framework Security \
@@ -48,7 +51,7 @@ elif [ "$ARCHS" = "x86_64" ]; then
     "${SRCS[@]}"
 else
   echo "Compiling (arm64)…"
-  swiftc -O \
+  swiftc "$SWIFT_OPTIMIZATION" \
     -target arm64-apple-macosx13.0 \
     -framework AppKit \
     -framework Security \
@@ -56,7 +59,7 @@ else
     "${SRCS[@]}"
 
   echo "Compiling (x86_64)…"
-  swiftc -O \
+  swiftc "$SWIFT_OPTIMIZATION" \
     -target x86_64-apple-macosx13.0 \
     -framework AppKit \
     -framework Security \

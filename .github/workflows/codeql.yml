@@ -42,6 +42,8 @@ jobs:
       - name: Build
         env:
           ARCHS: arm64
+          # CodeQL extracts the same Swift sources without release optimizer cost.
+          SWIFT_OPTIMIZATION: -Onone
         run: ./build.sh
 
       - name: Perform CodeQL analysis
