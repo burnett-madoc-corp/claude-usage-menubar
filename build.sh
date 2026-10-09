@@ -40,6 +40,8 @@ if [ "$ARCHS" = "arm64" ]; then
     -target arm64-apple-macosx13.0 \
     -framework AppKit \
     -framework Security \
+    -driver-time-compilation \
+    -Xfrontend -debug-time-function-bodies \
     -o "$BIN" \
     "${SRCS[@]}"
 elif [ "$ARCHS" = "x86_64" ]; then
