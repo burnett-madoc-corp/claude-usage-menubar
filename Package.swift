@@ -9,7 +9,11 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ClaudeUsage",
-            path: "Sources"
+            path: "Sources",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("Security")
+            ]
         )
     ]
 )

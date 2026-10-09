@@ -37,42 +37,16 @@ SRCS=(
 
 if [ "$ARCHS" = "arm64" ]; then
   echo "Compiling (arm64)…"
-  swiftc -O \
-    -target arm64-apple-macosx13.0 \
-    -framework AppKit \
-    -framework Security \
-    -driver-time-compilation \
-    -Xfrontend -debug-time-function-bodies \
-    -o "$BIN" \
-    "${SRCS[@]}"
+  swift build -c release --arch arm64
+  cp .build/arm64-apple-macosx/release/ClaudeUsage "$BIN"
 elif [ "$ARCHS" = "x86_64" ]; then
   echo "Compiling (x86_64)…"
-  swiftc -O \
-    -target x86_64-apple-macosx13.0 \
-    -framework AppKit \
-    -framework Security \
-    -o "$BIN" \
-    "${SRCS[@]}"
+  swift build -c release --arch x86_64
+  cp .build/x86_64-apple-macosx/release/ClaudeUsage "$BIN"
 else
-  echo "Compiling (arm64)…"
-  swiftc -O \
-    -target arm64-apple-macosx13.0 \
-    -framework AppKit \
-    -framework Security \
-    -o "$BIN-arm64" \
-    "${SRCS[@]}"
-
-  echo "Compiling (x86_64)…"
-  swiftc -O \
-    -target x86_64-apple-macosx13.0 \
-    -framework AppKit \
-    -framework Security \
-    -o "$BIN-x86_64" \
-    "${SRCS[@]}"
-
-  echo "Combining into a universal binary…"
-  lipo -create -output "$BIN" "$BIN-arm64" "$BIN-x86_64"
-  rm -f "$BIN-arm64" "$BIN-x86_64"
+  echo "Compiling (universal)…"
+  swift build -c release --arch arm64 --arch x86_64
+  cp .build/apple/Products/Release/ClaudeUsage "$BIN"
 fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
