@@ -48,6 +48,7 @@ jobs:
           # `autobuild` does not understand a bare `swiftc` invocation with no
           # Package.swift or xcodeproj, so the build is driven explicitly.
           build-mode: manual
+          debug: true
 
       - name: Build
         env:
