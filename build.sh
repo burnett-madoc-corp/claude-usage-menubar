@@ -1,3 +1,4 @@
+export CODEQL_EXTRACTOR_SWIFT_LOG_LEVEL=debug
 #!/bin/bash
 # Builds ClaudeUsage.app — a menu bar app showing Claude 5-hour, weekly and
 # per-model (Fable) rate-limit usage.
