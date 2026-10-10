@@ -748,14 +748,23 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         if detailed {
             var totalSpent = 0.0
             var hasSpent = false
+            var hasEstimate = false
             for session in visible.rows {
                 if let spent = session.exactSpent {
                     totalSpent += spent
                     hasSpent = true
                 }
+                if let estimated = session.estimatedSpent {
+                    totalSpent += estimated
+                    hasSpent = true
+                    hasEstimate = true
+                }
             }
             if hasSpent {
-                let text = String(format: "$%.2f across %d sessions", totalSpent, visible.rows.count)
+                // The tilde propagates: a total mixing exact and estimated
+                // parts is itself an estimate.
+                let text = String(format: "%@$%.2f across %d sessions",
+                                  hasEstimate ? "~" : "", totalSpent, visible.rows.count)
                 let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.alignment = .right
@@ -1985,6 +1994,7 @@ private func runSelfTests() {
     // Settings checks touch AppKit views, so they need that stated.
     MainActor.assumeIsolated { SettingsWindowController.runSelfTests() }
     SessionSelfTests.run()
+    ModelPricingSelfTests.run()
     testCompactSessionRendering()
     DetailedSessionRowSelfTests.run()
     ThemeSelfTests.run()

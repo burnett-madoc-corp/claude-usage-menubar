@@ -62,12 +62,7 @@ def tracked_files() -> list[Path]:
     return [REPO_ROOT / line for line in out.splitlines() if line]
 
 
-# The encoding/CRLF/conflict-marker checks below decode every tracked file as
-# UTF-8, which is right for source and prose and meaningless for an image. The
-# repo carries one binary asset (the README screenshot), so those checks skip
-# by extension rather than by sniffing for NUL bytes -- an allowlist cannot be
-# fooled by a text file that happens to contain one, and a new binary type has
-# to be added here deliberately rather than silently escaping every check.
+# Skip binary files by extension to avoid decoding non-text assets as UTF-8.
 BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".icns"}
 
 

@@ -140,7 +140,6 @@ def validate(title: str) -> tuple[list[str], list[str], dict[str, object]]:
     if len(set(scopes)) != len(scopes):
         errors.append("duplicate scope tags")
 
-    # Summary checks.
     separator = title[len(match.group(1)) : len(title) - len(summary)]
     if summary and separator != " ":
         warnings.append("use exactly one space between the last `]` and the summary")
@@ -183,14 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit a JSON result")
     args = parser.parse_args(argv)
 
-    # PR_TITLE, when set, IS the title -- and always wins over argv, even
-    # over a flag argparse would otherwise have parsed. The workflow always
-    # exports it from `github.event.pull_request.title` (see
-    # pr-title-lint.yml), specifically so this script never has to trust
-    # argv's shape: an attacker who titles a PR `--list` (or `--json`, or
-    # any future flag) must not get it parsed as that flag and skip
-    # validation entirely -- it must be validated as the literal string it
-    # is, and rejected for not matching the grammar.
+    # PR_TITLE takes precedence over argv to avoid flag injection.
     env_title = os.environ.get("PR_TITLE")
 
     if env_title is not None:

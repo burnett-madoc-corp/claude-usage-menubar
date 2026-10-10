@@ -9,24 +9,12 @@ DEST="/Applications/ClaudeUsage.app"
 PLIST="$HOME/Library/LaunchAgents/local.claude-usage-menubar.plist"
 
 echo "Installing to ${DEST}..."
-# -x, not -f: an -f match is a substring of the full argv, so an editor or
-# debugger with this app's binary path open on its command line (e.g.
-# `lldb ClaudeUsage.app/Contents/MacOS/ClaudeUsage`) would match and get
-# killed too. -x matches only the process name itself.
-#
-# Stop the KeepAlive job BEFORE killing the app: launchd relaunches via
-# open(1) the instant the app dies, and that relaunch can load the OLD
-# binary before the ditto below finishes — leaving the new version on disk
-# while an old instance keeps rendering (observed live during an upgrade:
-# the menu kept showing the previous build's features until a manual
-# restart). Booting out first also means the open(1) after the ditto
-# genuinely launches fresh instead of activating a surviving old instance.
+# Match exact process name to avoid killing editor/debugger processes containing the path.
+# Stop KeepAlive before terminating app to prevent launchd from relaunching old binary during copy.
 launchctl bootout "gui/$UID/local.claude-usage-menubar" 2>/dev/null || true
 pkill -x ClaudeUsage 2>/dev/null || true
 sleep 1
-# ditto into place rather than `rm -rf` + `cp -R`. Deleting the bundle
-# destroys the app identity macOS has records against; ditto replaces the
-# contents while the bundle keeps existing at the same path.
+# Preserve bundle directory identity across upgrades using ditto.
 mkdir -p "$DEST"
 ditto build/ClaudeUsage.app "$DEST"
 
@@ -37,16 +25,7 @@ cat > "$PLIST" <<PLISTEOF
 <plist version="1.0">
 <dict>
     <key>Label</key>              <string>local.claude-usage-menubar</string>
-    <!-- Launch through open(1), NOT the raw executable path.
-         On macOS 26 a third-party status item is not a window the app draws:
-         it is a scene hosted by ControlCenter, allowed or denied per app
-         against a persisted list. A launchd job that execs a binary directly
-         gets an "osservice" identity, whose default verdict is DENY, and that
-         denial is then persisted against the bundle id — the menu bar item
-         silently never appears, while System Settings still shows the app
-         toggled on. Launching via open(1) gives the process a real
-         application identity, whose default verdict is allow.
-         -W makes open wait for the app to exit, so KeepAlive still works. -->
+    <!-- Launch via open(1) with -W so ControlCenter grants normal application menu bar status. -->
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/open</string>

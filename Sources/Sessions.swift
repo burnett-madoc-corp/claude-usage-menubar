@@ -11,26 +11,13 @@ private extension Dictionary where Key == String, Value == Any {
 }
 
 // MARK: - Process time parsing
-//
-// `ps -o lstart=` renders the machine's LOCAL time zone; the registry's
-// `procStart` string is UTC. On this machine (BST, UTC+1) the two differ by
-// exactly one hour for every live session — a naive string compare silently
-// discards every one of them. Parse both into `Date` with explicit,
-// deliberate time zones and compare instants.
 
 enum ProcessTime {
-    // M6: a fresh DateFormatter per `ps` line measured at ~58ms/refresh on
-    // real output (559 lines) — DateFormatter construction, not parsing, was
-    // the cost. Cached once: DateFormatter is thread-safe for use (though not
-    // mutation) on Apple platforms, and this actor-free enum only ever reads
-    // these two after init.
+    // Cached formatters avoiding repeated construction during process scans.
     private static let localFormatter = makeFormatter(timeZone: .current)
     private static let utcFormatter = makeFormatter(timeZone: TimeZone(identifier: "UTC")!)
 
-    /// Counts formatter construction — self-tests assert this stays at the
-    /// fixed cost of the two cached instances (plus whatever one-off zones
-    /// `format(_:timeZone:)` is exercised with) even after hundreds of parse
-    /// calls, guarding against a regression back to per-call allocation.
+    /// Formatter construction counter exposed for allocation regression self-tests.
     private(set) static var formatterAllocationCount = 0
 
     private static func makeFormatter(timeZone: TimeZone) -> DateFormatter {
@@ -43,9 +30,7 @@ enum ProcessTime {
         return f
     }
 
-    /// `ps lstart` pads a single-digit day with a leading space
-    /// ("Sat Aug  9 …"); collapse that down so the formatter's non-padded
-    /// `d` pattern lines up regardless of day width.
+    /// Normalizes space-padded single-digit days from ps lstart output.
     private static func normalize(_ raw: String) -> String {
         raw.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "  ", with: " ")
     }
@@ -58,12 +43,7 @@ enum ProcessTime {
         utcFormatter.date(from: normalize(raw))
     }
 
-    /// Inverse of the two parsers above — self-tests use this to build exact
-    /// fixture strings from a known instant instead of hand-writing
-    /// timestamps that could drift from the real `ps`/registry formats. Only
-    /// UTC/local are ever requested in practice, so those reuse the cached
-    /// instances; any other zone (self-test-only) builds a one-off rather
-    /// than growing the cache unboundedly.
+    /// Formats dates in ps/registry format for testing.
     static func format(_ date: Date, timeZone: TimeZone) -> String {
         if timeZone.identifier == utcFormatter.timeZone!.identifier { return utcFormatter.string(from: date) }
         if timeZone.identifier == localFormatter.timeZone!.identifier { return localFormatter.string(from: date) }
@@ -79,28 +59,20 @@ struct ProcInfo: Sendable, Equatable {
     var startedLocal: Date
     var comm: String
 
-    /// macOS `ps` state codes: the leading letter is the scheduler state and
-    /// `T` means stopped (SIGSTOP/SIGTSTP). Trailing flags (`+`, `s`, `<`, …)
-    /// carry no bearing on suspension.
+    /// True when the process scheduler state is stopped (SIGSTOP/SIGTSTP).
     var isStopped: Bool { state.hasPrefix("T") }
 
-    /// `Z` = zombie: the process table entry for an unreaped exited process.
-    /// `kill(pid, 0)` still succeeds against it and it keeps its original
-    /// `lstart`, so without this check it reads as a perfectly live session.
+    /// True when the process is a zombie (exited but unreaped).
     var isZombie: Bool { state.hasPrefix("Z") }
 }
 
 enum ProcessScanner {
-    // pid, then the state code, then a fixed 24-char `lstart` (ctime-style,
-    // day space-padded), then whatever's left as comm — which can itself
-    // contain spaces ("Claude Helper (Renderer)"), so it must be the final
-    // greedy group.
+    // Matches pid, state, space-padded lstart date, and command path/name.
     private static let lineRegex = try! NSRegularExpression(
         pattern: #"^\s*(\d+)\s+([A-Za-z][\w+<>]*)\s+(\w{3}\s+\w{3}\s+[\d ]\d\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$"#
     )
 
-    /// Pure parser for `ps -axo pid=,state=,lstart=,comm=` output — self-testable
-    /// without a subprocess.
+    /// Parses ps output into process info structs.
     static func parse(psOutput: String) -> [ProcInfo] {
         var result: [ProcInfo] = []
         for substring in psOutput.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -136,39 +108,23 @@ enum ProcessScanner {
 
 // MARK: - Liveness / suspension
 
-/// A stale registry file whose PID is dead, or whose claimed start time
-/// doesn't match the real process (PID reuse), is discarded rather than
-/// shown as a session.
+/// Validates process existence and matching start times to discard stale or reused PIDs.
 enum Liveness {
-    /// Registration lag observed on this machine's 5 live sessions: 2–11s
-    /// between the OS process start and the registry writing its own
-    /// `startedAt`. 20s gives headroom without coming close to plausible
-    /// PID-reuse gaps (minutes to days).
+    /// Tolerance accommodating delay between process launch and registry file creation.
     static let startedAtTolerance: TimeInterval = 20
-    /// `procStart` and `ps lstart` both describe the same OS-reported start
-    /// instant at 1s resolution — near-exact once time zones are normalized.
+    /// Tolerance comparing normalized procStart and ps lstart timestamps.
     static let procStartTolerance: TimeInterval = 5
 
     static func isAlive(pid: pid_t, startedAtMs: Int64?, procStart: String?, process: ProcInfo?) -> Bool {
         guard let process, process.pid == pid else { return false }
-        // A zombie still answers kill(pid, 0) and keeps its original lstart
-        // — it must never be read as a live session.
         guard !process.isZombie else { return false }
-        // ESRCH = no such process (dead / reused). EPERM = alive, owned by
-        // someone else — still alive for our purposes.
+        // Checks process existence via kill signal 0.
         guard kill(pid, 0) == 0 || errno == EPERM else { return false }
 
-        // M7: procStart and `ps lstart` both describe the same OS-reported
-        // start instant at 1s resolution — exact, once time zones are
-        // normalized (correction 1). startedAt lags the real process start
-        // by an observed 2-11s, so it's a strictly worse signal; it's only a
-        // fallback for the (currently theoretical) case where a registry
-        // entry lacks procStart. Every real registry file on this machine
-        // carries procStart, so this is the branch that actually executes.
+        // Compares normalized procStart first, falling back to startedAt epoch milliseconds.
         if let procStart, let utc = ProcessTime.parseUTC(procStart) {
             return abs(utc.timeIntervalSince(process.startedLocal)) <= procStartTolerance
         }
-        // Fallback: startedAt (epoch ms), unambiguous but imprecise (correction 2).
         if let startedAtMs {
             let started = Date(timeIntervalSince1970: Double(startedAtMs) / 1000)
             return abs(started.timeIntervalSince(process.startedLocal)) <= startedAtTolerance
@@ -177,21 +133,7 @@ enum Liveness {
     }
 }
 
-/// A SIGSTOPed `claude` stops updating its registry file. The plan's first
-/// line of defence was to treat a stale `statusUpdatedAt` as suspended, with
-/// a direct process-state check as the documented escalation "if that proves
-/// too coarse in practice".
-///
-/// It proved too coarse on the first real run: Claude Code rewrites the
-/// registry on status *transitions*, not on a heartbeat, so a session sitting
-/// in one long turn is byte-for-byte indistinguishable from a suspended one.
-/// A genuinely-busy session was demoted to idle after 25 minutes of a single
-/// turn — wrong exactly when the row is most worth looking at.
-///
-/// So the escalation is what ships: the `ps` scan already runs once per
-/// refresh, and adding its `state=` column costs nothing. Suspension is now
-/// read from the process itself (`T` = stopped) and the registry's `status`
-/// is trusted at face value regardless of age.
+/// Evaluates busy state using registry status and process stopped state.
 enum Suspension {
     static func isBusy(status: String?, processStopped: Bool) -> Bool {
         guard status == "busy" else { return false }
@@ -202,13 +144,7 @@ enum Suspension {
 // MARK: - cwd <-> project-directory encoding
 
 enum PathEncoding {
-    /// `/`, `.` AND `_` all map to `-` (verified against real
-    /// `~/.claude/projects` dirs — 6 of 19 on this machine are `_`-bearing
-    /// paths, e.g. `pytest_120/test_real_cli_denies_shell_com0`). Missing
-    /// `_` used to mean any underscored cwd never found its transcript and
-    /// rendered as "starting — no usage yet" for its entire life. Note the
-    /// resulting `--` wherever a path segment starts with a dot, e.g. a
-    /// `.ade` worktree.
+    /// Encodes path separators, dots, and underscores to dashes to match project directory names.
     static func encode(cwd: String) -> String {
         String(cwd.map { $0 == "/" || $0 == "." || $0 == "_" ? "-" : $0 })
     }
@@ -217,12 +153,7 @@ enum PathEncoding {
         (cwd as NSString).lastPathComponent
     }
 
-    /// The primary encoded path, verified to exist. If a future Claude Code
-    /// release changes the encoding again (or this mapping is still
-    /// incomplete for some character we haven't seen), degrade instead of
-    /// silently blanking the row: glob every project dir for this exact
-    /// sessionId and use it if — and only if — exactly one match turns up.
-    /// More than one match is genuinely ambiguous and not worth guessing at.
+    /// Resolves transcript path, falling back to directory search if primary encoded path is absent.
     static func resolveTranscriptPath(projectsDir: URL, encoded: String, sessionId: String) -> URL {
         let primary = projectsDir.appendingPathComponent(encoded).appendingPathComponent("\(sessionId).jsonl")
         guard !FileManager.default.fileExists(atPath: primary.path) else { return primary }
@@ -283,6 +214,17 @@ struct AgentSession: Sendable {
     var inputTokens: Int64
     var outputTokens: Int64
     var exactSpent: Double? = nil
+    // API-equivalent estimate from OpenRouter's per-token prices (see
+    // ModelPricing.swift): what these tokens would have cost billed per
+    // token instead of inside a plan. nil when the model is not in the
+    // catalog — never a fabricated number.
+    var estimatedSpent: Double? = nil
+    // The cache components of inputTokens where the source reports them
+    // (Claude: cacheRead/cacheCreation; Codex: cached_input_tokens; pi:
+    // cacheRead/cacheWrite; agy reports neither). Fresh input is then
+    // inputTokens - cacheRead - cacheWrite. nil = source reports no split.
+    var cacheReadTokens: Int64? = nil
+    var cacheWriteTokens: Int64? = nil
     var subagentTokens: Int64?
     var contextTokens: Int64?
     var contextWindow: Int64?
@@ -340,6 +282,11 @@ actor TranscriptReader {
         var seenMessageIdOrder: [String] = []   // FIFO eviction order, parallel to the set above
         var rawInputTokens: Int64 = 0      // input+cacheRead+cacheCreation, incl. sidechains (they bill)
         var rawOutputTokens: Int64 = 0
+        // The cache split of rawInputTokens, kept separately because API
+        // pricing bills each at a different rate (see ModelPricing.swift).
+        // Both include sidechains, matching rawInputTokens's contract.
+        var rawCacheReadTokens: Int64 = 0
+        var rawCacheWriteTokens: Int64 = 0
         var subagentTokens: Int64 = 0
         var hasSubagentTokens: Bool = false
 
@@ -532,6 +479,8 @@ enum SessionScanner {
         // chain feeds turn counts, both xFloor windows, and contextPercent.
         acc.rawInputTokens += quantity
         acc.rawOutputTokens += output
+        acc.rawCacheReadTokens += cacheRead
+        acc.rawCacheWriteTokens += cacheCreation
 
         // Activity recency counts any usage record, sidechain included — a
         // subagent turn still means the file was touched just now.
@@ -676,7 +625,8 @@ enum SessionScanner {
         projectsDir: URL,
         userSettingsPath: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/settings.json"),
-        reader: TranscriptReader = .shared
+        reader: TranscriptReader = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
         guard let files = try? FileManager.default.contentsOfDirectory(at: mappingDir, includingPropertiesForKeys: nil)
         else { return [] }
@@ -717,7 +667,14 @@ enum SessionScanner {
                                         processStopped: processByPid[registry.pid]?.isStopped ?? false),
                 turns: acc.turnCosts.count,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens, exactSpent: nil,
+                outputTokens: acc.rawOutputTokens,
+                estimatedSpent: OpenRouterCatalog.estimate(
+                    model: acc.lastModel, catalog: pricing,
+                    input: max(0, acc.rawInputTokens - acc.rawCacheReadTokens - acc.rawCacheWriteTokens),
+                    output: acc.rawOutputTokens,
+                    cacheRead: acc.rawCacheReadTokens, cacheWrite: acc.rawCacheWriteTokens),
+                cacheReadTokens: acc.rawCacheReadTokens,
+                cacheWriteTokens: acc.rawCacheWriteTokens,
                 subagentTokens: acc.hasSubagentTokens ? acc.subagentTokens : nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
@@ -747,14 +704,18 @@ enum Sessions {
         // One ps pass feeds every source; the per-source scanners only add
         // the cheap per-PID lsof cwd lookups for the PIDs they care about.
         let processes = ProcessScanner.run()
+        // One OpenRouter catalog feeds every source's API-cost estimate —
+        // cache-backed, never blocking (see ModelPricing.swift).
+        let pricing = await ModelPricingStore.shared.catalog()
         async let claude = SessionScanner.liveSessions(
             processList: processes,
             mappingDir: home.appendingPathComponent(".claude/sessions"),
-            projectsDir: home.appendingPathComponent(".claude/projects")
+            projectsDir: home.appendingPathComponent(".claude/projects"),
+            pricing: pricing
         )
-        async let codex = CodexSessions.snapshot()
-        async let pi = PiSessions.snapshot(processes: processes)
-        async let agy = AgySessions.snapshot(processes: processes)
+        async let codex = CodexSessions.snapshot(pricing: pricing)
+        async let pi = PiSessions.snapshot(processes: processes, pricing: pricing)
+        async let agy = AgySessions.snapshot(processes: processes, pricing: pricing)
         return (await claude + (await codex) + (await pi) + (await agy)).sorted { $0.label < $1.label }
     }
 }

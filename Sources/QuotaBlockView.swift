@@ -1,10 +1,7 @@
 import AppKit
 
 // MARK: - Quota block: pure composition helpers
-//
-// Same split as DetailedSessionRow: everything that turns a `Card` into
-// strings and column geometry lives here as pure, fixture-tested functions,
-// and the view below is a thin draw-time layer over them.
+
 enum QuotaBlock {
     static let headerHeight: CGFloat = 22
     static let rowHeight: CGFloat = 18
@@ -12,13 +9,7 @@ enum QuotaBlock {
     static let topPadding: CGFloat = 6
     static let bottomPadding: CGFloat = 7
 
-    /// The label column is 56pt for the windows named "5-hour" and "Weekly",
-    /// but Claude's `weekly_scoped` rows are labelled with whatever
-    /// `scope.model.display_name` the API returns, and those are neither
-    /// short nor fixed. At a fixed 56pt, siblings sharing a long prefix all
-    /// truncate to the same string — rows that no longer say which model they
-    /// are. So the column grows to the widest label in *its own* block,
-    /// capped so the bar keeps a usable minimum width.
+    /// Label column bounds allowing row labels to expand while maintaining minimum bar width.
     static let minLabelWidth: CGFloat = 56
     static let maxLabelWidth: CGFloat = 132
     static let percentWidth: CGFloat = 40
@@ -26,21 +17,14 @@ enum QuotaBlock {
     static let barHeight: CGFloat = 5
     static let dotDiameter: CGFloat = 8
 
-    /// Codex quota is read out of the rollout log of the last turn you took,
-    /// so it is a snapshot, not a live reading. The bars are drawn at reduced
-    /// opacity to say that continuously, rather than only in the badge.
+    /// Bar opacity applied to snapshot readings such as Codex rollout data.
     static let staleBarOpacity: CGFloat = 0.75
 
-    /// "resets in 4h 53m", or a bare "—" when there is no reset time at all.
-    /// Providers compose the detail as "resets in \(countdown)" and
-    /// `Format.countdown` already yields "—" for a nil date, so the combined
-    /// "resets in —" is the one form that must collapse.
+    /// Normalizes reset strings, replacing "resets in —" with a bare dash.
     nonisolated static func resetText(_ detail: String) -> String {
         detail == "resets in —" ? "—" : detail
     }
 
-    /// Keyless providers collapse to a single line: there is no quota to show
-    /// and the error is not a failure so much as a setup step.
     nonisolated static func isMissingKey(_ card: Card) -> Bool { card.missingKey }
 
     nonisolated static let missingKeyText = "no API key"
@@ -64,9 +48,7 @@ enum QuotaBlock {
         return height
     }
 
-    /// Full-content accessibility text for the block, mirroring what the
-    /// Detailed session rows already provide — the drawn panel is otherwise
-    /// opaque to VoiceOver, since none of it is a real text control.
+    /// Full-content accessibility label for custom-drawn quota blocks.
     nonisolated static func accessibilityLabel(for card: Card) -> String {
         var parts: [String] = [card.provider]
         if isMissingKey(card) {
@@ -88,20 +70,14 @@ enum QuotaBlock {
 }
 
 // MARK: - Quota block view
-//
-// One custom view per provider, rather than one per window row: the four
-// columns only line up if a single drawing pass owns the whole block, and the
-// block has no per-row interaction to preserve. Like SessionRowView, this
-// hand-rolls what attributedTitle rows used to get free — sizing, dark mode,
-// accessibility — because a custom view inherits none of it.
+
 @MainActor
 final class QuotaBlockView: NSView {
     private let card: Card
     private let accent: ProviderAccent
     private let labelWidth: CGFloat
 
-    /// Only ever set for a keyless provider, whose whole block is the
-    /// affordance for the "add in Settings →" hint it draws.
+    /// Callback invoked when clicking a keyless provider block.
     var onOpenSettings: (() -> Void)?
 
     init(card: Card, width: CGFloat) {
@@ -195,9 +171,7 @@ final class QuotaBlockView: NSView {
 
         let barX = left + labelWidth + Panel.columnGap
         guard let percent = row.percent else {
-            // Balances, plan names and key health: no window, so no bar — the
-            // detail takes the whole remaining width rather than a 0% bar
-            // standing in for something that was never a percentage.
+            // Renders non-percentage rows across full width without a progress bar.
             Draw.text(row.detail, font: PanelFont.number(11), color: .secondaryLabelColor,
                       in: NSRect(x: barX, y: y, width: max(0, right - barX), height: box.height))
             return
@@ -285,8 +259,7 @@ enum QuotaBlockSelfTests {
         let noted = QuotaBlock.height(for: makeCard(note: "plan: max"))
         precondition(noted == base + QuotaBlock.noteHeight)
 
-        // A keyless provider is exactly one line — its rows and note, if any
-        // ever arrived, must not add height to a block that draws neither.
+        // Keyless provider collapses to header height.
         let keyless = makeCard(provider: "OpenRouter", rows: [], error: "no API key", missingKey: true)
         precondition(QuotaBlock.isMissingKey(keyless))
         precondition(QuotaBlock.height(for: keyless)
@@ -301,8 +274,7 @@ enum QuotaBlockSelfTests {
         ])
         precondition(QuotaBlock.labelWidth(for: short) == QuotaBlock.minLabelWidth)
 
-        // Scoped-model labels must not all collapse to the same truncated
-        // prefix — the column grows, but only up to the cap.
+        // Scoped-model labels expand the column up to maxLabelWidth.
         let long = makeCard(rows: [
             Row(label: "Weekly (Fable)", percent: 0, detail: "resets in 1d 0h"),
             Row(label: "Weekly (Opus)", percent: 0, detail: "resets in 1d 0h"),

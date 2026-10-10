@@ -9,11 +9,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  # Deliberately false. This workflow runs on `edited`, so retitling a PR to fix
-  # a title-lint failure would otherwise cancel the run already in flight -- and
-  # a cancelled check run is never superseded by a later success, leaving the
-  # rollup FAILURE and the PR blocked with auto-merge armed but never firing.
-  # The job validates a string in seconds; there is no slot worth reclaiming.
+  # Prevent cancellation on title edit to avoid leaving stale check failures.
   cancel-in-progress: false
 
 jobs:
@@ -25,8 +21,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate title
         env:
-          # Via the environment, never interpolated into the shell: a PR title
-          # is attacker-controlled text and `${{ }}` inside `run:` is a script
-          # injection sink.
+          # Pass title via environment variable to prevent shell injection.
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 .github/scripts/validate_pr_title.py "$PR_TITLE"

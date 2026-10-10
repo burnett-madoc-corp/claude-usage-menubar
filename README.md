@@ -188,11 +188,29 @@ from measured sessions by [`tools/token_charts.py`](tools/token_charts.py).
 
 A read-only view of your **live** agent processes — Claude Code, Codex, the
 pi coding agent and Antigravity's `agy` CLI — answering one question: *should
-I clear this session?* It only reads process state and on-disk logs — no cost
-estimate, no history, no way to kill or attach to a session from here.
+I clear this session?* It only reads process state and on-disk logs — no
+history, no way to kill or attach to a session from here.
 
-The four sources degrade independently, and not every agent exposes the same
-signals:
+### The $ SPENT column
+
+- **pi** shows its own exact per-provider cost (`cost.total` in each
+  assistant record) — `$0.456`, three decimals.
+- **Claude, Codex and agy** run on monthly plans where nothing bills per
+  token, so the plan fee hides the burn. Their rows show **`~$12.34`** — an
+  estimate of what the session's tokens would have cost billed per token via
+  the API, priced from OpenRouter's public model catalog
+  (`GET openrouter.ai/api/v1/models`, no key needed). Each component bills at
+  its own rate: fresh input, cache reads, cache writes and output. The
+  catalog is fetched at most once a day, cached to disk so estimates survive
+  a launch with no network, and a model the catalog cannot name shows `—`
+  rather than a fabricated price. The tilde is load-bearing: it is the only
+  thing distinguishing an estimate from a measured cost, and it propagates to
+  the footer total when the two are summed.
+- agy reports no cache split, so its estimate prices everything at the fresh
+  input rate — a slight overestimate where the model serves cached prompts.
+
+### Live session matching, per agent
+
 
 - **Claude Code** — registry files, transcripts, per-turn costs, BLOAT,
   compaction (the full row).
@@ -203,7 +221,12 @@ signals:
   pi records no context-window constant in transcripts, so the bar's window is
   resolved from `~/.pi/agent/models-store.json` (pi's own per-provider model
   catalog, mtime-cached). A resumed session (`pi -c`) is matched to its newest
-  same-directory transcript and labelled "(unmatched)".
+  same-directory transcript and labelled "(unmatched)" — but only if that
+  transcript was modified after the process started, the fingerprint of a
+  live resume appending to it. A transcript untouched since before the
+  process launched is a finished job in the same workspace, and a new session
+  never inherits its numbers: the row stays "starting — no usage yet" until
+  the first turn.
 - **agy** — each live agy PID is its own language server: `lsof` on the PID
   yields the cwd, the presence lock (whose UUID *is* the conversation id), and
   the process's own Connect port. `GetAllCascadeTrajectories` gives the title,

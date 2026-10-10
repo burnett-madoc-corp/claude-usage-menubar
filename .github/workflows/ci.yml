@@ -8,11 +8,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # A superseded push should give up its slot, so pushes still cancel.
-  # A review must NOT: cancelling an in-flight build leaves a FAILURE check run
-  # that the replacement run's SUCCESS does not supersede. The rollup for that
-  # SHA stays FAILURE and the PR is blocked with auto-merge armed but never
-  # firing, until someone re-runs the cancelled run by hand.
+  # Cancel pushes in progress but preserve review builds to avoid permanent failed rollup states.
   cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
 permissions:
@@ -22,10 +18,7 @@ jobs:
   merge-gate:
     if: ${{ (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.draft == false }}
     name: merge-gate
-    # This app links AppKit, so a real `swiftc` build only happens on macOS.
-    # Do NOT close the gap with a `|| true` / `|| echo` pattern -- an
-    # earlier version of this job did exactly that and reported green without
-    # checking anything.
+    # AppKit linkage requires a macOS runner for swiftc builds.
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -34,10 +27,7 @@ jobs:
       - name: Static checks (encoding, conflict markers, build.sh manifest)
         run: python3 .github/scripts/static_checks.py
 
-      # Pure geometry/arithmetic over the committed SVGs -- no rendering, no
-      # transcripts, so it runs anywhere. Catches the class of defect that
-      # shipped in #26: a curve drawn through its own label, text past the
-      # viewBox, and two charts stating different values for one quantity.
+      # Validates SVG geometry, label clearance, and cross-chart data consistency.
       - name: Chart checks (docs/charts/*.svg geometry and cross-chart numbers)
         run: python3 tools/check_charts.py
 

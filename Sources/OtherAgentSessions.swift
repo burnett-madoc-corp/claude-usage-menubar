@@ -2,10 +2,7 @@ import Darwin
 import Foundation
 
 // MARK: - JSON helpers
-//
-// Sessions.swift declares an equivalent extension, but `private` on a
-// top-level extension is file-scoped in Swift — redeclared here rather than
-// widening the other file's access, mirroring CodexSessions.swift.
+// File-scoped JSON helper dictionary extensions declared locally.
 
 private extension Dictionary where Key == String, Value == Any {
     func int64(_ key: String) -> Int64? { (self[key] as? NSNumber)?.int64Value }
@@ -15,11 +12,7 @@ private extension Dictionary where Key == String, Value == Any {
 
 // MARK: - pi model registry (context windows)
 
-/// `~/.pi/agent/models-store.json` — pi's cache of every provider's model
-/// catalog. Each provider entry carries a `models` array whose members have
-/// an `id` and a `contextWindow` (verified live: glm-5.3-flash → 1048576,
-/// grok-4.6 → 500000). Parsing is pure so self-tests can drive it; sibling
-/// keys like `checkedAt`/`etag` are skipped by the typed walk.
+/// Parses model catalog cache to map model identifiers to context windows.
 enum PiModelRegistry {
     struct Registry: Sendable, Equatable {
         var byProvider: [String: Int64] = [:]   // "<provider>/<model id>"
@@ -37,7 +30,7 @@ enum PiModelRegistry {
             for model in models {
                 guard let id = model["id"] as? String,
                       let window = (model["contextWindow"] as? NSNumber)?.int64Value,
-                      window > 0
+                  window > 0
                 else { continue }
                 registry.byProvider["\(provider)/\(id)"] = window
                 registry.byId[id] = window
@@ -48,27 +41,9 @@ enum PiModelRegistry {
 }
 
 // MARK: - pi coding agent sessions
-//
-// pi stores one JSONL file per session under ~/.pi/agent/sessions/<encoded
-// cwd>/ — the first line is a header:
-//
-//   {"type":"session","version":3,"id":"…","timestamp":"…Z","cwd":"/Users/…"}
-//
-// and subsequent assistant `message` records carry the model, provider and
-// a usage block:
-//
-//   {"type":"message","id":"…","timestamp":"…","message":{"role":"assistant",
-//    "model":"…","provider":"…","usage":{"input":…,"output":…,"cacheRead":…,
-//    "cacheWrite":…,"reasoning":…,"totalTokens":…,"cost":{…}}}}
-//
-// Live-process matching is start-time proximity (like Codex): the pi process's
-// `lstart` lines up with the header timestamp to the second (the filename
-// embeds the same instant, UTC). A live PID with no fresh session for its
-// cwd is a resumed session — shown with the newest same-cwd transcript as a
-// labelled best guess; a live PID with no session at all renders pending.
+// Discovers pi sessions from JSONL files and matches them to active processes.
 
-/// A session file found on disk, with what the matcher needs.
-/// `Meta` (below) is the parsed first-line header.
+/// Session file metadata and path information parsed from disk.
 struct PiLiveSession: Sendable, Equatable {
     var meta: Meta
     var path: URL
@@ -90,19 +65,15 @@ struct PiProcessCandidate: Sendable, Equatable {
 struct PiMatch: Sendable {
     var process: PiProcessCandidate
     var session: PiLiveSession?
-    /// No session started within tolerance, but a same-cwd transcript exists
-    /// (most likely `pi -c` / resume) — shown with its data, labelled.
+    /// Indicates matching by fallback cwd when process start fell outside tolerance window.
     var viaFallback: Bool = false
 }
 
 enum PiSessionParsing {
-    /// Same tolerance Codex uses: process start vs session creation observed
-    /// at ~1s apart on live data; ±5s without reaching distinct-session gaps.
+    /// Maximum allowed delta between process start time and session timestamp.
     static let startTolerance: TimeInterval = 5
 
-    /// Pure parser for the session header line. Returns nil for anything
-    /// that is not a `session` record with a cwd — malformed files must
-    /// never render as rows pointing at nowhere.
+    /// Parses the session header line from a transcript.
     static func header(line: String) -> PiLiveSession.Meta? {
         guard let data = line.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -116,13 +87,9 @@ enum PiSessionParsing {
     }
 }
 
-/// Folds one pi session JSONL line into the accumulator. Pure and
-/// synchronous so self-tests can drive it directly.
+/// Folds a pi session JSONL line into the accumulator.
 enum PiSessionFold {
-    /// pi's assistant `usage.totalTokens` is the full prompt bill for the
-    /// turn (input + output + cacheRead + cacheWrite — reasoning sits inside
-    /// output), so it is the context analogue Claude's per-turn quantity and
-    /// Codex's `last_token_usage.total_tokens` are for their agents.
+    /// Folds message usage metrics into the running accumulator.
     static func fold(line: String, into acc: inout PiSessionReader.Acc) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
@@ -145,6 +112,8 @@ enum PiSessionFold {
 
         acc.rawInputTokens += input + cacheRead + cacheWrite
         acc.rawOutputTokens += output
+        acc.rawCacheReadTokens += cacheRead
+        acc.rawCacheWriteTokens += cacheWrite
         acc.turns += 1
         
         if let cost = usage.dict("cost"), let totalCost = (cost["total"] as? NSNumber)?.doubleValue {
@@ -176,6 +145,10 @@ actor PiSessionReader {
 
         var rawInputTokens: Int64 = 0
         var rawOutputTokens: Int64 = 0
+        // The cache split of rawInputTokens — API pricing bills each at a
+        // different rate (see ModelPricing.swift).
+        var rawCacheReadTokens: Int64 = 0
+        var rawCacheWriteTokens: Int64 = 0
         var exactSpent: Double? = nil
         var turns: Int = 0
         var contextTokens: Int64?
@@ -194,13 +167,7 @@ actor PiSessionReader {
 
     private var accumulators: [String: Acc] = [:]
 
-    /// pi never records a context-window constant in its session files, but
-    /// ~/.pi/agent/models-store.json caches every provider's full model
-    /// catalog with per-model `contextWindow` — so "window unknown" becomes a
-    /// real percent bar by looking the session's current model up there.
-    /// Registry is mtime-cached: parsed once, re-read only when pi rewrites
-    /// it. Lookup is by model id, preferring the session's own provider's
-    /// catalog entry when it has one.
+    /// Caches model catalog registry by file modification time to look up context windows.
     private var registryByProvider: [String: Int64] = [:]
     private var registryById: [String: Int64] = [:]
     private var registryMtime: Date?
@@ -276,9 +243,7 @@ actor PiSessionReader {
 }
 
 enum PiSessionMatcher {
-    /// Confident: same cwd AND session start within tolerance of process
-    /// start. Otherwise the newest same-cwd transcript is a labelled best
-    /// guess; no same-cwd transcript at all renders pending.
+    /// Matches processes to live sessions by matching cwd and start timestamp within tolerance.
     static func match(processes: [PiProcessCandidate],
                       sessions: [PiLiveSession]) -> [PiMatch] {
         processes.map { process in
@@ -293,7 +258,11 @@ enum PiSessionMatcher {
             }) {
                 return PiMatch(process: process, session: closest)
             }
-            if let newest = sameCwd.max(by: { $0.modified < $1.modified }) {
+            // Tolerance on the mtime side too: a file written in the same
+            // instant the process launched is plausibly this process's.
+            let freshnessFloor = process.startedLocal.addingTimeInterval(-PiSessionParsing.startTolerance)
+            if let newest = sameCwd.max(by: { $0.modified < $1.modified }),
+               newest.modified >= freshnessFloor {
                 return PiMatch(process: process, session: newest, viaFallback: true)
             }
             return PiMatch(process: process, session: nil)
@@ -316,10 +285,10 @@ enum PiSessions {
         processes: [ProcInfo] = ProcessScanner.run(),
         sessionsDir: URL = defaultSessionsDir,
         cwdLookup: (pid_t) -> String? = { CwdLookup.cwd(pid: $0) },
-        reader: PiSessionReader = .shared
+        reader: PiSessionReader = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
-        // comm is exactly "pi" — a token-substring check would drag in pips
-        // and scripts that merely contain the two letters in argv.
+        // Filter strictly by executable name "pi" to avoid matching unrelated commands.
         let live = processes
             .filter { $0.comm == "pi" }
             .compactMap { proc -> PiProcessCandidate? in
@@ -336,8 +305,7 @@ enum PiSessions {
         for match in matches {
             let label = PathEncoding.label(cwd: match.process.cwd)
             guard let session = match.session else {
-                // Live PID, no transcript yet — pre-first-message. Renders
-                // pending; unknown usage, never a fabricated 0%.
+                // Render pending state when process is active but transcript is not yet created.
                 result.append(AgentSession(
                     kind: .pi, pid: match.process.pid, label: label, taskTitle: nil,
                     cwd: match.process.cwd, model: nil, busy: true,
@@ -352,8 +320,7 @@ enum PiSessions {
 
             scannedPaths.insert(session.path.path)
             let acc = await reader.scan(session.path)
-            // pi stores no window constant in the transcript; the model
-            // registry lookup is what turns contextTokens into a real bar.
+            // Look up model context window from model registry.
             let window = await reader.contextWindow(provider: acc.lastProvider,
                                                     modelId: acc.lastModel)
             var rowLabel = label
@@ -368,7 +335,19 @@ enum PiSessions {
                 busy: true,
                 turns: acc.turns,
                 inputTokens: acc.rawInputTokens,
-                outputTokens: acc.rawOutputTokens, exactSpent: acc.exactSpent,
+                outputTokens: acc.rawOutputTokens,
+                // pi's own `cost.total` IS the API price (pi bills each
+                // provider's per-token rates), so it wins when present;
+                // the OpenRouter estimate only fills providers that report
+                // no cost block.
+                exactSpent: acc.exactSpent,
+                estimatedSpent: acc.exactSpent ?? OpenRouterCatalog.estimate(
+                    model: acc.lastModel, catalog: pricing,
+                    input: max(0, acc.rawInputTokens - acc.rawCacheReadTokens - acc.rawCacheWriteTokens),
+                    output: acc.rawOutputTokens,
+                    cacheRead: acc.rawCacheReadTokens, cacheWrite: acc.rawCacheWriteTokens),
+                cacheReadTokens: acc.rawCacheReadTokens,
+                cacheWriteTokens: acc.rawCacheWriteTokens,
                 subagentTokens: nil,
                 contextTokens: acc.contextTokens,
                 contextWindow: window,
@@ -383,9 +362,7 @@ enum PiSessions {
         return result.sorted { $0.label < $1.label }
     }
 
-    /// Enumerates session transcripts by reading each file's header line —
-    /// the header carries the cwd verbatim, so no reverse-engineered
-    /// directory-name encoding can silently drift out from under us.
+    /// Enumerates session transcripts by reading each file's header line.
     static func enumerateSessions(in dir: URL) -> [PiLiveSession] {
         guard let dirs = try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey]
@@ -418,30 +395,7 @@ enum PiSessions {
 }
 
 // MARK: - Antigravity (agy) sessions
-//
-// A live agy process is its own language server: each PID holds a flock on
-// ~/.gemini/antigravity-cli/presence/<conversationId>.lock (verified: the
-// lock's UUID is the conversation id) and LISTENs on an ephemeral loopback
-// port serving the unauthenticated Connect RPC. One `lsof -p <pid>` yields
-// all three identities at once — cwd (the cwd fd), the lock (conversation),
-// and the port (its own server).
-//
-// Per-PID servers only know their own conversations, so each process is
-// queried directly:
-//
-//   GetAllCascadeTrajectories → per-conversation summary: title, status
-//     (CASCADE_RUN_STATUS_IDLE = idle), workspaces (cwd), lastUserInputTime
-//   GetCascadeTrajectory {cascadeId: <conversationId>} → generatorMetadata[]:
-//     per-invocation usage {inputTokens, outputTokens — JSON strings} and
-//     chatStartMetadata.contextWindowMetadata {estimatedTokensUsed,
-//     maxContextTokens} — the real context state, replacing the old
-//     history.jsonl heuristic AND resolving the "no usage for agy" gap.
-//
-// Trajectory payloads run to MBs, so they are fetched only when the
-// conversation's lastUserInputTime advances (actor-cached); summaries are
-// cheap and always refreshed. If lsof yields nothing for a PID, the row
-// degrades through the old history.jsonl cwd heuristic — a live agy session
-// is never dropped for lack of identity.
+// Discovers live Antigravity sessions via loopback Connect RPC and presence lockfiles.
 
 struct AgyHistoryEntry: Equatable, Sendable {
     var display: String?
@@ -462,11 +416,7 @@ enum AgyHistoryParsing {
                                timestampMs: obj.int64("timestamp"))
     }
 
-    /// The newest entry for a workspace. When `since` is given, entries from
-    /// before it are only used if nothing newer exists — a live agy writes a
-    /// history line on every user turn, so a same-workspace entry newer than
-    /// the process start is confident identity; anything older is a previous
-    /// conversation in the same workspace and best-guess at best.
+    /// Returns the most recent history entry for a given workspace, filtering by timestamp when provided.
     static func newest(entries: [AgyHistoryEntry], workspace: String, since: Date?) -> AgyHistoryEntry? {
         let sameWorkspace = entries.filter { $0.workspace == workspace }
         if let since,
@@ -491,7 +441,8 @@ enum AgySessions {
         cwdLookup: (pid_t) -> String? = { CwdLookup.cwd(pid: $0) },
         lsofOutput: (pid_t) -> String? = { AgyProcessScanner.run(pid: $0) },
         fetcher: AgyRPC.Fetch = AgyRPC.defaultFetch,
-        cache: AgyTrajectoryCache = .shared
+        cache: AgyTrajectoryCache = .shared,
+        pricing: OpenRouterCatalog.Catalog = .init()
     ) async -> [AgentSession] {
         let live = processes.filter { $0.comm == "agy" }
         guard !live.isEmpty else { return [] }
@@ -512,14 +463,12 @@ enum AgySessions {
         for proc in live {
             let scan = lsofOutput(proc.pid).map { AgyProcessScanner.parse(lsofOutput: $0) }
 
-            // Rich path: the presence lock gives the exact conversation, the
-            // LISTEN port gives its own server.
+            // Resolve conversation and loopback server from presence lock and listen port.
             if let scan, let convId = scan.conversationId, let port = scan.port,
                let summaries = await AgyRPC.fetchSummaries(port: port, fetcher: fetcher),
                let summary = summaries.first(where: { $0.id == convId }) {
 
-                // Only advance-poll the trajectory: an MB-scale payload, but
-                // its content is stable between user turns.
+                // Poll trajectory payload only when conversation lastUserInputTime advances.
                 let stamp = summary.lastUserInputTime ?? .distantPast
                 let acc = await cache.trajectory(convId: convId, port: port,
                                                  changedAt: stamp, fetcher: fetcher)
@@ -527,21 +476,28 @@ enum AgySessions {
                 let cwd = summary.workspace ?? scan.cwd
                 let label = cwd.map(PathEncoding.label) ?? "Agy"
                 let busy = summary.status.map { !$0.contains("IDLE") } ?? true
+                let model = acc?.model
+                // agy reports no cache split, so everything prices at the
+                // fresh-input rate — a slight overestimate where the model
+                // serves cached prompts.
                 result.append(AgentSession(
                     kind: .agy,
                     pid: proc.pid,
                     label: label,
                     taskTitle: summary.title,
                     cwd: cwd ?? "",
-                    model: acc?.model,
+                    model: model,
                     busy: busy,
                     turns: acc?.turns ?? 0,
                     inputTokens: acc?.inputTokens ?? 0,
-                    outputTokens: acc?.outputTokens ?? 0, exactSpent: nil,
+                    outputTokens: acc?.outputTokens ?? 0,
+                    estimatedSpent: OpenRouterCatalog.estimate(
+                        model: model, catalog: pricing,
+                        input: acc?.inputTokens ?? 0, output: acc?.outputTokens ?? 0),
                     subagentTokens: nil,
                     contextTokens: acc?.contextTokens,
                     contextWindow: acc?.contextWindow,
-                    xFloorMultiple: nil, compactionCount: 0,
+                    xFloorMultiple: acc?.xFloorMultiple, compactionCount: 0,
                     lastCompactionAt: nil, lastCompactionPreCtx: nil,
                     lastCompactionPostCtx: nil,
                     hasUsage: acc?.contextTokens != nil,
@@ -581,8 +537,7 @@ enum AgySessions {
         return result.sorted { $0.label < $1.label }
     }
 
-    /// A live agy whose identity fell through: unknown usage, never a
-    /// fabricated zero — the same contract Codex's pending rows make.
+    /// Builds a pending session row with unknown usage for fallback processes.
     private static func pendingRow(pid: pid_t, cwd: String) -> AgentSession {
         AgentSession(
             kind: .agy, pid: pid,
@@ -600,11 +555,7 @@ enum AgySessions {
 
 // MARK: - agy process scan + language-server RPC client
 
-/// Pure parser for one `lsof -nP -p <pid>` dump of a live agy process.
-/// The cwd fd line gives a degraded-path cwd; the LISTEN line gives the
-/// process's own Connect server; the presence lock line gives the exact
-/// conversation id (the lock filename's UUID — verified to equal the
-/// conversation id in GetAllCascadeTrajectories).
+/// Parses lsof output for cwd, listening loopback port, and presence lock conversation ID.
 enum AgyProcessScanner {
     struct Scan: Equatable, Sendable {
         var cwd: String?
@@ -649,9 +600,7 @@ enum AgyRPC {
     static let rpcPath = "/exa.language_server_pb.LanguageServerService/"
     typealias Fetch = (Int, String, [String: Any]) async -> Data?
 
-    /// POSTs one Connect call. The server is loopback-only and takes no
-    /// auth; http first, https (self-signed — LoopbackSession) second,
-    /// mirroring AntigravityProvider's port probing.
+    /// Sends a Connect RPC request to loopback trying http followed by https.
     static func defaultFetch(port: Int, rpc: String, body: [String: Any]) async -> Data? {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
         for scheme in ["http", "https"] {
@@ -684,9 +633,7 @@ enum AgyRPC {
         var lastUserInputTime: Date?
     }
 
-    /// Pure parser for GetAllCascadeTrajectories. Workspace paths arrive as
-    /// file:// URIs. A missing/blank status reads busy — the safe default for
-    /// a process we can see is alive.
+    /// Parses trajectory summaries response from GetAllCascadeTrajectories RPC.
     static func parseSummaries(data: Data) -> [ConversationSummary] {
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let summaries = obj["trajectorySummaries"] as? [String: Any]
@@ -718,25 +665,14 @@ enum AgyRPC {
         var inputTokens: Int64 = 0
         var outputTokens: Int64 = 0
         var turns: Int = 0
+        var turnCosts: [Int64] = []
+
+        var xFloorMultiple: Double? {
+            SessionScanner.xFloor(turnCosts: turnCosts)
+        }
     }
 
-    /// Pure parser for GetCascadeTrajectory. Fields verified live:
-    ///
-    ///   trajectory.generatorMetadata[].chatModel.usage
-    ///       {inputTokens, outputTokens, thinkingOutputTokens, …} — JSON
-    ///       STRINGS of integers; output already includes thinking.
-    ///   trajectory.generatorMetadata[].chatModel.chatStartMetadata
-    ///       .contextWindowMetadata
-    ///       {estimatedTokensUsed, maxContextTokens} — ints; the context at
-    ///       that invocation's START, so the freshest estimate for a row is
-    ///       max(newest start estimate, newest input + output).
-    ///   trajectory.executorMetadatas[].cascadeConfig.plannerConfig.modelName
-    ///       — the human model name ("gemini-3.1-pro-low"); the enum fields
-    ///       elsewhere read MODEL_PLACEHOLDER_M36.
-    ///
-    /// Usage totals sum every invocation (input re-sent per call bills, the
-    /// same contract Claude's rawInputTokens keeps); retryInfos duplicates are
-    /// ignored — a retry's final usage already lands in its own invocation.
+    /// Parses GetCascadeTrajectory payload to extract usage totals, context metrics, and model names.
     static func parseTrajectory(data: Data) -> TrajectoryAcc {
         var acc = TrajectoryAcc()
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -756,12 +692,17 @@ enum AgyRPC {
                 acc.outputTokens += output
                 lastUsage = (input, output)
 
+                var turnCost = input + output
                 if let start = chat["chatStartMetadata"] as? [String: Any],
                    let windowMeta = start["contextWindowMetadata"] as? [String: Any] {
                     acc.contextWindow = number(windowMeta["maxContextTokens"]) ?? acc.contextWindow
                     let estimated = number(windowMeta["estimatedTokensUsed"]) ?? 0
                     let current = max(estimated, lastUsage!.input + lastUsage!.output)
                     acc.contextTokens = max(acc.contextTokens ?? 0, current)
+                    turnCost = current
+                }
+                if turnCost > 0 {
+                    acc.turnCosts.append(turnCost)
                 }
             }
             if acc.contextTokens == nil, let lastUsage {
@@ -778,11 +719,48 @@ enum AgyRPC {
                 return planner["modelName"] as? String
             }.last
         }
+
+        if acc.contextWindow != nil || acc.contextTokens != nil {
+            acc.contextWindow = contextWindow(for: acc.model,
+                                              reported: acc.contextWindow,
+                                              observedTokens: acc.contextTokens)
+        }
         return acc
     }
 
-    /// agy emits integers as bare ints in contextWindowMetadata but as
-    /// STRINGS in usage — one tolerant reader for both.
+    /// Resolves context window limits by model family, expanding if observed tokens exceed nominal window.
+    static func contextWindow(for model: String?, reported: Int64? = nil, observedTokens: Int64? = nil) -> Int64? {
+        var window: Int64?
+        if let model = model?.lowercased() {
+            if model.contains("gemini") {
+                if model.contains("flash") {
+                    window = 1_000_000
+                } else if model.contains("pro") || model.contains("3.1") {
+                    window = 2_000_000
+                } else {
+                    window = 1_000_000
+                }
+            } else if model.contains("claude") {
+                window = model.contains("1m") ? 1_000_000 : 200_000
+            } else if model.contains("gpt-oss") || model.contains("gpt-4o") {
+                window = 128_000
+            } else if model.contains("codex") {
+                window = 200_000
+            }
+        }
+        if window == nil {
+            window = reported
+        }
+        if let reported, reported != 128_000, let current = window, reported > current {
+            window = reported
+        }
+        if let observed = observedTokens, let current = window, observed > current {
+            window = observed
+        }
+        return window
+    }
+
+    /// Parses an integer value from NSNumber or String representation.
     static func number(_ value: Any?) -> Int64? {
         if let n = value as? NSNumber { return n.int64Value }
         if let s = value as? String { return Int64(s) }
@@ -790,9 +768,7 @@ enum AgyRPC {
     }
 }
 
-/// Trajectory payloads are MB-scale, so each conversation's parsed state is
-/// cached and only re-fetched when its lastUserInputTime advances. Entries
-/// for conversations no longer alive are evicted each cycle.
+/// Caches parsed conversation trajectories by timestamp and evicts inactive sessions.
 actor AgyTrajectoryCache {
     static let shared = AgyTrajectoryCache()
 
@@ -869,6 +845,8 @@ enum PiAndAgySessionSelfTests {
         precondition(acc.turns == 1)
         precondition(acc.rawInputTokens == 5_614 + 47_168, "input must include cacheRead (cacheWrite is 0 here)")
         precondition(acc.rawOutputTokens == 833)
+        precondition(acc.rawCacheReadTokens == 47_168 && acc.rawCacheWriteTokens == 0,
+                     "the cache split must track rawInputTokens for API-cost pricing")
         precondition(acc.contextTokens == 5_614 + 833 + 47_168,
                      "context must be the usage total, mirroring Codex last_token_usage")
         precondition(acc.lastModel == "grok-4.6")
@@ -878,6 +856,7 @@ enum PiAndAgySessionSelfTests {
         precondition(acc.turns == 2)
         precondition(acc.rawInputTokens == 5_614 + 47_168 + 790 + 46_400)
         precondition(acc.contextTokens == 790 + 3_061 + 46_400, "the newest usage total must win")
+        precondition(abs((acc.exactSpent ?? 0) - 0.002) < 0.0001, "exact spent must sum message costs")
     }
 
     private static func testPiFoldDedup() {
@@ -888,6 +867,7 @@ enum PiAndAgySessionSelfTests {
         PiSessionFold.fold(line: dup, into: &acc)
         precondition(acc.turns == 1, "repeated message ids (streaming retries) must dedup to one turn")
         precondition(acc.rawInputTokens == 2 + 47_168)
+        precondition(abs((acc.exactSpent ?? 0) - 0.001) < 0.0001, "deduped turns must not double-count cost")
     }
 
     private static func testPiMatcher() {
@@ -905,13 +885,22 @@ enum PiAndAgySessionSelfTests {
                                startedAt: started.addingTimeInterval(4.9), modified: started)])
         precondition(conf.count == 1 && conf[0].session?.meta.id == "in" && !conf[0].viaFallback)
 
-        // Out of tolerance (resumed session) but same cwd — labelled fallback
-        // onto the newest same-cwd transcript, never dropped, never guessed wrong silently.
+        // Resumed sessions outside tolerance fall back to newest same-cwd transcript.
         let resumed = PiSessionMatcher.match(
             processes: [proc],
             sessions: [session(name: "old", cwd: "/Users/dev/proj",
-                               startedAt: started.addingTimeInterval(-3600), modified: started.addingTimeInterval(-10))])
+                               startedAt: started.addingTimeInterval(-3600), modified: started.addingTimeInterval(10))])
         precondition(resumed.count == 1 && resumed[0].session?.meta.id == "old" && resumed[0].viaFallback)
+
+        // Out of tolerance AND untouched since before the process started —
+        // last week's finished job in the same workspace. Must render pending,
+        // never donate its token counts to the brand-new session.
+        let stale = PiSessionMatcher.match(
+            processes: [proc],
+            sessions: [session(name: "stale", cwd: "/Users/dev/proj",
+                               startedAt: started.addingTimeInterval(-604_800), modified: started.addingTimeInterval(-604_700))])
+        precondition(stale.count == 1 && stale[0].session == nil && !stale[0].viaFallback,
+                     "a pre-process transcript must not be inherited by a new session")
 
         // No transcript for this cwd at all — pending.
         let pending = PiSessionMatcher.match(
@@ -999,18 +988,39 @@ enum PiAndAgySessionSelfTests {
 
     private static func testAgyTrajectoryParse() {
         let acc = AgyRPC.parseTrajectory(data: trajectoryFixture())
-        precondition(acc.contextWindow == 128_000)
-        // Context = max(newest start estimate, newest input+output):
-        // 25217 vs 26000+1400 → the fresher, larger view wins.
+        precondition(acc.contextWindow == 2_000_000,
+                     "gemini-3.1-pro-low must resolve to 2m context window, overriding reported 128k")
+        // Context reflects max of newest start estimate and newest input+output.
         precondition(acc.contextTokens == 27_400)
         precondition(acc.inputTokens == 9_399 + 26_000, "usage totals sum every invocation")
         precondition(acc.outputTokens == 535 + 1_400)
         precondition(acc.turns == 2)
+        precondition(acc.turnCosts == [9_934, 27_400])
+        precondition(acc.xFloorMultiple == nil, "fewer than 5 turns must yield nil bloat")
         precondition(acc.model == "gemini-3.1-pro-low",
                      "the newest executor's planner modelName is the live model")
 
-        // A trajectory with no generator metadata (fresh conversation) must
-        // stay pending — never a fabricated 0% context.
+        // Context window resolution rules
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1-pro-low", reported: 128_000) == 2_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1-pro-high", reported: 128_000) == 2_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1", reported: 128_000) == 2_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.8-flash-high", reported: 128_000) == 1_000_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3-flash", reported: 128_000) == 1_000_000)
+        precondition(AgyRPC.contextWindow(for: "claude-sonnet-4-6", reported: 128_000) == 200_000)
+        precondition(AgyRPC.contextWindow(for: "claude-opus-4-6-1m", reported: 128_000) == 1_000_000)
+        precondition(AgyRPC.contextWindow(for: "gpt-oss-120b-medium", reported: 128_000) == 128_000)
+        precondition(AgyRPC.contextWindow(for: "custom-model", reported: 500_000) == 500_000)
+        precondition(AgyRPC.contextWindow(for: "gemini-3.1-pro-low", reported: 128_000, observedTokens: 2_500_000) == 2_500_000)
+
+        // Trajectory with 5+ turns computes bloat (xFloorMultiple)
+        let bloatData = Data(#"{"trajectory":{"trajectoryId":"b","generatorMetadata":[{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"10000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}},{"chatModel":{"usage":{"inputTokens":"25000","outputTokens":"0"}}}],"executorMetadatas":[{"cascadeConfig":{"plannerConfig":{"modelName":"gemini-3.1-pro-high"}}}]}}"#.utf8)
+        let bloatAcc = AgyRPC.parseTrajectory(data: bloatData)
+        precondition(bloatAcc.turns == 10)
+        precondition(bloatAcc.turnCosts.count == 10)
+        precondition(bloatAcc.xFloorMultiple == 2.5, "bloat must compute live/baseline ratio")
+        precondition(bloatAcc.contextWindow == 2_000_000)
+
+        // Fresh trajectories without generator metadata remain pending.
         let empty = AgyRPC.parseTrajectory(data: Data(#"{"trajectory":{"generatorMetadata":[],"executorMetadatas":[{"cascadeConfig":{"plannerConfig":{"modelName":"gemini-3.1-pro-low"}}}]}}"#.utf8))
         precondition(empty.contextTokens == nil && empty.contextWindow == nil)
         precondition(empty.turns == 0 && empty.inputTokens == 0 && empty.outputTokens == 0)
@@ -1025,8 +1035,9 @@ enum PiAndAgySessionSelfTests {
             let cache = AgyTrajectoryCache()
             var calls = 0
             let acc = AgyRPC.TrajectoryAcc(model: "gemini-3.1-pro-low",
-                                           contextTokens: 27_400, contextWindow: 128_000,
-                                           inputTokens: 35_399, outputTokens: 1_935, exactSpent: nil, turns: 2)
+                                           contextTokens: 27_400, contextWindow: 2_000_000,
+                                           inputTokens: 35_399, outputTokens: 1_935, turns: 2,
+                                           turnCosts: [9_934, 27_400])
             let fetcher: AgyRPC.Fetch = { _, _, _ in
                 calls += 1
                 return trajectoryFixture()
@@ -1078,8 +1089,7 @@ enum PiAndAgySessionSelfTests {
             workspace: "/w", since: started.addingTimeInterval(-5))
         precondition(live?.conversationId == "new")
 
-        // Nothing since the process start — a previous conversation in the
-        // same workspace is still shown, as the labelled best guess it is.
+        // Fall back to most recent previous conversation in same workspace.
         let stale = AgyHistoryParsing.newest(
             entries: [entry("old", workspace: "/w", secondsAgo: 3600)],
             workspace: "/w", since: started.addingTimeInterval(-5))

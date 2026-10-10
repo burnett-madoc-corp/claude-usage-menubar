@@ -2,8 +2,7 @@ import Foundation
 
 // MARK: - Shared display model
 
-/// One line in the dropdown. `percent` drives a bar; `detail` carries anything
-/// that is not a percentage (a dollar balance, a plan name, a reset time).
+/// One line in the dropdown; percent drives a progress bar, detail carries non-percentage text.
 struct Row {
     var label: String
     var percent: Int?
@@ -12,37 +11,23 @@ struct Row {
 }
 
 /// A provider's section in the menu: a title plus its rows, or an error.
-///
-/// `badge` is the small pill drawn beside the provider name. It is set
-/// structurally at the point the condition is known — staleness in
-/// `UsageMenuBar.merge`, snapshot age in `CodexProvider.card` — rather than
-/// recovered later by pattern-matching `note`, which the renderer would
-/// otherwise have to parse back out of a human-readable sentence.
 struct Card {
     var provider: String
     var rows: [Row]
     var note: String?
     var error: String?
     var badge: Badge?
-    /// Distinguishes "you have not set this provider up yet" from "the fetch
-    /// failed", which read identically as an error string but call for
-    /// completely different rows — a setup hint versus a diagnostic.
+    /// Distinguishes unconfigured providers from runtime fetch failures.
     var missingKey: Bool = false
-    /// Set on an HTTP 429. Drives the poll backoff, so it has to survive as a
-    /// flag rather than as prose in `error` — `merge` replaces a failed card
-    /// with the previous good rows, and the reason for the failure would be
-    /// lost with it exactly when the scheduler needs to know.
+    /// Preserves 429 status across card merges to drive poll backoff.
     var rateLimited: Bool = false
 }
 
 struct HeadlineValue {
-    /// Always drives the colour, even when it is not what gets drawn.
+    /// Always drives color severity, even when custom display text is shown.
     let percent: Int
     let severity: String
-    /// Drawn instead of "\(percent)%" when the number this metric is about
-    /// is not a percentage. OpenRouter's headline is a credit balance in
-    /// dollars; it still has a meaningful percent (spend against the amount
-    /// granted) to colour by, but "$8.42" is what belongs in the bar.
+    /// Custom text drawn instead of percent when the metric is not a percentage.
     let display: String?
 
     init(percent: Int, severity: String, display: String? = nil) {
@@ -51,8 +36,6 @@ struct HeadlineValue {
         self.display = display
     }
 
-    /// The one place the drawn title and the plain-text title agree on how a
-    /// value reads.
     var text: String { display ?? "\(percent)%" }
 }
 
@@ -63,33 +46,15 @@ protocol Provider: Sendable {
 
 // MARK: - Config
 
-/// Keys resolve highest-precedence-wins across three tiers:
-///   1. The OPENROUTER_API_KEY env var (unchanged — keeps CI/scripting
-///      workflows working).
-///   2. The macOS Keychain (KeyStore.swift): service
-///      "local.claude-usage-menubar", account "openrouter_key" — what the
-///      settings window's Save button writes.
-///   3. Legacy ~/.config/claude-usage/config.json — read-only, never
-///      deleted automatically, kept alive forever for anyone who never
-///      opens settings:
-///        { "openrouter_key": "sk-or-v1-…" }
-/// Providers.all() calls Config.load() on every refresh, so a key saved in
-/// settings (or removed) takes effect on the next poll with no restart —
-/// the same property the legacy env-var/file design already had.
+/// Resolves provider keys in precedence order: environment variables, Keychain, legacy config file.
 struct Config: Sendable {
     var openRouterKey: String?
 
-    /// var, not let: --self-test points this at a temp-dir fixture instead
-    /// of the real file, mirroring the Prefs.defaults swap pattern.
+    /// Mutable to allow overriding with a fixture during self-tests.
     static var legacyPath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/claude-usage/config.json")
 
-    /// The polling path reads straight through to the Keychain on every
-    /// refresh. There is no cache and no timeout wrapper in front of it any
-    /// more: those existed to survive an approval dialog that this app's own
-    /// items no longer raise (see KeychainStore), and a cache that outlives
-    /// the dialog it was built for is just a way to serve a stale key after
-    /// the user changes one.
+    /// Reads directly from the Keychain on each poll to avoid serving stale keys after updates.
     static let pollingStore: KeyStore = KeychainStore()
 
     static func load(store: KeyStore = Config.pollingStore) -> Config {
@@ -100,18 +65,13 @@ struct Config: Sendable {
         return config
     }
 
-    /// L15: `OPENROUTER_API_KEY=` (set but empty, or whitespace-only) must
-    /// not win tier 1 over a perfectly good Keychain key — without this,
-    /// `env["…"] ?? …` treats `""` as present and the provider reports "no
-    /// API key" while a valid Keychain entry sits unused underneath it.
+    /// Ignores empty or whitespace-only strings so empty environment variables do not mask lower-tier keys.
     static func nonBlank(_ value: String?) -> String? {
         guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return value
     }
 
-    /// Exposed separately (not folded into load()) so SettingsWindow's
-    /// migration banner can ask "does the legacy file hold a key?" without
-    /// touching the Keychain or env vars at all.
+    /// Reads the legacy JSON config without checking Keychain or environment variables.
     static func legacyOpenRouterKey() -> String? {
         guard let data = try? Data(contentsOf: legacyPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -120,17 +80,9 @@ struct Config: Sendable {
     }
 }
 
-/// One bounded `Process` run, shared by every subprocess this app shells out
-/// to.
-///
-/// Extracted from KeychainCLI, which carried two copies of this body.
-/// AntigravityProvider's `lsof` call is the third caller, and a third
-/// hand-written copy of a subprocess timeout is how timeouts drift apart.
+/// Subprocess runner with execution timeout.
 enum BoundedProcess {
-    /// `failed` carries the child's exit status so callers can tell the
-    /// routine outcomes apart from the real ones — security(1)'s 44 is "no
-    /// such item", which for a key that was never configured is not an error
-    /// at all.
+    /// Carries child exit status so callers can distinguish routine non-zero exits (e.g. item not found).
     enum Failure: Error { case blocked, failed(Int32) }
 
     static func run(executable: String, arguments: [String],
@@ -150,44 +102,23 @@ enum BoundedProcess {
         guard (try? task.run()) != nil else { return .failure(.failed(-1)) }
 
         if let input, let stdin {
-            // At most a few hundred bytes, so this write cannot fill the pipe
-            // and block; closing afterwards is what makes the child see EOF
-            // and act on the one command it was given.
+            // Writes fit within pipe buffer; closing signals EOF to the child process.
             input.fileHandleForWriting.write(Data(stdin.utf8))
             try? input.fileHandleForWriting.close()
         }
 
         if finished.wait(timeout: .now() + timeout) == .timedOut {
-            // Leaves any approval dialog up — answering it makes the next call
-            // succeed. Only this run is abandoned, not the user's decision.
+            // Terminates timed-out process without dismissing pending system dialogs.
             task.terminate()
             return .failure(.blocked)
         }
-        // Safe to read after exit only because these payloads are a few KB;
-        // a larger one could fill the pipe buffer and stall the child, which
-        // the timeout above would then catch as .blocked rather than hang.
         let data = output.fileHandleForReading.readDataToEndOfFile()
         return task.terminationStatus == 0 ? .success(data) : .failure(.failed(task.terminationStatus))
     }
 }
 
-/// Bounded wrapper around `security(1)`.
-///
-/// A Keychain read can block indefinitely: if macOS decides the caller needs
-/// approval it puts a dialog on screen and `security` waits for it — forever,
-/// if nobody clicks it. Unbounded, one such dialog blanked the entire usage
-/// section, because `loadAll` awaits every provider and one that never returns
-/// takes down the others with it, including those that touch no Keychain at
-/// all.
-///
-/// This app's own key no longer triggers that dialog (see KeychainStore), but
-/// the item it reads from *another* app — Claude Code's OAuth token — is
-/// written under that app's own access rules, so the timeout stays. That
-/// reasoning is specific to the Keychain and deliberately does not live on
-/// BoundedProcess, which `lsof` also uses.
+/// Bounded security CLI wrapper with timeout to prevent Keychain prompt hangs from blocking refreshes.
 enum KeychainCLI {
-    /// Long enough that a genuinely slow read succeeds, short enough that the
-    /// menu is not held hostage to a dialog nobody is looking at.
     static let timeout: TimeInterval = 8
 
     typealias Failure = BoundedProcess.Failure
@@ -196,23 +127,14 @@ enum KeychainCLI {
         BoundedProcess.run(executable: "/usr/bin/security", arguments: arguments, timeout: timeout)
     }
 
-    /// Same shape as read(), for the one call site (KeychainStore.set) that
-    /// cannot use argv: `security -i` reads one command line off stdin
-    /// instead, so a secret value never becomes a `ps`-visible argument.
+    /// Passes commands via stdin to prevent secrets from appearing in process argument lists.
     static func readStdin(_ commandLine: String, timeout: TimeInterval = timeout) -> Result<Data, Failure> {
         BoundedProcess.run(executable: "/usr/bin/security", arguments: ["-i"],
                            stdin: commandLine, timeout: timeout)
     }
 }
 
-/// URLSession that accepts a self-signed certificate from 127.0.0.1, and from
-/// nowhere else.
-///
-/// agy's TLS port presents its own certificate. Trusting it is defensible
-/// only because the connection cannot leave this machine, so the host check
-/// below IS the security argument — it must not be widened to "any local
-/// name" or dropped for convenience. No credential is ever sent to this
-/// server; the RPC is unauthenticated.
+/// Ephemeral URLSession trusting self-signed certificates strictly from 127.0.0.1 for local RPC.
 final class LoopbackSession: NSObject, URLSessionDelegate, @unchecked Sendable {
     static let shared = LoopbackSession()
     private lazy var session = URLSession(configuration: .ephemeral, delegate: self,
@@ -346,10 +268,6 @@ struct CodexProvider: Provider {
 
         guard !rows.isEmpty else { return nil }
 
-        // Snapshot age and plan are two different things and now render in two
-        // different places — the age as the header badge, since "how old is
-        // this reading" qualifies every row in the block, and the plan as the
-        // block's own note. They used to be joined into one note string.
         let note = (limits["plan_type"] as? String).map { "plan: \($0)" }
         var badge: Badge?
         if let timestamp, let date = Format.iso.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) {
@@ -358,7 +276,6 @@ struct CodexProvider: Provider {
         return Card(provider: name, rows: rows, note: note, badge: badge)
     }
 
-    /// 10080 minutes is the weekly window, 300 the 5-hour one.
     private func windowName(minutes: Int, fallback: String) -> String {
         switch minutes {
         case 0: return fallback
@@ -386,23 +303,7 @@ struct CodexProvider: Provider {
 
 // MARK: - OpenRouter
 
-/// `GET /api/v1/credits` exposes only LIFETIME totals to a regular key
-/// (verified live: `/credits/history` 404s, `/activity` requires a
-/// management key):
-///
-///   total_credits — every dollar ever granted; it GROWS on each top-up and
-///                   is NOT the current balance
-///   total_usage   — every dollar ever spent
-///
-/// `remaining` (grant − usage) is therefore always honest, but a "used" bar
-/// computed from those two double-counts every earlier top-up the moment the
-/// account is funded again. So top-ups are detected locally: the app persists
-/// the last-seen lifetime grant (`OpenRouterLedger.lastTotalCredits`) and a
-/// poll where it has grown IS the top-up — the delta becomes that top-up's
-/// grant, and lifetime usage at that moment starts the cycle's spend counter.
-/// Known cost of the method: spend between the last poll before a top-up and
-/// the top-up itself is attributed to the old cycle (bounded by one refresh
-/// interval).
+/// Tracks top-up cycles locally since the credits API only returns lifetime grant and spend totals.
 struct OpenRouterLedger: Codable, Equatable {
     var lastTotalCredits: Double
     var topup: Cycle?
@@ -411,10 +312,7 @@ struct OpenRouterLedger: Codable, Equatable {
         var granted: Double
         var usageAtTopup: Double
         var topupAt: Date
-        /// True when the cycle was seeded from the current balance rather
-        /// than observed — an upgrading install has no history to say what
-        /// usage was at its last real top-up, so "since install" is the
-        /// honest label until the next real top-up lands.
+        /// True when seeded from initial balance rather than an observed top-up transition.
         var seeded: Bool
     }
 }
@@ -428,9 +326,7 @@ struct OpenRouterProvider: Provider {
     /// A grant moving by less than half a cent is float noise, not a top-up.
     static let topupEpsilon = 0.005
 
-    /// Ledger persistence lives in the same defaults the Antigravity cache
-    /// uses, so it survives restarts — the whole point: a top-up detected
-    /// before a relaunch must still define the cycle after it.
+    /// Loads persisted top-up cycle history across application restarts.
     static func loadLedger() -> OpenRouterLedger? {
         guard let data = Prefs.defaults.data(forKey: ledgerKey) else { return nil }
         return try? JSONDecoder().decode(OpenRouterLedger.self, from: data)
@@ -440,17 +336,12 @@ struct OpenRouterProvider: Provider {
         Prefs.defaults.set(try? JSONEncoder().encode(ledger), forKey: ledgerKey)
     }
 
-    /// Pure ledger transition for one poll, self-testable without network.
-    /// A grown grant is a top-up; a SHRUNK grant (adjustment/revocation)
-    /// makes lifetime totals incomparable, so tracking restarts and the card
-    /// falls back to lifetime display until the next top-up.
+    /// Updates ledger on credit grant increases; resets cycle tracking if grant total shrinks.
     static func update(ledger: OpenRouterLedger?, granted: Double, used: Double,
                        now: Date = Date()) -> OpenRouterLedger {
         var ledger = ledger ?? OpenRouterLedger(
             lastTotalCredits: granted,
-            // Upgrade path: there is no history to say what usage was at the
-            // install's last real top-up, so the current balance seeds the
-            // cycle — spend from here on counts against it, not lifetime.
+            // Seeds initial cycle from current balance when no prior ledger exists.
             topup: granted - used > 0
                 ? .init(granted: granted - used, usageAtTopup: used, topupAt: now, seeded: true)
                 : nil)
@@ -464,10 +355,7 @@ struct OpenRouterProvider: Provider {
         return ledger
     }
 
-    /// Turns a /v1/credits response into the "valid — $X.XX remaining"
-    /// message SettingsWindow's Test button shows — the same arithmetic
-    /// load() uses for its Row, pulled out so both call sites (and
-    /// --self-test) share one source of truth instead of two copies drifting.
+    /// Formats credits test response showing remaining balance.
     static func creditsMessage(from json: [String: Any]) -> String {
         let data = json["data"] as? [String: Any] ?? [:]
         let granted = (data["total_credits"] as? NSNumber)?.doubleValue ?? 0
@@ -475,10 +363,7 @@ struct OpenRouterProvider: Provider {
         return "valid — \(Format.usd(granted - used)) remaining"
     }
 
-    /// The bar shows what is left, in dollars, coloured by how much of the
-    /// granted amount has gone. With nothing granted (a pure pay-as-you-go
-    /// account) there is no denominator to be a percentage of, so the balance
-    /// colours itself: overdrawn is critical, nearly empty is a warning.
+    /// Calculates headline metrics from lifetime grant and spend totals.
     static func headline(granted: Double, used: Double) -> HeadlineValue {
         let remaining = granted - used
         let display = Format.usd(remaining)
@@ -491,10 +376,7 @@ struct OpenRouterProvider: Provider {
         return HeadlineValue(percent: percent, severity: severity, display: display)
     }
 
-    /// Menu-bar colour source, cycle-aware: with a known top-up cycle the
-    /// percent is spend since the top-up against the top-up itself — the
-    /// number a person actually funds against; without one it falls back to
-    /// the lifetime ratio. The display is always the remaining balance.
+    /// Calculates headline metrics against the active top-up cycle when available.
     static func headline(ledger: OpenRouterLedger, granted: Double, used: Double) -> HeadlineValue {
         guard let cycle = ledger.topup, cycle.granted > 0 else {
             return headline(granted: granted, used: used)
@@ -547,9 +429,7 @@ struct OpenRouterProvider: Provider {
             }
             return Card(provider: name, rows: rows, badge: badge)
         } catch {
-            // A failed fetch must not leave a stale balance in the bar: an
-            // out-of-date dollar figure reads as current in a way an em-dash
-            // does not.
+            // Clears title values to prevent stale balance readings.
             TitleValues.clear(provider: .openrouter)
             return Card(provider: name, rows: [], error: error.localizedDescription)
         }
@@ -558,22 +438,7 @@ struct OpenRouterProvider: Provider {
 
 // MARK: - Antigravity (agy)
 
-/// Antigravity's quota lives behind `RetrieveUserQuotaSummary`, served by the
-/// `agy` CLI's own loopback Connect server with no authentication.
-///
-/// This provider shipped once before and was removed in #33, because the RPC
-/// available then (`v1internal:retrieveUserQuota`) returned raw per-modelId
-/// buckets covering only some of the models Antigravity serves — so the card
-/// could read 0% while you were throttled on a model it never mentioned.
-/// `RetrieveUserQuotaSummary` returns two named groups spanning the whole
-/// product, which is what makes the card honest enough to ship again.
-///
-/// The *remote* form of this RPC (cloudcode-pa v1internal) returns 403
-/// SUBSCRIPTION_REQUIRED for consumer accounts on both the prod and daily
-/// hosts. See docs/superpowers/specs/2026-08-27-… before trying it again:
-/// re-test against a live token rather than re-arguing from documentation.
-///
-/// `remainingFraction` is what is LEFT (1.0 = untouched), so used = 1 - it.
+/// Quota provider querying the local loopback Connect server exposed by the agy CLI.
 struct AntigravityProvider: Provider {
     let name = "Antigravity"
 
@@ -584,12 +449,7 @@ struct AntigravityProvider: Provider {
         let resetTime: Date?
     }
 
-    /// "Gemini Models" + "weekly" -> "Gemini · Weekly".
-    ///
-    /// The group name is the server's own marketing string. Trimming
-    /// " Models" and folding " and " to "/" is what keeps four rows inside
-    /// the dropdown's width without a hand-maintained translation table that
-    /// a newly-added group would silently fall out of.
+    /// Normalizes group and window names to fit the dropdown row width.
     static func label(group: String, window: String, fallback: String) -> String {
         var name = group
         for suffix in [" Models", " models"] where name.hasSuffix(suffix) {
@@ -647,16 +507,7 @@ struct AntigravityProvider: Provider {
     }
 
     // MARK: Cache
-    //
-    // agy is a CLI, not a daemon, so its server is absent most of the time.
-    // Without a cache this card would read "not running" almost always, which
-    // is truthful but useless. With one, the weekly numbers — the ones you
-    // actually plan around — stay on screen between agy sessions.
-    //
-    // The dropdown may replay the cache with its "as of" badge at any age,
-    // but the title has no badge: a days-old 66% there reads as live, which
-    // is exactly how a quota limit arrived unwarned. Older than
-    // titleStalenessThreshold, the title is cleared to "—" instead.
+
     static let cacheKey = "antigravity.cache"
     static let titleStalenessThreshold: TimeInterval = 900
 
@@ -674,9 +525,7 @@ struct AntigravityProvider: Provider {
         ]
     }
 
-    /// Returns nil when the cache is absent, unreadable, or entirely past its
-    /// reset times. All three mean "show no cached rows", so the caller gets
-    /// one branch instead of three.
+    /// Decodes cached buckets, returning nil if the cache is expired, invalid, or missing.
     static func decodeCache(_ raw: [String: Any], now: Date) -> (buckets: [Bucket], fetchedAt: Date)? {
         guard let stamp = raw["fetchedAt"] as? String,
               let fetchedAt = Format.iso.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
@@ -691,10 +540,7 @@ struct AntigravityProvider: Provider {
             let resetTime = (entry["resetTime"] as? String).flatMap {
                 Format.iso.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
             }
-            // A bucket that never said when it resets is not immortal: it
-            // falls back to a week from the fetch, the longest window
-            // Antigravity actually uses. Keeping it forever would park a
-            // stale percentage on screen with nothing to ever clear it.
+            // Buckets without an explicit reset time expire after one week.
             let expiresAt = resetTime ?? fetchedAt.addingTimeInterval(7 * 86400)
             if expiresAt <= now { continue }
             buckets.append(Bucket(id: id, label: label, percent: percent, resetTime: resetTime))
@@ -704,9 +550,7 @@ struct AntigravityProvider: Provider {
 
     // MARK: Transport
 
-    /// agy opens ephemeral ports per run and writes no port file — no
-    /// lockfile carries one, and jetski_state.pbtxt does not either — so the
-    /// only way to find its server is to ask the kernel who is listening.
+    /// Extracts listening ports for agy processes from lsof output.
     static func agyPorts(fromLsof output: String) -> [Int] {
         var ports: [Int] = []
         for line in output.split(separator: "\n") {
@@ -731,14 +575,10 @@ struct AntigravityProvider: Provider {
     private static let rpcPath =
         "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
 
-    /// The IDE additionally requires an X-Codeium-Csrf-Token from its own
-    /// state; the CLI's server does not, which is the only reason this
-    /// provider can exist without shipping a token scraper.
     private static let rpcBody = Data(
         #"{"ideName":"antigravity","extensionName":"antigravity","locale":"en","ideVersion":"unknown"}"#.utf8)
 
-    /// agy opens one plain-HTTP port and one TLS port, and which is which is
-    /// not stable between runs, so both schemes are tried per port.
+    /// Tries HTTP and HTTPS schemes since agy port scheme assignments vary across runs.
     private static func fetch(port: Int) async -> [String: Any]? {
         for scheme in ["http", "https"] {
             guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)\(rpcPath)") else { continue }
@@ -759,8 +599,7 @@ struct AntigravityProvider: Provider {
         return nil
     }
 
-    /// Only bucket ids that exist in the registry can reach the title; an
-    /// unrecognised one from a future release still renders in the dropdown.
+    /// Publishes title metrics for recognized bucket identifiers.
     private static func publishHeadlines(_ buckets: [Bucket]) {
         for bucket in buckets where TitleMetric.metric(id: "antigravity.\(bucket.id)") != nil {
             TitleValues.set("antigravity.\(bucket.id)",
@@ -769,11 +608,7 @@ struct AntigravityProvider: Provider {
         }
     }
 
-    /// Replays the last reading (minus any bucket whose window has since
-    /// reset) under the given error, the same contract CodexProvider's
-    /// snapshot badge makes. Title values follow the cache: published while
-    /// fresh enough to be honest, cleared once past the staleness threshold
-    /// — and always cleared when there is no usable cache at all.
+    /// Replays cached buckets with an age badge, clearing title metrics if stale.
     private static func cachedCard(error: String, now: Date = Date()) -> Card {
         guard let raw = Prefs.defaults.dictionary(forKey: Self.cacheKey),
               let cached = Self.decodeCache(raw, now: now)
@@ -781,10 +616,7 @@ struct AntigravityProvider: Provider {
             TitleValues.clear(provider: .antigravity)
             return Card(provider: ProviderID.antigravity.displayName, rows: [], error: error)
         }
-        // Publish from the cached path too: a cached number in the dropdown
-        // and a blank one in the title would be incoherent — but only while
-        // the cache is young. Past the threshold the title would state a
-        // live-looking percentage it has no badge to qualify.
+        // Clears title values if cached data exceeds staleness threshold.
         if now.timeIntervalSince(cached.fetchedAt) > titleStalenessThreshold {
             TitleValues.clear(provider: .antigravity)
         } else {
@@ -808,19 +640,13 @@ struct AntigravityProvider: Provider {
             return Card(provider: name, rows: Self.rows(from: buckets))
         }
 
-        // Three distinct realities, previously collapsed into one:
-        // (a) agy is listening but every RPC failed — the process is alive,
-        //     so "not running" would be a lie; say so and replay cache.
         if !ports.isEmpty && !rpcSucceeded {
             return Self.cachedCard(error: "agy running — quota fetch failed")
         }
-        // (b) a live RPC answered but parsed to zero buckets — a server-side
-        //     shape change must surface, not masquerade as days-old cache.
         if rpcSucceeded {
             TitleValues.clear(provider: .antigravity)
             return Card(provider: name, rows: [], error: "agy responded without quota data")
         }
-        // (c) nothing is listening — the original "not running" + cache replay.
         return Self.cachedCard(error: "agy not running")
     }
 }
