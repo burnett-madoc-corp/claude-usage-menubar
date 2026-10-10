@@ -1,7 +1,7 @@
-export CODEQL_EXTRACTOR_SWIFT_LOG_LEVEL=debug
 #!/bin/bash
 # Builds ClaudeUsage.app menu bar application.
 set -euo pipefail
+export CODEQL_EXTRACTOR_SWIFT_LOG_LEVEL=debug
 
 cd "$(dirname "$0")"
 
@@ -33,7 +33,9 @@ SRCS=(
 
 if [ "$ARCHS" = "arm64" ]; then
   echo "Compiling (arm64)…"
-  swift build -c release --arch arm64
+  swift build -c release --arch arm64 \
+    -Xswiftc -driver-time-compilation \
+    -Xswiftc -Xfrontend -Xswiftc -debug-time-function-bodies
   cp .build/arm64-apple-macosx/release/ClaudeUsage "$BIN"
 elif [ "$ARCHS" = "x86_64" ]; then
   echo "Compiling (x86_64)…"
