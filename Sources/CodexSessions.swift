@@ -294,6 +294,9 @@ actor CodexRolloutReader {
         // bills each at a different rate (see ModelPricing.swift).
         var totalUsage: (input: Int64, output: Int64, cachedInput: Int64, cacheWriteInput: Int64)?
         var hasTokenCountEvent: Bool = false
+        var turnCosts: [Int64] = []
+        var compactionCount = 0
+
     }
 
     private var accumulators: [String: Acc] = [:]
@@ -387,6 +390,10 @@ enum CodexRolloutParsing {
         case "turn_context":
             if let model = obj.dict("payload")?.string("model") { acc.model = model }
 
+        case "compacted":
+            acc.turnCosts = []
+            acc.compactionCount += 1
+
         case "event_msg":
             guard let payload = obj.dict("payload"), payload.string("type") == "token_count",
                   let info = payload.dict("info")
@@ -396,6 +403,16 @@ enum CodexRolloutParsing {
                 acc.lastTokenCount = (total: total, window: info.int64("model_context_window"))
             }
             if let usage = info.dict("total_token_usage") {
+                // token_count can repeat unchanged after status updates. Count
+                // only a new cumulative usage sample, including cached input.
+                let input = usage.int64("input_tokens") ?? 0
+                let output = usage.int64("output_tokens") ?? 0
+                if input != acc.totalUsage?.input || output != acc.totalUsage?.output,
+                   let last = info.dict("last_token_usage"),
+                   let cost = last.int64("total_tokens"), cost > 0 {
+                    acc.turnCosts.append(cost)
+                }
+
                 acc.totalUsage = (
                     input: usage.int64("input_tokens") ?? 0,
                     output: usage.int64("output_tokens") ?? 0,
@@ -453,7 +470,7 @@ enum CodexSessionScanner {
                 cwd: cwd,
                 model: model,
                 busy: true,
-                turns: 0,
+                turns: acc.turnCosts.count,
                 inputTokens: usage?.input ?? 0,
                 outputTokens: usage?.output ?? 0,
                 estimatedSpent: usage.flatMap { usage in
@@ -471,8 +488,8 @@ enum CodexSessionScanner {
                 // Keep context pending when token_count event is missing to avoid showing 0%.
                 contextTokens: acc.hasTokenCountEvent ? acc.lastTokenCount?.total : nil,
                 contextWindow: acc.lastTokenCount?.window ?? acc.sessionContextWindow,
-                xFloorMultiple: nil,
-                compactionCount: 0,
+                xFloorMultiple: SessionScanner.xFloor(turnCosts: acc.turnCosts),
+                compactionCount: acc.compactionCount,
                 lastCompactionAt: nil, lastCompactionPreCtx: nil, lastCompactionPostCtx: nil,
                 hasUsage: acc.hasTokenCountEvent
             ))
@@ -506,6 +523,7 @@ enum CodexSessionSelfTests {
         testFixtureDBMissingColumn()
         testFixtureDBAbsentFile()
         testTokenCountExtraction()
+        testTurnsAndBloat()
         testTotalTokenUsageParsing()
         testSubagentNicknameCorrectedNesting()
         testPendingVsZero()
@@ -635,6 +653,21 @@ enum CodexSessionSelfTests {
         let payload: [String: Any] = ["message": "", "replacement_history": []]
         let data = try! JSONSerialization.data(withJSONObject: ["type": "compacted", "payload": payload])
         return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func testTurnsAndBloat() {
+        var acc = CodexRolloutReader.Acc()
+        for i in 1...10 {
+            let line = tokenCountLine(lastTotal: i <= 5 ? 10_000 : 30_000,
+                                      window: 258_400, cumIn: Int64(i * 40_000), cumOut: Int64(i * 100))
+            CodexRolloutParsing.fold(line: line, into: &acc)
+            CodexRolloutParsing.fold(line: line, into: &acc)
+        }
+        precondition(acc.turnCosts.count == 10, "repeated usage events must not double count turns")
+        precondition(SessionScanner.xFloor(turnCosts: acc.turnCosts) == 3)
+        CodexRolloutParsing.fold(line: compactedLine(), into: &acc)
+        precondition(acc.turnCosts.isEmpty && acc.compactionCount == 1)
+        precondition(SessionScanner.xFloor(turnCosts: acc.turnCosts) == nil)
     }
 
     private static func testTokenCountExtraction() {

@@ -727,11 +727,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         addSectionHeader("Sessions")
         let visible = Self.visibleSessions(sessions)
         let detailed = !Prefs.rendersCompact(Prefs.sessionRowStyle())
-        // Detailed reads as a table, so it is ordered by what the table is
-        // for — worst first. Compact keeps the recency order it was designed
-        // around. Both draw the same cap/overflow selection, so switching
-        // styles never changes *which* sessions you can see, only their order.
-        let rows = detailed ? Self.severityOrdered(visible.rows) : visible.rows
+        let rows = visible.rows
         if detailed {
             let header = NSMenuItem(title: "", action: nil, keyEquivalent: "")
             header.view = SessionHeaderView(width: detailedRowWidth)
@@ -778,17 +774,6 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Worst-first, with most-recent activity breaking ties. The tiebreak is
-    /// not cosmetic: `sorted(by:)` is not guaranteed stable, so without a
-    /// total order two equally-severe rows could swap places on any tick,
-    /// and every swap costs a full menu rebuild (see applySessionUpdates).
-    nonisolated static func severityOrdered(_ rows: [AgentSession]) -> [AgentSession] {
-        rows.sorted {
-            if $0.severity != $1.severity { return $0.severity > $1.severity }
-            return ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast)
-        }
-    }
-
     /// Refreshing session rows while the menu is OPEN must not rebuild the
     /// menu: `removeAllItems` destroys and recreates the item under the
     /// cursor, which dismisses its tooltip — and in Compact mode the tooltip
@@ -807,7 +792,7 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         // key comparison below reports a structural change on every tick
         // (and, worse, a matching key list could pair a view with the wrong
         // session's data).
-        let rows = compact ? visible.rows : Self.severityOrdered(visible.rows)
+        let rows = visible.rows
         guard rows.map(Self.sessionKey) == sessionRowKeys,
               visible.overflow == sessionOverflow
         else { rebuildMenu(); return }
@@ -827,16 +812,16 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Sort by most-recent transcript activity, cap at 8 rows, report the
-    /// rest as a count for a single "+N more" line — NSMenu has no internal
-    /// scrolling worth fighting. 12 (up from 8): a pi+agy machine routinely
-    /// runs 8-12 live agents now, and every hidden row was one the panel's
-    /// whole point — "should I clear this session?" — could not answer.
-    /// Pure and nonisolated so it's fixture-testable.
-    nonisolated static func visibleSessions(_ sessions: [AgentSession], cap: Int = 12) -> (rows: [AgentSession], overflow: Int) {
-        let sorted = sessions.sorted { ($0.lastActivityAt ?? .distantPast) > ($1.lastActivityAt ?? .distantPast) }
-        guard sorted.count > cap else { return (sorted, 0) }
-        return (Array(sorted.prefix(cap)), sorted.count - cap)
+    /// Keep every session in a fixed order. NSMenu scrolls at screen edges.
+    nonisolated static func visibleSessions(_ sessions: [AgentSession]) -> (rows: [AgentSession], overflow: Int) {
+        let sorted = sessions.sorted {
+            // Fallback matching can replace a label with a subagent nickname.
+            // Only process-owned fields may decide the order across refreshes.
+            if $0.cwd != $1.cwd { return $0.cwd < $1.cwd }
+            if $0.kind != $1.kind { return $0.kind.rawValue < $1.kind.rawValue }
+            return $0.pid < $1.pid
+        }
+        return (sorted, 0)
     }
 
     /// Labels truncate around 14 chars with an ellipsis so the bar column
@@ -1263,24 +1248,30 @@ private func testCompactSessionRendering() {
     let normal = makeSession(contextTokens: 84_000, contextWindow: 200_000)
     precondition(UsageMenuBar.sessionGauge(for: normal).contains("42%"))
 
-    // Sorting: most-recent transcript activity first, cap at 12, "+N more".
+    // All rows remain visible and process order survives changing nicknames,
+    // activity, severity, and the scanner's dictionary iteration order.
     let now = Date()
-    let many = (0..<15).map { i in makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i))) }
-    let capped = UsageMenuBar.visibleSessions(many)
-    precondition(capped.rows.count == 12)
-    precondition(capped.overflow == 3)
-    precondition(capped.rows.first?.label == "s0", "most-recent activity must sort first")
-    precondition(capped.rows.last?.label == "s11")
-
+    let many = (0..<36).map { i -> AgentSession in
+        var session = makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i)))
+        session.pid = pid_t(i + 100)
+        session.cwd = "/workspace/\(i / 2)"
+        return session
+    }
+    let visible = UsageMenuBar.visibleSessions(many)
+    precondition(visible.rows.count == 36 && visible.overflow == 0)
+    let keys = visible.rows.map(UsageMenuBar.sessionKey)
+    precondition(UsageMenuBar.visibleSessions(many.reversed()).rows.map(UsageMenuBar.sessionKey) == keys)
+    var updated = many
+    for i in updated.indices {
+        updated[i].label = i.isMultiple(of: 2) ? "Hume (unmatched)" : "Plato"
+        updated[i].lastActivityAt = now.addingTimeInterval(Double(i))
+        updated[i].xFloorMultiple = Double(i)
+    }
+    precondition(UsageMenuBar.visibleSessions(updated.reversed()).rows.map(UsageMenuBar.sessionKey) == keys,
+                 "nickname and activity changes must not move an existing process")
     let few = UsageMenuBar.visibleSessions(Array(many.prefix(5)))
     precondition(few.rows.count == 5 && few.overflow == 0)
 
-    // A session with no activity timestamp at all must sort last, not crash
-    // the comparator and not be dropped.
-    let mixed = [makeSession(label: "known", lastActivityAt: now),
-                 makeSession(label: "unknown", lastActivityAt: nil)]
-    let mixedSorted = UsageMenuBar.visibleSessions(mixed)
-    precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
 }
 
 // MARK: - Keychain-timeout self-tests
@@ -1431,51 +1422,6 @@ private func testEditMenu() {
     precondition(undo?.keyEquivalent == "z" && undo?.keyEquivalentModifierMask == .command)
     precondition(redo?.keyEquivalent == "z")
     precondition(redo?.keyEquivalentModifierMask == [.command, .shift])
-}
-
-// MARK: - Detailed-table ordering self-tests
-//
-// Detailed rows are ordered worst-first; Compact and the `--once` printer keep
-// the recency order `visibleSessions` produces. Both facts are asserted here
-// so the redesign can't quietly re-order the two surfaces it left alone.
-
-private func testSeverityOrdering() {
-    let now = Date()
-    // xFloor thresholds (Sessions.swift): <1.5 green, <4.0 yellow, >=7.0 red.
-    let calm = makeSession(label: "calm", contextTokens: 20_000, xFloorMultiple: 1.0,
-                           lastActivityAt: now)
-    let warm = makeSession(label: "warm", contextTokens: 20_000, xFloorMultiple: 3.0,
-                           lastActivityAt: now.addingTimeInterval(-60))
-    let hot = makeSession(label: "hot", contextTokens: 20_000, xFloorMultiple: 8.0,
-                          lastActivityAt: now.addingTimeInterval(-120))
-
-    precondition(calm.severity < warm.severity && warm.severity < hot.severity,
-                 "fixtures must actually span three severities for this test to mean anything")
-
-    let ordered = UsageMenuBar.severityOrdered([calm, warm, hot])
-    precondition(ordered.map(\.label) == ["hot", "warm", "calm"], "worst first")
-
-    // Equal severity falls back to most-recent activity, giving a total order
-    // — without it, an unstable sort could swap rows on any tick and force a
-    // full menu rebuild every time.
-    let older = makeSession(label: "older", contextTokens: 20_000, xFloorMultiple: 1.0,
-                            lastActivityAt: now.addingTimeInterval(-600))
-    let newer = makeSession(label: "newer", contextTokens: 20_000, xFloorMultiple: 1.0,
-                            lastActivityAt: now)
-    precondition(UsageMenuBar.severityOrdered([older, newer]).map(\.label) == ["newer", "older"])
-    precondition(UsageMenuBar.severityOrdered([newer, older]).map(\.label) == ["newer", "older"],
-                 "the tiebreak must not depend on input order")
-
-    // A session with no activity timestamp still sorts, and still isn't dropped.
-    let unknown = makeSession(label: "unknown", contextTokens: 20_000, xFloorMultiple: 1.0,
-                              lastActivityAt: nil)
-    precondition(UsageMenuBar.severityOrdered([unknown, newer]).map(\.label) == ["newer", "unknown"])
-
-    // Re-ordering is Detailed-only: the shared selection helper that Compact
-    // and --once use is untouched and still recency-ordered.
-    precondition(UsageMenuBar.visibleSessions([calm, warm, hot]).rows.map(\.label)
-                 == ["calm", "warm", "hot"],
-                 "visibleSessions must stay recency-ordered for Compact and --once")
 }
 
 // MARK: - Entry point
@@ -1999,7 +1945,6 @@ private func runSelfTests() {
     DetailedSessionRowSelfTests.run()
     ThemeSelfTests.run()
     QuotaBlockSelfTests.run()
-    testSeverityOrdering()
     testEditMenu()
     PollPolicySelfTests.run()
     testKeychainBounds()
