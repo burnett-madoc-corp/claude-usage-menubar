@@ -31,6 +31,7 @@ vulnerability here could break.
 |---|---|---|
 | Keychain item `Claude Code-credentials` | Claude Code's OAuth token | shelling out to `security find-generic-password` |
 | `~/.codex/sessions/**.jsonl` | Codex's recorded `rate_limits` payloads | file read |
+| Descendants of the local `agy` listener | CLI-exported `ANTIGRAVITY_CSRF_TOKEN` | read-only `ps` environment lookup, scoped by listener PID |
 
 **Credentials it stores on your behalf**, in the login Keychain under service
 `local.claude-usage-menubar`, account `openrouter_key`: the OpenRouter API key
@@ -70,9 +71,16 @@ untrusted certificate when — and only when — the challenge host is exactly
 `LoopbackSession` in `Sources/Providers.swift` is the only place this applies,
 and that host comparison is the entire security argument: it must not be
 widened to hostnames that merely resolve to loopback, since those can be
-attacker-controlled. No credential is sent to that server in any case — the
-RPC is unauthenticated, which is also why this provider needs no Keychain
-item and adds no secret to protect.
+attacker-controlled. Recent CLI versions authenticate local RPCs with a CSRF
+credential exported to their tool subprocesses. The app resolves the `agy`
+listener for the specific port with `lsof`, then reads the exported variable
+only from descendants of that process. Tokens stay in memory, are scoped to
+the listener PID and port, and are never written to disk, logged, placed in
+command arguments, or sent to a remote provider. Loopback requests refuse all
+HTTP redirects so that a local credential cannot be forwarded elsewhere.
+Older CLI versions that accept unauthenticated requests remain supported.
+If no credential has been exported yet, authenticated RPCs remain unavailable
+until a tool subprocess exposes one; the app never alters or restarts `agy`.
 
 ## The refresh-token boundary
 

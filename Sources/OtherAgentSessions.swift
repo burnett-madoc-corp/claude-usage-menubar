@@ -468,7 +468,7 @@ enum AgySessions {
                let summaries = await AgyRPC.fetchSummaries(port: port, fetcher: fetcher),
                let summary = summaries.first(where: { $0.id == convId }) {
 
-                // Poll trajectory payload only when conversation lastUserInputTime advances.
+                // Reuse recent payloads briefly; usage changes during one user turn.
                 let stamp = summary.lastUserInputTime ?? .distantPast
                 let acc = await cache.trajectory(convId: convId, port: port,
                                                  changedAt: stamp, fetcher: fetcher)
@@ -595,6 +595,67 @@ enum AgyProcessScanner {
     }
 }
 
+/// Recent CLI releases export their loopback credential to tool subprocesses.
+/// Read only descendants of the agy process that owns this listening port;
+/// keep the credential in memory and never put it in logs, arguments or files.
+actor AgyLocalCredentials {
+    static let shared = AgyLocalCredentials()
+    private var tokens: [Int: (pid: Int, token: String)] = [:]
+
+    static func exportedToken(_ output: String) -> String? {
+        let prefix = "ANTIGRAVITY_CSRF_TOKEN="
+        for field in output.split(whereSeparator: \.isWhitespace) where field.hasPrefix(prefix) {
+            let value = String(field.dropFirst(prefix.count))
+            if !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    static func descendants(of parent: Int, processTable: String) -> [Int] {
+        let pairs = processTable.split(separator: "\n").compactMap { line -> (Int, Int)? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 2, let pid = Int(fields[0]), let ppid = Int(fields[1]) else { return nil }
+            return (pid, ppid)
+        }
+        var found: Set<Int> = [parent]
+        for _ in 0..<16 {
+            let next = Set(pairs.filter { found.contains($0.1) }.map { $0.0 }).union(found)
+            if next == found { break }
+            found = next
+        }
+        found.remove(parent)
+        return Array(found.sorted().prefix(64))
+    }
+
+    private static func output(_ executable: String, _ arguments: [String]) -> String? {
+        guard case let .success(data) = BoundedProcess.run(
+            executable: executable, arguments: arguments, timeout: 5
+        ) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    func token(port: Int, invalidate: Bool = false) -> String? {
+        guard let listeners = Self.output("/usr/sbin/lsof", ["-nP", "-a", "-c", "agy",
+                    "-iTCP:\(port)", "-sTCP:LISTEN", "-Fp"]),
+              let owner = listeners.split(separator: "\n").first(where: { $0.hasPrefix("p") }),
+              let pid = Int(owner.dropFirst()) else {
+            tokens.removeValue(forKey: port)
+            return nil
+        }
+        if !invalidate, let cached = tokens[port], cached.pid == pid { return cached.token }
+        tokens.removeValue(forKey: port)
+        guard let table = Self.output("/bin/ps", ["-axo", "pid=,ppid="]) else { return nil }
+        let children = Self.descendants(of: pid, processTable: table)
+        guard !children.isEmpty,
+              let environment = Self.output("/bin/ps", ["eww", "-p", children.map(String.init).joined(separator: ","),
+                                                         "-o", "command="]),
+              let token = Self.exportedToken(environment) else { return nil }
+        if tokens.count >= 64 { tokens.removeAll() }
+        tokens[port] = (pid, token)
+        return token
+    }
+}
+
 /// Connect-RPC client for the agy language server's read-only session calls.
 enum AgyRPC {
     static let rpcPath = "/exa.language_server_pb.LanguageServerService/"
@@ -603,6 +664,7 @@ enum AgyRPC {
     /// Sends a Connect RPC request to loopback trying http followed by https.
     static func defaultFetch(port: Int, rpc: String, body: [String: Any]) async -> Data? {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
+        var token = await AgyLocalCredentials.shared.token(port: port)
         for scheme in ["http", "https"] {
             guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)\(rpcPath)\(rpc)") else { continue }
             var request = URLRequest(url: url)
@@ -612,10 +674,19 @@ enum AgyRPC {
             request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
             request.cachePolicy = .reloadIgnoringLocalCacheData
             request.timeoutInterval = 5
+            request.setValue(token, forHTTPHeaderField: "x-codeium-csrf-token")
             guard let (data, response) = try? await LoopbackSession.shared.data(for: request),
-                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode)
-            else { continue }
-            return data
+                  let http = response as? HTTPURLResponse else { continue }
+            if (200..<300).contains(http.statusCode) { return data }
+            if http.statusCode == 401,
+               let renewed = await AgyLocalCredentials.shared.token(port: port, invalidate: true),
+               renewed != token {
+                token = renewed
+                request.setValue(renewed, forHTTPHeaderField: "x-codeium-csrf-token")
+                if let (retryData, retryResponse) = try? await LoopbackSession.shared.data(for: request),
+                   let retryHTTP = retryResponse as? HTTPURLResponse,
+                   (200..<300).contains(retryHTTP.statusCode) { return retryData }
+            }
         }
         return nil
     }
@@ -768,21 +839,24 @@ enum AgyRPC {
     }
 }
 
-/// Caches parsed conversation trajectories by timestamp and evicts inactive sessions.
+/// Briefly reuses parsed trajectories; a user-input timestamp is not a usage revision.
 actor AgyTrajectoryCache {
     static let shared = AgyTrajectoryCache()
 
-    private var entries: [String: (changedAt: Date, acc: AgyRPC.TrajectoryAcc)] = [:]
+    static let maxAge: TimeInterval = 5
+    private var entries: [String: (changedAt: Date, fetchedAt: Date, port: Int, acc: AgyRPC.TrajectoryAcc)] = [:]
 
     var cachedCount: Int { entries.count }
 
     func trajectory(convId: String, port: Int, changedAt: Date,
-                    fetcher: AgyRPC.Fetch) async -> AgyRPC.TrajectoryAcc? {
-        if let entry = entries[convId], entry.changedAt == changedAt { return entry.acc }
+                    fetcher: AgyRPC.Fetch, now: Date = Date()) async -> AgyRPC.TrajectoryAcc? {
+        if let entry = entries[convId], entry.port == port, entry.changedAt == changedAt,
+           now.timeIntervalSince(entry.fetchedAt) >= 0,
+           now.timeIntervalSince(entry.fetchedAt) < Self.maxAge { return entry.acc }
         guard let data = await fetcher(port, "GetCascadeTrajectory", ["cascadeId": convId])
         else { return entries[convId]?.acc }
         let acc = AgyRPC.parseTrajectory(data: data)
-        entries[convId] = (changedAt, acc)
+        entries[convId] = (changedAt, now, port, acc)
         return acc
     }
 
@@ -807,6 +881,7 @@ enum PiAndAgySessionSelfTests {
         testAgySummariesParse()
         testAgyTrajectoryParse()
         testAgyTrajectoryCache()
+        testAgyLocalCredentials()
     }
 
     private static func piSessionLine(cwd: String = "/Users/dev/proj",
@@ -1029,27 +1104,65 @@ enum PiAndAgySessionSelfTests {
         precondition(AgyRPC.parseTrajectory(data: Data("not json".utf8)).contextTokens == nil)
     }
 
+    private static func testAgyLocalCredentials() {
+        let table = "10 1\n20 10\n30 20\n40 1\n50 40\nmalformed\n"
+        precondition(AgyLocalCredentials.descendants(of: 10, processTable: table) == [20, 30],
+                     "credential lookup must exclude unrelated process trees")
+        precondition(AgyLocalCredentials.exportedToken("tool A=1 ANTIGRAVITY_CSRF_TOKEN=fixture-token B=2") == "fixture-token")
+        precondition(AgyLocalCredentials.exportedToken("NOT_ANTIGRAVITY_CSRF_TOKEN=wrong") == nil)
+        precondition(AgyLocalCredentials.exportedToken("ANTIGRAVITY_CSRF_TOKEN= ") == nil)
+        let url = URL(string: "http://127.0.0.1:1/rpc")!
+        let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: nil, headerFields: nil)!
+        var refused = false
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.dataTask(with: url)
+        LoopbackSession.shared.urlSession(session, task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: URLRequest(url: URL(string: "https://example.com/")!)) { request in
+                refused = request == nil
+            }
+        precondition(refused, "loopback credentials must never follow redirects")
+        session.invalidateAndCancel()
+    }
+
     private static func testAgyTrajectoryCache() {
         let sem = DispatchSemaphore(value: 0)
         Task {
             let cache = AgyTrajectoryCache()
             var calls = 0
+            var updated = false
+            var fail = false
             let acc = AgyRPC.TrajectoryAcc(model: "gemini-3.1-pro-low",
                                            contextTokens: 27_400, contextWindow: 2_000_000,
                                            inputTokens: 35_399, outputTokens: 1_935, turns: 2,
                                            turnCosts: [9_934, 27_400])
             let fetcher: AgyRPC.Fetch = { _, _, _ in
                 calls += 1
-                return trajectoryFixture()
+                if fail { return nil }
+                let fixture = String(decoding: trajectoryFixture(), as: UTF8.self)
+                return Data((updated ? fixture.replacingOccurrences(of: "26000", with: "36000") : fixture).utf8)
             }
             let t1 = Date(timeIntervalSinceReferenceDate: 800_000_000)
-            let first = await cache.trajectory(convId: "c1", port: 1, changedAt: t1, fetcher: fetcher)
+            let first = await cache.trajectory(convId: "c1", port: 1, changedAt: t1, fetcher: fetcher, now: t1)
             precondition(first == acc)
-            _ = await cache.trajectory(convId: "c1", port: 1, changedAt: t1, fetcher: fetcher)
-            precondition(calls == 1, "an unchanged conversation must not be re-fetched")
+            _ = await cache.trajectory(convId: "c1", port: 1, changedAt: t1, fetcher: fetcher, now: t1)
+            precondition(calls == 1, "a recent payload can be reused")
+            updated = true
+            let refreshed = await cache.trajectory(convId: "c1", port: 1, changedAt: t1,
+                                                   fetcher: fetcher, now: t1.addingTimeInterval(5))
+            precondition(calls == 2 && refreshed?.inputTokens == 45_399 && refreshed?.contextTokens == 37_400,
+                         "usage must refresh even when the user has not sent another prompt")
+            fail = true
+            let retained = await cache.trajectory(convId: "c1", port: 1, changedAt: t1,
+                                                  fetcher: fetcher, now: t1.addingTimeInterval(10))
+            precondition(calls == 3 && retained == refreshed, "a failed poll preserves the last good payload")
+            fail = false
             _ = await cache.trajectory(convId: "c1", port: 1,
                                        changedAt: t1.addingTimeInterval(60), fetcher: fetcher)
-            precondition(calls == 2)
+            precondition(calls == 4)
+            _ = await cache.trajectory(convId: "c1", port: 2, changedAt: t1.addingTimeInterval(60),
+                                       fetcher: fetcher)
+            precondition(calls == 5, "a new server port must not reuse another server payload")
             let count1 = await cache.cachedCount
             precondition(count1 == 1)
             await cache.evict(keeping: ["other"])
