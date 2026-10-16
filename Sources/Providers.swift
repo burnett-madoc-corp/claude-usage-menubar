@@ -135,13 +135,21 @@ enum KeychainCLI {
 }
 
 /// Ephemeral URLSession trusting self-signed certificates strictly from 127.0.0.1 for local RPC.
-final class LoopbackSession: NSObject, URLSessionDelegate, @unchecked Sendable {
+final class LoopbackSession: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     static let shared = LoopbackSession()
     private lazy var session = URLSession(configuration: .ephemeral, delegate: self,
                                           delegateQueue: nil)
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         try await session.data(for: request)
+    }
+
+    // Local CSRF credentials must never follow a redirect to another origin.
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
@@ -572,31 +580,12 @@ struct AntigravityProvider: Provider {
         return agyPorts(fromLsof: String(decoding: data, as: UTF8.self))
     }
 
-    private static let rpcPath =
-        "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-
-    private static let rpcBody = Data(
-        #"{"ideName":"antigravity","extensionName":"antigravity","locale":"en","ideVersion":"unknown"}"#.utf8)
-
-    /// Tries HTTP and HTTPS schemes since agy port scheme assignments vary across runs.
     private static func fetch(port: Int) async -> [String: Any]? {
-        for scheme in ["http", "https"] {
-            guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)\(rpcPath)") else { continue }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.httpBody = rpcBody
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            request.timeoutInterval = 5
-
-            guard let (data, response) = try? await LoopbackSession.shared.data(for: request),
-                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            return json
-        }
-        return nil
+        guard let data = await AgyRPC.defaultFetch(port: port, rpc: "RetrieveUserQuotaSummary", body: [
+            "ideName": "antigravity", "extensionName": "antigravity",
+            "locale": "en", "ideVersion": "unknown"
+        ]) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
     /// Publishes title metrics for recognized bucket identifiers.
