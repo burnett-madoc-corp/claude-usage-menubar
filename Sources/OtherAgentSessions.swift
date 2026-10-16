@@ -854,7 +854,10 @@ actor AgyTrajectoryCache {
            now.timeIntervalSince(entry.fetchedAt) >= 0,
            now.timeIntervalSince(entry.fetchedAt) < Self.maxAge { return entry.acc }
         guard let data = await fetcher(port, "GetCascadeTrajectory", ["cascadeId": convId])
-        else { return entries[convId]?.acc }
+        else {
+            guard let prior = entries[convId], prior.port == port else { return nil }
+            return prior.acc
+        }
         let acc = AgyRPC.parseTrajectory(data: data)
         entries[convId] = (changedAt, now, port, acc)
         return acc
@@ -1163,6 +1166,15 @@ enum PiAndAgySessionSelfTests {
             _ = await cache.trajectory(convId: "c1", port: 2, changedAt: t1.addingTimeInterval(60),
                                        fetcher: fetcher)
             precondition(calls == 5, "a new server port must not reuse another server payload")
+            fail = true
+            let foreign = await cache.trajectory(convId: "c1", port: 3, changedAt: t1,
+                                                 fetcher: fetcher)
+            precondition(calls == 6 && foreign == nil,
+                         "a failed fetch must not replay another server's usage")
+            let same = await cache.trajectory(convId: "c1", port: 2, changedAt: t1,
+                                              fetcher: fetcher)
+            precondition(calls == 7 && same != nil,
+                         "the same server can retain its last good payload after a failed fetch")
             let count1 = await cache.cachedCount
             precondition(count1 == 1)
             await cache.evict(keeping: ["other"])
