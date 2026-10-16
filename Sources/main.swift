@@ -815,9 +815,11 @@ final class UsageMenuBar: NSObject, NSApplicationDelegate {
     /// Keep every session in a fixed order. NSMenu scrolls at screen edges.
     nonisolated static func visibleSessions(_ sessions: [AgentSession]) -> (rows: [AgentSession], overflow: Int) {
         let sorted = sessions.sorted {
-            if $0.label != $1.label { return $0.label < $1.label }
+            // Fallback matching can replace a label with a subagent nickname.
+            // Only process-owned fields may decide the order across refreshes.
             if $0.cwd != $1.cwd { return $0.cwd < $1.cwd }
-            return sessionKey(for: $0) < sessionKey(for: $1)
+            if $0.kind != $1.kind { return $0.kind.rawValue < $1.kind.rawValue }
+            return $0.pid < $1.pid
         }
         return (sorted, 0)
     }
@@ -1246,27 +1248,30 @@ private func testCompactSessionRendering() {
     let normal = makeSession(contextTokens: 84_000, contextWindow: 200_000)
     precondition(UsageMenuBar.sessionGauge(for: normal).contains("42%"))
 
-    // Every session is visible, with order independent of activity.
+    // All rows remain visible and process order survives changing nicknames,
+    // activity, severity, and the scanner's dictionary iteration order.
     let now = Date()
-    let many = (0..<15).map { i in makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i))) }
-    let capped = UsageMenuBar.visibleSessions(many)
-    precondition(capped.rows.count == 15)
-    precondition(capped.overflow == 0)
-    precondition(capped.rows.first?.label == "s0", "alphabetical order must be stable")
-    precondition(capped.rows.last?.label == "s9")
-
-    precondition(UsageMenuBar.visibleSessions(many.reversed()).rows.map(\.label) == capped.rows.map(\.label))
+    let many = (0..<36).map { i -> AgentSession in
+        var session = makeSession(label: "s\(i)", lastActivityAt: now.addingTimeInterval(Double(-i)))
+        session.pid = pid_t(i + 100)
+        session.cwd = "/workspace/\(i / 2)"
+        return session
+    }
+    let visible = UsageMenuBar.visibleSessions(many)
+    precondition(visible.rows.count == 36 && visible.overflow == 0)
+    let keys = visible.rows.map(UsageMenuBar.sessionKey)
+    precondition(UsageMenuBar.visibleSessions(many.reversed()).rows.map(UsageMenuBar.sessionKey) == keys)
+    var updated = many
+    for i in updated.indices {
+        updated[i].label = i.isMultiple(of: 2) ? "Hume (unmatched)" : "Plato"
+        updated[i].lastActivityAt = now.addingTimeInterval(Double(i))
+        updated[i].xFloorMultiple = Double(i)
+    }
+    precondition(UsageMenuBar.visibleSessions(updated.reversed()).rows.map(UsageMenuBar.sessionKey) == keys,
+                 "nickname and activity changes must not move an existing process")
     let few = UsageMenuBar.visibleSessions(Array(many.prefix(5)))
     precondition(few.rows.count == 5 && few.overflow == 0)
 
-    // Activity timestamps do not change the alphabetical session order.
-    let mixed = [makeSession(label: "known", lastActivityAt: now),
-                 makeSession(label: "unknown", lastActivityAt: nil)]
-    let mixedSorted = UsageMenuBar.visibleSessions(mixed)
-    precondition(mixedSorted.rows.map(\.label) == ["known", "unknown"])
-    var updated = mixed
-    updated[1].lastActivityAt = now.addingTimeInterval(60)
-    precondition(UsageMenuBar.visibleSessions(updated).rows.map(\.label) == mixedSorted.rows.map(\.label))
 }
 
 // MARK: - Keychain-timeout self-tests
