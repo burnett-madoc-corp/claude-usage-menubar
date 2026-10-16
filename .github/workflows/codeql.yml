@@ -1,11 +1,9 @@
 name: CodeQL
 
-# Weekly static vulnerability analysis requiring AppKit compilation on macOS.
+# Static vulnerability analysis requiring AppKit compilation on macOS.
 
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   schedule:
     # Scheduled off-hour to avoid queue congestion.
@@ -13,7 +11,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
