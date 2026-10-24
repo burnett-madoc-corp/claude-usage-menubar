@@ -457,3 +457,7 @@ explains how to report a vulnerability privately.
 ## Licence
 
 [MIT](LICENSE) © 2026 Alexander Burnett.
+
+## Operational runbooks
+
+See the [deployment, local testing, CI, and production testing runbooks](docs/runbooks/README.md) for procedures, expected results, and evidence-backed troubleshooting.
