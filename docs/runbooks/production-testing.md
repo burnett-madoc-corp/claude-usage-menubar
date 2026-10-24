@@ -9,7 +9,7 @@ This is a locally installed macOS application, not a network service. Expected s
 Prerequisites: interactive access to the target Mac as the installed user. Do not print Keychain contents, delete preferences, reset Control Centre, reinstall, or refresh credentials.
 
 ```bash
-cd /path/to/claude-usage-menubar
+cd "$(git rev-parse --show-toplevel)"
 git rev-parse HEAD
 test -x /Applications/ClaudeUsage.app/Contents/MacOS/ClaudeUsage
 launchctl print "gui/$UID/local.claude-usage-menubar" >/tmp/claude-usage-launch.txt

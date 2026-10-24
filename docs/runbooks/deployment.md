@@ -16,6 +16,7 @@ before release; the installer overwrites in place and has no automatic rollback.
 Then, from inside the reviewed checkout:
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 approved_sha='<reviewed-40-character-sha>'
 test "$(git rev-parse HEAD)" = "$approved_sha"

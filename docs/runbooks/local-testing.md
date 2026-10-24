@@ -1,5 +1,7 @@
 # Local testing
 
+Each command block may be started from anywhere inside the owned checkout; its first command resolves that checkout root with Git and fails outside a Git working tree.
+
 This is a dependency-free Swift/AppKit menu-bar application. Its authoritative automated test is the built binary's `--self-test` mode; Python scripts add repository and SVG-chart checks. The supported build host is macOS only.
 
 ## Prerequisites and clean setup
@@ -11,6 +13,8 @@ This is a dependency-free Swift/AppKit menu-bar application. Its authoritative a
 From the repository root, verify tools without changing the installed app:
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
+set -euo pipefail
 sw_vers -productVersion
 xcode-select -p
 swift --version
@@ -23,6 +27,8 @@ Do not run `install.sh` for local testing: it copies into `/Applications` and re
 ## Complete offline gate
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
+set -euo pipefail
 python3 .github/scripts/static_checks.py
 python3 tools/check_charts.py
 ./build.sh
@@ -36,6 +42,8 @@ The self-test uses in-memory/static fixtures and a dedicated `UserDefaults` suit
 For a manual parser smoke check after automated tests, run:
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
+set -euo pipefail
 build/ClaudeUsage.app/Contents/MacOS/ClaudeUsage --once
 ```
 

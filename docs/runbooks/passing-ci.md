@@ -12,14 +12,14 @@ Passing means an actually executed, current-head `merge-gate` with conclusion `s
 
 ## Prerequisites
 
-macOS 13 or newer, Xcode command-line tools (`swift`, `lipo`, `codesign`), Python 3, and both arm64/x86_64 Swift build support. CI uses `macos-latest`. Work from an isolated checkout at the exact PR head and do not load production secrets unless a command below explicitly names a read-only requirement.
+macOS 13 or newer, Xcode command-line tools (`swift`, `lipo`, `codesign`), Python 3, and both arm64/x86_64 Swift build support. CI uses `macos-latest`. Start somewhere inside the owned isolated checkout at the exact PR head and do not load production secrets unless a command below explicitly names a read-only requirement.
 
 ## Local reproduction
 
 ### Run static, build, and self-test gates
 
 ```bash
-cd <repo-root>
+cd "$(git rev-parse --show-toplevel)"
 python3 .github/scripts/static_checks.py
 python3 tools/check_charts.py
 ./build.sh
@@ -33,16 +33,22 @@ Expected outcome: Both Python checks exit zero, `build.sh` recreates `build/Clau
 The installed Skynet `gh` 2.46.0 does not support `gh pr checks --json`. Use these read-only REST/run payloads; `jq -e` asserts actual keys and values and no pipeline can hide a failed command:
 
 ```bash
-cd <repo-root>
+cd "$(git rev-parse --show-toplevel)"
 set -euo pipefail
-PR=<number>
-RUN_ID=<ci-run-id>
+: "${PR:?set PR to the target pull request number}"
+case "$PR" in
+  ''|*[!0-9]*) printf '%s\n' 'PR must contain decimal digits only' >&2; exit 2 ;;
+esac
+: "${CI_RUN_ID:?set CI_RUN_ID to the target CI workflow run ID}"
+case "$CI_RUN_ID" in
+  ''|*[!0-9]*) printf '%s\n' 'CI_RUN_ID must contain decimal digits only' >&2; exit 2 ;;
+esac
 HEAD_SHA=$(gh pr view "$PR" -R burnett-madoc-corp/claude-usage-menubar --json headRefOid --jq .headRefOid)
 test "${#HEAD_SHA}" -eq 40
 CHECKS_JSON=$(mktemp)
 RUN_JSON=$(mktemp)
 gh api "repos/burnett-madoc-corp/claude-usage-menubar/commits/$HEAD_SHA/check-runs?per_page=100" > "$CHECKS_JSON"
-gh run view "$RUN_ID" -R burnett-madoc-corp/claude-usage-menubar --json headSha,event,conclusion,jobs > "$RUN_JSON"
+gh run view "$CI_RUN_ID" -R burnett-madoc-corp/claude-usage-menubar --json headSha,event,conclusion,jobs > "$RUN_JSON"
 jq -e '  (.check_runs | type == "array") and  (any(.check_runs[]; .name == "merge-gate" and .status == "completed" and .conclusion == "success"))' "$CHECKS_JSON" >/dev/null
 jq -e --arg head "$HEAD_SHA" '  (.headSha == $head) and (.event == "pull_request") and (.conclusion == "success") and  (.jobs | type == "array") and  (any(.jobs[]; .name == "merge-gate" and .status == "completed" and .conclusion == "success"))' "$RUN_JSON" >/dev/null
 ```
